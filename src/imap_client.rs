@@ -603,6 +603,8 @@ const SENT_FOLDER_NAMES: &[&str] = &[
     "Sent Items",
     "Sent Mail",
     "[Gmail]/Sent Mail",
+    "[Google Mail]/Sent Mail",
+    "[Google Mail]/Gesendet",
     "INBOX.Sent",
     "Gesendete Elemente",
     "Gesendete Objekte",
@@ -611,18 +613,24 @@ const SENT_FOLDER_NAMES: &[&str] = &[
 const TRASH_FOLDER_NAMES: &[&str] = &[
     "Trash",
     "[Gmail]/Trash",
+    "[Google Mail]/Trash",
+    "[Google Mail]/Papierkorb",
     "Deleted Items",
     "INBOX.Trash",
     "Papierkorb",
     "Gelöschte Elemente",
+    "Gel&APY-schte Elemente",
 ];
 
 const DRAFTS_FOLDER_NAMES: &[&str] = &[
     "Drafts",
     "[Gmail]/Drafts",
+    "[Google Mail]/Drafts",
+    "[Google Mail]/Entwürfe",
     "Draft",
     "INBOX.Drafts",
     "Entwürfe",
+    "Entw&APw-rfe",
 ];
 
 // ========== Types ==========
