@@ -73,7 +73,16 @@ macro_rules! resolve_write {
 }
 
 pub async fn move_email(server: &ImapMcpServer, req: MoveEmailRequest) -> String {
-    let client_arc = resolve_write!(server, req);
+    let (config, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    if config.read_only {
+        return error_json("Account is configured as read-only");
+    }
+    if !config.allow_move {
+        return error_json("Moving emails is disabled for this account (allow_move = false)");
+    }
     let mut client = client_arc.lock().await;
     match client
         .move_emails(&req.folder, &req.uids, &req.target_folder)
@@ -133,7 +142,16 @@ pub async fn flag_email(server: &ImapMcpServer, req: FlagEmailRequest) -> String
 }
 
 pub async fn delete_email(server: &ImapMcpServer, req: DeleteEmailRequest) -> String {
-    let client_arc = resolve_write!(server, req);
+    let (config, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    if config.read_only {
+        return error_json("Account is configured as read-only");
+    }
+    if !config.allow_delete {
+        return error_json("Deleting emails is disabled for this account (allow_delete = false)");
+    }
     let permanent = req.permanent.unwrap_or(false);
     let mut client = client_arc.lock().await;
     match client

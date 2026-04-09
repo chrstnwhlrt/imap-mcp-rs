@@ -8,6 +8,8 @@ port = 993
 username = "user@gmail.com"
 # email = "user@gmail.com"        # From address for drafts (defaults to username)
 # read_only = false                # true = only read tools, no write/draft
+# allow_delete = true              # false = delete_email blocked
+# allow_move = true                # false = move_email blocked
 # accept_invalid_certs = false     # true for self-signed certs (testing only!)
 # allowed_folders = ["INBOX"]      # restrict accessible folders (optional)
 auth_method = "password"

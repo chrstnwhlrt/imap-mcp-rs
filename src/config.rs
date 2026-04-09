@@ -8,6 +8,7 @@ pub struct ServerConfig {
     pub accounts: Vec<AccountConfig>,
 }
 
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Deserialize, Clone)]
 pub struct AccountConfig {
     pub name: String,
@@ -19,6 +20,10 @@ pub struct AccountConfig {
     pub email: Option<String>,
     #[serde(default)]
     pub read_only: bool,
+    #[serde(default = "default_true")]
+    pub allow_delete: bool,
+    #[serde(default = "default_true")]
+    pub allow_move: bool,
     #[serde(default)]
     pub accept_invalid_certs: bool,
     pub allowed_folders: Option<Vec<String>>,
@@ -51,6 +56,10 @@ impl std::fmt::Debug for AccountConfig {
 
 fn default_port() -> u16 {
     993
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Deserialize, Clone, PartialEq)]

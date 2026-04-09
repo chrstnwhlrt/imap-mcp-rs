@@ -147,32 +147,32 @@ The LLM discovers accounts via `list_accounts`, then uses the `account` paramete
 
 Account name matching is case-insensitive. Each account has its own IMAP connection, folder cache, and reconnect logic. Failed accounts reconnect automatically on first use.
 
-## Read-Only Mode
+## Permissions
 
-Set `read_only = true` per account to prevent any modifications:
+Control what the LLM can do per account with three flags:
 
 ```toml
 [[accounts]]
-name = "Shared Inbox"
-host = "imap.company.com"
-port = 993
-username = "support@company.com"
-read_only = true
-auth_method = "password"
-password = "..."
+name = "Work"
+read_only = false       # true = only read tools, all writes blocked
+allow_delete = false    # false = delete_email blocked (default: true)
+allow_move = false      # false = move_email blocked (default: true)
 ```
 
-In read-only mode:
+**`read_only = true`** overrides everything — all write tools are blocked. When `read_only = false`, `allow_delete` and `allow_move` control those specific operations individually.
 
-- **Available tools (6):** `list_accounts`, `list_folders`, `list_emails`, `get_email`, `get_thread`, `search_emails`
-- **Blocked tools (8):** `mark_as_read`, `mark_as_unread`, `flag_email`, `move_email`, `delete_email`, `draft_reply`, `draft_forward`, `draft_email` — these return an error explaining the account is read-only
+| Flag | Effect when `false` |
+|------|-------------------|
+| `read_only = true` | All 8 write tools blocked (mark, flag, move, delete, draft) |
+| `allow_delete = false` | Only `delete_email` blocked |
+| `allow_move = false` | Only `move_email` blocked |
 
-**When to use read-only mode:**
+**Use cases:**
 
-- **Exploring a new setup** — browse and search without risk before granting write access
-- **Shared/team accounts** — give the LLM read access to a support inbox without modification ability
-- **Auditing** — review emails without accidentally marking them as read or changing flags
-- **Corporate environments** — connect with minimal permissions when company policy restricts automation
+- **`read_only = true`** — safe exploration, shared inboxes, auditing, corporate policies
+- **`allow_delete = false`** — allow organizing (mark, flag, move, draft) but prevent accidental deletion
+- **`allow_move = false`** — allow reading and drafting but prevent reorganizing folder structure
+- **`allow_delete = false` + `allow_move = false`** — only mark as read, flag, and draft replies
 
 You can mix read-only and read-write accounts in the same config.
 
@@ -297,6 +297,8 @@ port = 993                          # IMAP port (993 for TLS)
 username = "user@gmail.com"         # IMAP login username
 email = "user@gmail.com"            # From address for drafts (defaults to username)
 read_only = false                   # true = only read tools, write/draft blocked
+allow_delete = true                 # false = delete_email blocked
+allow_move = true                   # false = move_email blocked
 accept_invalid_certs = false        # Accept self-signed TLS certs (testing only!)
 # allowed_folders = ["INBOX"]       # Restrict accessible folders (optional)
 auth_method = "password"            # "password" or "oauth2"
