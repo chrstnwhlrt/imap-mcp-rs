@@ -627,6 +627,7 @@ const DRAFTS_FOLDER_NAMES: &[&str] = &[
     "[Gmail]/Drafts",
     "[Google Mail]/Drafts",
     "[Google Mail]/Entwürfe",
+    "[Google Mail]/Entw&APw-rfe",
     "Draft",
     "INBOX.Drafts",
     "Entwürfe",
