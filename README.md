@@ -357,21 +357,75 @@ refresh_token = "your-refresh-token"
 
 **Outlook 365 (OAuth2):**
 
+Microsoft has disabled password-based IMAP for most Office 365 tenants. OAuth2 requires a one-time setup in Azure:
+
+**Step 1 — Register an app in Azure:**
+
+1. Go to [Microsoft Entra admin center](https://entra.microsoft.com)
+2. Navigate to **Entra ID** → **App registrations** → **New registration**
+3. Name: `imap-mcp-rs`
+4. Supported account types: **Single tenant** (your organization only)
+5. Redirect URI: select **Web**, enter `http://localhost`
+6. Click **Register**
+7. Note the **Application (client) ID** and **Directory (tenant) ID** from the overview page
+
+**Step 2 — Create a client secret:**
+
+1. In your app registration, go to **Certificates & secrets**
+2. Click **New client secret**, set an expiry (e.g. 24 months), click **Add**
+3. Copy the **Value** (not the Secret ID) — you won't see it again
+
+**Step 3 — Set API permissions:**
+
+1. Go to **API permissions** → **Add a permission**
+2. Select **Microsoft Graph** → **Delegated permissions**
+3. Search and add: `IMAP.AccessAsUser.All` and `offline_access`
+4. Click **Grant admin consent** for your organization
+
+**Step 4 — Get a refresh token:**
+
+Open this URL in your browser (replace `YOUR_TENANT_ID` and `YOUR_CLIENT_ID`):
+
+```
+https://login.microsoftonline.com/YOUR_TENANT_ID/oauth2/v2.0/authorize?client_id=YOUR_CLIENT_ID&response_type=code&redirect_uri=http://localhost&scope=https://outlook.office365.com/IMAP.AccessAsUser.All%20offline_access&response_mode=query
+```
+
+Sign in with your Microsoft account. The browser redirects to `http://localhost?code=LONG_CODE...` — the page won't load (that's expected). Copy the `code` value from the address bar.
+
+Exchange the code for a refresh token:
+
+```bash
+curl -s -X POST "https://login.microsoftonline.com/YOUR_TENANT_ID/oauth2/v2.0/token" \
+  -d "client_id=YOUR_CLIENT_ID" \
+  -d "client_secret=YOUR_CLIENT_SECRET" \
+  -d "code=THE_CODE_FROM_THE_URL" \
+  -d "redirect_uri=http://localhost" \
+  -d "grant_type=authorization_code" \
+  -d "scope=https://outlook.office365.com/IMAP.AccessAsUser.All offline_access"
+```
+
+The response contains `refresh_token` — copy it.
+
+**Step 5 — Configure:**
+
 ```toml
 [[accounts]]
 name = "Office"
 host = "outlook.office365.com"
 port = 993
 username = "you@company.com"
+read_only = true
 auth_method = "oauth2"
 
 [accounts.oauth2]
 provider = "outlook365"
-tenant = "your-tenant-id"  # or "common" for personal accounts
-client_id = "your-azure-app-id"
+tenant = "your-tenant-id"
+client_id = "your-client-id"
 client_secret = "your-client-secret"
 refresh_token = "your-refresh-token"
 ```
+
+The server automatically refreshes the access token using the refresh token. No manual intervention needed after initial setup.
 
 **Generic IMAP (Hetzner, Dovecot, etc.):**
 
@@ -385,6 +439,49 @@ email = "user@yourdomain.com"  # set explicitly when username != email address
 auth_method = "password"
 password = "your-password"
 ```
+
+## Troubleshooting
+
+### "IMAP login failed"
+
+**Gmail:** Regular passwords don't work. You need an App Password:
+1. Go to https://myaccount.google.com/apppasswords
+2. Generate a password (format: `xxxx xxxx xxxx xxxx`)
+3. Use that as the `password` in your config
+
+**Office 365:** Microsoft has disabled basic password auth for most tenants. Use OAuth2 instead (see Outlook 365 setup above).
+
+**Generic IMAP:** Verify your credentials work with a regular mail client first.
+
+### "OAuth2 token refresh failed"
+
+- Check that `client_id`, `client_secret`, and `refresh_token` are correct
+- Ensure the app has `IMAP.AccessAsUser.All` and `offline_access` permissions with admin consent granted
+- Refresh tokens expire if unused for 90 days — repeat Step 4 of the OAuth2 setup to get a new one
+- Check that the `tenant` ID matches your organization
+
+### Office 365 connection hangs after "OAuth2 access token refreshed successfully"
+
+IMAP is disabled for the user. Enable it in the Microsoft 365 Admin Center:
+
+1. Go to https://admin.microsoft.com
+2. **Users** → **Active users** → select the user → **Mail** → **Manage email apps**
+3. Enable **IMAP**
+4. Save and wait ~15 minutes for the change to propagate
+
+SMTP is not needed — the server only creates drafts via IMAP APPEND, it never sends emails.
+
+### "Failed to save draft: could not append mail to mailbox"
+
+The Drafts folder doesn't exist on the server. Some IMAP servers (especially fresh setups) don't create standard folders automatically. Create the Drafts folder manually via your webmail client, or check if your server uses a different naming convention (e.g., `INBOX.Drafts` for Dovecot).
+
+### Connection drops / "broken pipe"
+
+Normal — the server auto-reconnects on the next tool call. TCP keepalive detects dead connections within ~60 seconds. If the problem persists, check your network or the IMAP server status.
+
+### "Account ... not found"
+
+Account names are matched case-insensitively. Check `list_accounts` to see the exact names configured.
 
 ## Development
 

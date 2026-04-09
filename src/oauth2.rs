@@ -37,6 +37,10 @@ pub async fn refresh_access_token(config: &OAuth2Config) -> Result<String> {
     let response = tokio::time::timeout(OAUTH2_TIMEOUT, minimal_https_post(&token_url, &body))
         .await
         .context("OAuth2 token refresh timed out")?
+        .map_err(|e| {
+            tracing::error!("OAuth2 HTTP request failed: {e:#}");
+            e
+        })
         .context("OAuth2 token refresh failed")?;
 
     let token_response: TokenResponse = serde_json::from_str(&response).with_context(|| {
@@ -102,8 +106,20 @@ async fn minimal_https_post(url: &str, body: &str) -> Result<String> {
     tls.write_all(request.as_bytes()).await?;
     tls.flush().await?;
 
-    let mut response = String::new();
-    tls.read_to_string(&mut response).await?;
+    // Read response in chunks. Some servers (Microsoft) close the
+    // connection without TLS close_notify, causing UnexpectedEof.
+    // We read until EOF or error, keeping whatever data we received.
+    let mut response_bytes = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => response_bytes.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    let response = String::from_utf8_lossy(&response_bytes).to_string();
 
     // Extract HTTP status line
     let first_line = response.lines().next().unwrap_or("");
