@@ -36,12 +36,15 @@ async fn main() -> anyhow::Result<()> {
     let mut clients = HashMap::new();
     for account in &config.accounts {
         let mut client = ImapClient::new(account.clone());
-        match client.connect().await {
-            Ok(()) => {
+        match tokio::time::timeout(std::time::Duration::from_secs(15), client.connect()).await {
+            Ok(Ok(())) => {
                 tracing::info!(account = %account.name, "Connected");
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 tracing::warn!(account = %account.name, error = %e, "Failed to connect (will retry on first use)");
+            }
+            Err(_) => {
+                tracing::warn!(account = %account.name, "Connection timed out (will retry on first use)");
             }
         }
         clients.insert(account.name.to_lowercase(), Arc::new(Mutex::new(client)));

@@ -44,7 +44,15 @@ impl ImapClient {
 
     pub async fn connect(&mut self) -> Result<()> {
         let tls_stream = self.establish_tls().await?;
-        let client = async_imap::Client::new(tls_stream);
+        let mut client = async_imap::Client::new(tls_stream);
+
+        // Read the server greeting before any commands.
+        // async-imap's Client::new() doesn't consume the greeting, which causes
+        // authenticate() to misinterpret it as a response to the AUTHENTICATE command.
+        let _greeting = client
+            .read_response()
+            .await
+            .context("Failed to read server greeting")?;
 
         let session = match self.config.auth_method {
             AuthMethod::Password => {
@@ -70,6 +78,7 @@ impl ImapClient {
                     "user={}\x01auth=Bearer {}\x01\x01",
                     self.config.username, access_token
                 );
+                tracing::debug!(auth_len = auth_string.len(), "Attempting XOAUTH2");
                 client
                     .authenticate("XOAUTH2", XOAuth2Authenticator(auth_string))
                     .await
