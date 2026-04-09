@@ -1,6 +1,9 @@
+use std::collections::HashMap;
 use std::env;
+use std::sync::Arc;
 
 use rmcp::{ServiceExt, transport::stdio};
+use tokio::sync::Mutex;
 use tracing_subscriber::EnvFilter;
 
 mod config;
@@ -28,34 +31,42 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let config = config::load_config(config_path.as_deref())?;
-    tracing::info!(
-        host = %config.imap.host,
-        user = %config.imap.username,
-        read_only = config.account.read_only,
-        "Configuration loaded"
-    );
 
-    let mut client = ImapClient::new(config.imap.clone(), config.auth.clone());
-    client.connect().await?;
-    tracing::info!("IMAP connection established");
+    // Connect all accounts (soft errors — failed accounts reconnect on first use)
+    let mut clients = HashMap::new();
+    for account in &config.accounts {
+        let mut client = ImapClient::new(account.clone());
+        match client.connect().await {
+            Ok(()) => {
+                tracing::info!(account = %account.name, "Connected");
+            }
+            Err(e) => {
+                tracing::warn!(account = %account.name, error = %e, "Failed to connect (will retry on first use)");
+            }
+        }
+        clients.insert(account.name.to_lowercase(), Arc::new(Mutex::new(client)));
+    }
 
-    let server = ImapMcpServer::new(config, client);
-    let disconnect_client = server.client.clone();
+    let server = ImapMcpServer::new(config, clients);
+    let disconnect_clients: Vec<_> = server.clients.values().cloned().collect();
 
     let service = match server.serve(stdio()).await {
         Ok(s) => s,
         Err(e) => {
             tracing::error!("serving error: {:?}", e);
-            disconnect_client.lock().await.disconnect().await;
+            for client in &disconnect_clients {
+                client.lock().await.disconnect().await;
+            }
             return Err(e.into());
         }
     };
 
     let result = service.waiting().await;
 
-    // Always disconnect, even on error
-    disconnect_client.lock().await.disconnect().await;
-    tracing::info!("IMAP disconnected, shutting down");
+    for client in &disconnect_clients {
+        client.lock().await.disconnect().await;
+    }
+    tracing::info!("All accounts disconnected, shutting down");
 
     result?;
     Ok(())

@@ -5,6 +5,8 @@ use super::{ImapMcpServer, error_json};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MoveEmailRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Source folder name")]
     pub folder: String,
     #[schemars(description = "One or more email UIDs to move")]
@@ -15,6 +17,8 @@ pub struct MoveEmailRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkReadRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder name")]
     pub folder: String,
     #[schemars(description = "One or more email UIDs to mark as read")]
@@ -23,6 +27,8 @@ pub struct MarkReadRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkUnreadRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder name")]
     pub folder: String,
     #[schemars(description = "One or more email UIDs to mark as unread")]
@@ -31,6 +37,8 @@ pub struct MarkUnreadRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlagEmailRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder name")]
     pub folder: String,
     #[schemars(description = "One or more email UIDs to flag/unflag")]
@@ -41,6 +49,8 @@ pub struct FlagEmailRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteEmailRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder name")]
     pub folder: String,
     #[schemars(description = "One or more email UIDs to delete")]
@@ -49,11 +59,22 @@ pub struct DeleteEmailRequest {
     pub permanent: Option<bool>,
 }
 
+macro_rules! resolve_write {
+    ($server:expr, $req:expr) => {{
+        let (config, client_arc) = match $server.resolve_client($req.account.as_deref()) {
+            Ok(r) => r,
+            Err(e) => return error_json(&e),
+        };
+        if config.read_only {
+            return error_json("Account is configured as read-only");
+        }
+        client_arc
+    }};
+}
+
 pub async fn move_email(server: &ImapMcpServer, req: MoveEmailRequest) -> String {
-    if server.config.account.read_only {
-        return error_json("Account is configured as read-only");
-    }
-    let mut client = server.client.lock().await;
+    let client_arc = resolve_write!(server, req);
+    let mut client = client_arc.lock().await;
     match client
         .move_emails(&req.folder, &req.uids, &req.target_folder)
         .await
@@ -67,10 +88,8 @@ pub async fn move_email(server: &ImapMcpServer, req: MoveEmailRequest) -> String
 }
 
 pub async fn mark_as_read(server: &ImapMcpServer, req: MarkReadRequest) -> String {
-    if server.config.account.read_only {
-        return error_json("Account is configured as read-only");
-    }
-    let mut client = server.client.lock().await;
+    let client_arc = resolve_write!(server, req);
+    let mut client = client_arc.lock().await;
     match client
         .mark_flags(&req.folder, &req.uids, "\\Seen", true)
         .await
@@ -84,10 +103,8 @@ pub async fn mark_as_read(server: &ImapMcpServer, req: MarkReadRequest) -> Strin
 }
 
 pub async fn mark_as_unread(server: &ImapMcpServer, req: MarkUnreadRequest) -> String {
-    if server.config.account.read_only {
-        return error_json("Account is configured as read-only");
-    }
-    let mut client = server.client.lock().await;
+    let client_arc = resolve_write!(server, req);
+    let mut client = client_arc.lock().await;
     match client
         .mark_flags(&req.folder, &req.uids, "\\Seen", false)
         .await
@@ -101,10 +118,8 @@ pub async fn mark_as_unread(server: &ImapMcpServer, req: MarkUnreadRequest) -> S
 }
 
 pub async fn flag_email(server: &ImapMcpServer, req: FlagEmailRequest) -> String {
-    if server.config.account.read_only {
-        return error_json("Account is configured as read-only");
-    }
-    let mut client = server.client.lock().await;
+    let client_arc = resolve_write!(server, req);
+    let mut client = client_arc.lock().await;
     match client
         .mark_flags(&req.folder, &req.uids, "\\Flagged", req.flagged)
         .await
@@ -118,11 +133,9 @@ pub async fn flag_email(server: &ImapMcpServer, req: FlagEmailRequest) -> String
 }
 
 pub async fn delete_email(server: &ImapMcpServer, req: DeleteEmailRequest) -> String {
-    if server.config.account.read_only {
-        return error_json("Account is configured as read-only");
-    }
+    let client_arc = resolve_write!(server, req);
     let permanent = req.permanent.unwrap_or(false);
-    let mut client = server.client.lock().await;
+    let mut client = client_arc.lock().await;
     match client
         .delete_emails(&req.folder, &req.uids, permanent)
         .await

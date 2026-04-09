@@ -6,6 +6,8 @@ use super::{ImapMcpServer, error_json};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DraftReplyRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder containing the email to reply to")]
     pub folder: String,
     #[schemars(description = "UID of the email to reply to")]
@@ -20,6 +22,8 @@ pub struct DraftReplyRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DraftForwardRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder containing the email to forward")]
     pub folder: String,
     #[schemars(description = "UID of the email to forward")]
@@ -34,6 +38,8 @@ pub struct DraftForwardRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DraftEmailRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Recipient addresses")]
     pub to: Vec<String>,
     #[schemars(description = "Email subject line")]
@@ -48,11 +54,16 @@ pub struct DraftEmailRequest {
 
 #[allow(clippy::too_many_lines)]
 pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> String {
-    if server.config.account.read_only {
+    let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    if account_config.read_only {
         return error_json("Account is configured as read-only");
     }
+    let from = account_config.sender_address().to_string();
 
-    let mut client = server.client.lock().await;
+    let mut client = client_arc.lock().await;
 
     let original = match client.get_email(&req.folder, req.uid).await {
         Ok(Some(email)) => email,
@@ -60,7 +71,6 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
         Err(e) => return error_json(&client.check_error(e).to_string()),
     };
 
-    let from = server.config.imap.sender_address();
     let reply_all = req.reply_all.unwrap_or(false);
 
     let to_addr = match original.from.as_ref() {
@@ -71,7 +81,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
     let mut to_list = vec![to_addr.clone()];
     if reply_all {
         for addr in &original.to {
-            if addr.address != *from {
+            if addr.address != from {
                 to_list.push(addr.address.clone());
             }
         }
@@ -80,7 +90,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
     let mut cc_list: Vec<String> = Vec::new();
     if reply_all {
         for addr in &original.cc {
-            if addr.address != *from {
+            if addr.address != from {
                 cc_list.push(addr.address.clone());
             }
         }
@@ -111,7 +121,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
     );
 
     let mut builder = MessageBuilder::new()
-        .from(from)
+        .from(from.as_str())
         .subject(&subject)
         .text_body(&full_body);
 
@@ -166,11 +176,16 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
 }
 
 pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> String {
-    if server.config.account.read_only {
+    let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    if account_config.read_only {
         return error_json("Account is configured as read-only");
     }
+    let from = account_config.sender_address().to_string();
 
-    let mut client = server.client.lock().await;
+    let mut client = client_arc.lock().await;
 
     let original = match client.get_email(&req.folder, req.uid).await {
         Ok(Some(email)) => email,
@@ -178,7 +193,6 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
         Err(e) => return error_json(&client.check_error(e).to_string()),
     };
 
-    let from = server.config.imap.sender_address();
     let subject = format!("Fwd: {}", original.subject);
 
     let from_display = format_sender(original.from.as_ref());
@@ -208,7 +222,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     };
 
     let mut builder = MessageBuilder::new()
-        .from(from)
+        .from(from.as_str())
         .subject(&subject)
         .text_body(&full_body);
 
@@ -244,14 +258,17 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
 }
 
 pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> String {
-    if server.config.account.read_only {
+    let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    if account_config.read_only {
         return error_json("Account is configured as read-only");
     }
-
-    let from = server.config.imap.sender_address();
+    let from = account_config.sender_address().to_string();
 
     let mut builder = MessageBuilder::new()
-        .from(from)
+        .from(from.as_str())
         .subject(&req.subject)
         .text_body(&req.body);
 
@@ -274,7 +291,7 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
         Err(e) => return error_json(&format!("Failed to build MIME message: {e}")),
     };
 
-    let mut client = server.client.lock().await;
+    let mut client = client_arc.lock().await;
     match client.save_draft(&message_bytes).await {
         Ok(()) => serde_json::to_string(&serde_json::json!({
             "status": "ok",

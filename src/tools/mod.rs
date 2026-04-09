@@ -2,6 +2,7 @@ pub mod draft;
 pub mod read;
 pub mod write;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -9,10 +10,10 @@ use rmcp::{
     ServerHandler,
     handler::server::router::tool::ToolRouter,
     model::{ServerCapabilities, ServerInfo},
-    tool, tool_handler, tool_router,
+    schemars, tool, tool_handler, tool_router,
 };
 
-use crate::config::ServerConfig;
+use crate::config::{AccountConfig, ServerConfig};
 use crate::imap_client::ImapClient;
 
 pub fn error_json(msg: &str) -> String {
@@ -22,25 +23,86 @@ pub fn error_json(msg: &str) -> String {
 #[derive(Debug, Clone)]
 pub struct ImapMcpServer {
     pub config: ServerConfig,
-    pub client: Arc<Mutex<ImapClient>>,
+    pub clients: HashMap<String, Arc<Mutex<ImapClient>>>,
     tool_router: ToolRouter<Self>,
 }
 
 impl ImapMcpServer {
-    pub fn new(config: ServerConfig, client: ImapClient) -> Self {
+    pub fn new(config: ServerConfig, clients: HashMap<String, Arc<Mutex<ImapClient>>>) -> Self {
         Self {
             config,
-            client: Arc::new(Mutex::new(client)),
+            clients,
             tool_router: Self::tool_router(),
         }
     }
+
+    /// Resolve an account name to its config and client.
+    /// Case-insensitive matching. Uses first account if name is None.
+    pub fn resolve_client(
+        &self,
+        account: Option<&str>,
+    ) -> Result<(&AccountConfig, Arc<Mutex<ImapClient>>), String> {
+        let lookup_name = account.map_or_else(
+            || {
+                self.config
+                    .accounts
+                    .first()
+                    .map(|a| a.name.to_lowercase())
+                    .unwrap_or_default()
+            },
+            str::to_lowercase,
+        );
+
+        let account_config = self
+            .config
+            .accounts
+            .iter()
+            .find(|a| a.name.to_lowercase() == lookup_name)
+            .ok_or_else(|| format!("Account \"{lookup_name}\" not found"))?;
+
+        let client = self
+            .clients
+            .get(&lookup_name)
+            .ok_or_else(|| format!("No client for account \"{lookup_name}\""))?
+            .clone();
+
+        Ok((account_config, client))
+    }
 }
+
+#[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
+pub struct ListAccountsRequest {}
 
 #[tool_router]
 impl ImapMcpServer {
+    #[tool(description = "List all configured email accounts with their names and addresses.")]
+    async fn list_accounts(
+        &self,
+        #[allow(unused)] rmcp::handler::server::wrapper::Parameters(_req): rmcp::handler::server::wrapper::Parameters<ListAccountsRequest>,
+    ) -> String {
+        let accounts: Vec<serde_json::Value> = self
+            .config
+            .accounts
+            .iter()
+            .map(|a| {
+                serde_json::json!({
+                    "name": a.name,
+                    "email": a.sender_address(),
+                    "read_only": a.read_only,
+                })
+            })
+            .collect();
+        serde_json::to_string(&accounts).unwrap_or_else(|e| error_json(&e.to_string()))
+    }
+
     #[tool(description = "List all available email folders with total and unread message counts.")]
-    async fn list_folders(&self) -> String {
-        read::list_folders(self).await
+    async fn list_folders(
+        &self,
+        rmcp::handler::server::wrapper::Parameters(req): rmcp::handler::server::wrapper::Parameters<
+            read::ListFoldersRequest,
+        >,
+    ) -> String {
+        read::list_folders(self, req).await
     }
 
     #[tool(
@@ -185,8 +247,8 @@ impl ServerHandler for ImapMcpServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
             concat!(
-                "IMAP email server for LLM assistants.\n\n",
-                "Workflow: list_folders → list_emails (browse) or search_emails (find). ",
+                "IMAP email server for LLM assistants. Supports multiple accounts.\n\n",
+                "Workflow: list_accounts → list_folders(account) → list_emails(account, folder) or search_emails. ",
                 "Use get_email for full content, get_thread for conversation context. ",
                 "Organize with mark_as_read, flag_email, move_email, delete_email. ",
                 "Compose with draft_reply (threads automatically), draft_forward, or draft_email. ",

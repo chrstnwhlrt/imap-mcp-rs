@@ -1,30 +1,29 @@
 # imap-mcp-rs configuration
+# Each [[accounts]] entry defines one email account.
 
-[account]
-# Set to true to disable all write operations (move, delete, flag, draft)
-read_only = false
-
-[imap]
+[[accounts]]
+name = "Personal"
 host = "imap.gmail.com"
 port = 993
 username = "user@gmail.com"
-# email = "user@gmail.com"  # From address for drafts (defaults to username)
-# Restrict accessible folders (optional, all folders accessible if omitted)
-# allowed_folders = ["INBOX", "[Gmail]/Sent Mail", "[Gmail]/Drafts"]
+# email = "user@gmail.com"        # From address for drafts (defaults to username)
+# read_only = false                # true = only read tools, no write/draft
+# accept_invalid_certs = false     # true for self-signed certs (testing only!)
+# allowed_folders = ["INBOX"]      # restrict accessible folders (optional)
+auth_method = "password"
+password = "your-app-specific-password"  # or use a .env file
 
-[auth]
-# "password" or "oauth2"
-method = "password"
-# password = "app-specific-password"  # prefer IMAP_PASSWORD env var
-
-# [auth.oauth2]
-# provider = "gmail"        # "gmail", "outlook365", or "custom"
-# client_id = ""             # prefer OAUTH2_CLIENT_ID env var
-# client_secret = ""         # prefer OAUTH2_CLIENT_SECRET env var
-# refresh_token = ""         # prefer OAUTH2_REFRESH_TOKEN env var
+# [[accounts]]
+# name = "Work"
+# host = "outlook.office365.com"
+# port = 993
+# username = "user@company.com"
+# read_only = true
+# auth_method = "oauth2"
 #
-# # Outlook365 only:
-# # tenant = "common"        # or specific tenant ID
-#
-# # Custom provider only:
-# # token_url = "https://..."
+# [accounts.oauth2]
+# provider = "outlook365"
+# tenant = "your-tenant-id"
+# client_id = ""
+# client_secret = ""
+# refresh_token = ""

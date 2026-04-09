@@ -9,7 +9,7 @@ use tokio::net::TcpStream;
 use tokio_rustls::TlsConnector;
 use tokio_rustls::client::TlsStream;
 
-use crate::config::{AuthConfig, AuthMethod, ImapConfig};
+use crate::config::{AccountConfig, AuthMethod};
 use crate::email::{self, EmailFull, EmailSummary};
 
 use std::time::Duration;
@@ -18,8 +18,7 @@ type ImapSession = Session<TlsStream<TcpStream>>;
 
 pub struct ImapClient {
     session: Option<ImapSession>,
-    imap_config: ImapConfig,
-    auth_config: AuthConfig,
+    config: AccountConfig,
     allowed_folders: Option<HashSet<String>>,
     selected_folder: Option<String>,
     selected_exists: u32,
@@ -27,16 +26,15 @@ pub struct ImapClient {
 }
 
 impl ImapClient {
-    pub fn new(imap_config: ImapConfig, auth_config: AuthConfig) -> Self {
-        let allowed_folders = imap_config
+    pub fn new(config: AccountConfig) -> Self {
+        let allowed_folders = config
             .allowed_folders
             .as_ref()
             .map(|f| f.iter().cloned().collect());
 
         Self {
             session: None,
-            imap_config,
-            auth_config,
+            config,
             allowed_folders,
             selected_folder: None,
             selected_exists: 0,
@@ -48,29 +46,29 @@ impl ImapClient {
         let tls_stream = self.establish_tls().await?;
         let client = async_imap::Client::new(tls_stream);
 
-        let session = match self.auth_config.method {
+        let session = match self.config.auth_method {
             AuthMethod::Password => {
                 let password = self
-                    .auth_config
+                    .config
                     .password
                     .as_deref()
                     .context("Password required but not configured")?;
                 client
-                    .login(&self.imap_config.username, password)
+                    .login(&self.config.username, password)
                     .await
                     .map_err(|(e, _)| e)
                     .context("IMAP login failed")?
             }
             AuthMethod::OAuth2 => {
                 let oauth2_config = self
-                    .auth_config
+                    .config
                     .oauth2
                     .as_ref()
                     .context("OAuth2 config required")?;
                 let access_token = crate::oauth2::refresh_access_token(oauth2_config).await?;
                 let auth_string = format!(
                     "user={}\x01auth=Bearer {}\x01\x01",
-                    self.imap_config.username, access_token
+                    self.config.username, access_token
                 );
                 client
                     .authenticate("XOAUTH2", XOAuth2Authenticator(auth_string))
@@ -81,8 +79,8 @@ impl ImapClient {
         };
 
         tracing::info!(
-            host = %self.imap_config.host,
-            user = %self.imap_config.username,
+            host = %self.config.host,
+            user = %self.config.username,
             "Connected to IMAP server"
         );
 
@@ -535,7 +533,7 @@ impl ImapClient {
     }
 
     async fn establish_tls(&self) -> Result<TlsStream<TcpStream>> {
-        let addr = format!("{}:{}", self.imap_config.host, self.imap_config.port);
+        let addr = format!("{}:{}", self.config.host, self.config.port);
         let tcp_stream = TcpStream::connect(&addr)
             .await
             .with_context(|| format!("Failed to connect to {addr}"))?;
@@ -547,7 +545,7 @@ impl ImapClient {
             .with_interval(Duration::from_secs(10));
         sock_ref.set_tcp_keepalive(&keepalive)?;
 
-        let tls_config = if self.imap_config.accept_invalid_certs {
+        let tls_config = if self.config.accept_invalid_certs {
             rustls::ClientConfig::builder()
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
@@ -561,7 +559,7 @@ impl ImapClient {
         };
 
         let connector = TlsConnector::from(Arc::new(tls_config));
-        let domain = rustls::pki_types::ServerName::try_from(self.imap_config.host.clone())
+        let domain = rustls::pki_types::ServerName::try_from(self.config.host.clone())
             .context("Invalid server hostname")?;
 
         let tls_stream = connector
@@ -614,7 +612,8 @@ pub struct FolderInfo {
 impl std::fmt::Debug for ImapClient {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ImapClient")
-            .field("host", &self.imap_config.host)
+            .field("name", &self.config.name)
+            .field("host", &self.config.host)
             .field("connected", &self.session.is_some())
             .field("selected_folder", &self.selected_folder)
             .finish_non_exhaustive()

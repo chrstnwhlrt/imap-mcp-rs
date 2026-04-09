@@ -6,7 +6,15 @@ use crate::imap_client::{escape_imap_string, iso_to_imap_date};
 use super::{ImapMcpServer, error_json};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListFoldersRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListEmailsRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Maximum number of results (default: 20)")]
@@ -19,6 +27,8 @@ pub struct ListEmailsRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetEmailRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UID (from list_emails or search_emails results)")]
@@ -27,6 +37,8 @@ pub struct GetEmailRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetThreadRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UID of any message in the thread")]
@@ -35,6 +47,8 @@ pub struct GetThreadRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchEmailsRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
     #[schemars(description = "Folder to search (omit to search all folders)")]
     pub folder: Option<String>,
     #[schemars(description = "Full-text search in body and headers")]
@@ -59,8 +73,12 @@ pub struct SearchEmailsRequest {
     pub limit: Option<u32>,
 }
 
-pub async fn list_folders(server: &ImapMcpServer) -> String {
-    let mut client = server.client.lock().await;
+pub async fn list_folders(server: &ImapMcpServer, req: ListFoldersRequest) -> String {
+    let (_, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    let mut client = client_arc.lock().await;
     match client.list_folders().await {
         Ok(folders) => {
             serde_json::to_string(&folders).unwrap_or_else(|e| error_json(&e.to_string()))
@@ -70,7 +88,11 @@ pub async fn list_folders(server: &ImapMcpServer) -> String {
 }
 
 pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> String {
-    let mut client = server.client.lock().await;
+    let (_, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    let mut client = client_arc.lock().await;
     let limit = req.limit.unwrap_or(20);
     let offset = req.offset.unwrap_or(0);
     let unread_only = req.unread_only.unwrap_or(false);
@@ -93,7 +115,11 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Stri
 }
 
 pub async fn get_email(server: &ImapMcpServer, req: GetEmailRequest) -> String {
-    let mut client = server.client.lock().await;
+    let (_, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    let mut client = client_arc.lock().await;
     match client.get_email(&req.folder, req.uid).await {
         Ok(Some(email)) => {
             serde_json::to_string(&email).unwrap_or_else(|e| error_json(&e.to_string()))
@@ -107,7 +133,11 @@ pub async fn get_email(server: &ImapMcpServer, req: GetEmailRequest) -> String {
 }
 
 pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> String {
-    let mut client = server.client.lock().await;
+    let (_, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    let mut client = client_arc.lock().await;
     match client.get_thread(&req.folder, req.uid).await {
         Ok(emails) => {
             let subject = emails
@@ -181,7 +211,11 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
     let criteria = criteria_parts.join(" ");
     let limit = req.limit.unwrap_or(20);
 
-    let mut client = server.client.lock().await;
+    let (_, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    let mut client = client_arc.lock().await;
 
     let folders = if let Some(folder) = &req.folder {
         vec![folder.clone()]
