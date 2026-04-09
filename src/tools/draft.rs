@@ -18,6 +18,8 @@ pub struct DraftReplyRequest {
     pub reply_all: Option<bool>,
     #[schemars(description = "Additional CC addresses")]
     pub cc: Option<Vec<String>>,
+    #[schemars(description = "File paths to attach (e.g. from download_attachment)")]
+    pub attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -34,6 +36,8 @@ pub struct DraftForwardRequest {
     pub body: Option<String>,
     #[schemars(description = "Optional CC addresses")]
     pub cc: Option<Vec<String>>,
+    #[schemars(description = "File paths to attach (e.g. from download_attachment)")]
+    pub attachments: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -50,6 +54,8 @@ pub struct DraftEmailRequest {
     pub cc: Option<Vec<String>>,
     #[schemars(description = "BCC addresses")]
     pub bcc: Option<Vec<String>>,
+    #[schemars(description = "File paths to attach (e.g. from download_attachment)")]
+    pub attachments: Option<Vec<String>>,
 }
 
 #[allow(clippy::too_many_lines)]
@@ -145,6 +151,14 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
         false
     };
 
+    let attachment_data = match read_attachments(req.attachments.as_ref()) {
+        Ok(a) => a,
+        Err(e) => return error_json(&e),
+    };
+    for (content_type, filename, bytes) in &attachment_data {
+        builder = builder.attachment(*content_type, filename.as_str(), bytes.clone());
+    }
+
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
         Err(e) => return error_json(&format!("Failed to build MIME message: {e}")),
@@ -235,6 +249,14 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
         }
     }
 
+    let attachment_data = match read_attachments(req.attachments.as_ref()) {
+        Ok(a) => a,
+        Err(e) => return error_json(&e),
+    };
+    for (content_type, filename, bytes) in &attachment_data {
+        builder = builder.attachment(*content_type, filename.as_str(), bytes.clone());
+    }
+
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
         Err(e) => return error_json(&format!("Failed to build MIME message: {e}")),
@@ -286,6 +308,14 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
         }
     }
 
+    let attachment_data = match read_attachments(req.attachments.as_ref()) {
+        Ok(a) => a,
+        Err(e) => return error_json(&e),
+    };
+    for (content_type, filename, bytes) in &attachment_data {
+        builder = builder.attachment(*content_type, filename.as_str(), bytes.clone());
+    }
+
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
         Err(e) => return error_json(&format!("Failed to build MIME message: {e}")),
@@ -318,6 +348,60 @@ fn format_sender(from: Option<&crate::email::EmailAddress>) -> String {
             None => a.address.clone(),
         },
     )
+}
+
+/// Read attachment files from disk. Returns (content_type, filename, bytes) tuples.
+type AttachmentData = Vec<(&'static str, String, Vec<u8>)>;
+
+fn read_attachments(attachments: Option<&Vec<String>>) -> Result<AttachmentData, String> {
+    let Some(paths) = attachments else {
+        return Ok(vec![]);
+    };
+    let mut result = Vec::new();
+    for path_str in paths {
+        let path = std::path::Path::new(path_str);
+        let bytes = std::fs::read(path)
+            .map_err(|e| format!("Failed to read attachment \"{path_str}\": {e}"))?;
+        let filename = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .unwrap_or("attachment")
+            .to_string();
+        let content_type =
+            mime_type_from_extension(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
+        result.push((content_type, filename, bytes));
+    }
+    Ok(result)
+}
+
+fn mime_type_from_extension(ext: &str) -> &'static str {
+    match ext.to_lowercase().as_str() {
+        "pdf" => "application/pdf",
+        "zip" => "application/zip",
+        "gz" | "gzip" => "application/gzip",
+        "json" => "application/json",
+        "xml" => "application/xml",
+        "csv" => "text/csv",
+        "txt" => "text/plain",
+        "html" | "htm" => "text/html",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "mp4" => "video/mp4",
+        "doc" => "application/msword",
+        "docx" => "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        "xls" => "application/vnd.ms-excel",
+        "xlsx" => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        "ppt" => "application/vnd.ms-powerpoint",
+        "pptx" => "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+        "ics" => "text/calendar",
+        "eml" => "message/rfc822",
+        _ => "application/octet-stream",
+    }
 }
 
 fn truncate(s: &str, max_len: usize) -> String {

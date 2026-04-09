@@ -73,6 +73,18 @@ pub struct SearchEmailsRequest {
     pub limit: Option<u32>,
 }
 
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct DownloadAttachmentRequest {
+    #[schemars(description = "Account name (from list_accounts). Uses first account if omitted.")]
+    pub account: Option<String>,
+    #[schemars(description = "Folder name (e.g. \"INBOX\")")]
+    pub folder: String,
+    #[schemars(description = "Email UID (from list_emails or get_email results)")]
+    pub uid: u32,
+    #[schemars(description = "Attachment filename (from get_email attachments list)")]
+    pub filename: String,
+}
+
 pub async fn list_folders(server: &ImapMcpServer, req: ListFoldersRequest) -> String {
     let (_, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
@@ -243,6 +255,87 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
     serde_json::to_string(&serde_json::json!({
         "total_results": all_results.len(),
         "emails": all_results,
+    }))
+    .unwrap_or_else(|e| error_json(&e.to_string()))
+}
+
+pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachmentRequest) -> String {
+    use mail_parser::MimeHeaders;
+    use std::path::Path;
+    use uuid::Uuid;
+
+    let (_, client_arc) = match server.resolve_client(req.account.as_deref()) {
+        Ok(r) => r,
+        Err(e) => return error_json(&e),
+    };
+    let mut client = client_arc.lock().await;
+
+    // Fetch raw email bytes
+    let raw = match client.fetch_raw(&req.folder, req.uid).await {
+        Ok(Some(bytes)) => bytes,
+        Ok(None) => {
+            return error_json(&format!(
+                "Email with UID {} not found in {}",
+                req.uid, req.folder
+            ));
+        }
+        Err(e) => return error_json(&client.check_error(e).to_string()),
+    };
+
+    // Parse and find the attachment
+    let Some(message) = mail_parser::MessageParser::default().parse(&raw) else {
+        return error_json("Failed to parse email");
+    };
+
+    let attachment = message
+        .attachments()
+        .find(|att| att.attachment_name().unwrap_or("") == req.filename);
+
+    let Some(attachment) = attachment else {
+        return error_json(&format!(
+            "Attachment \"{}\" not found in email UID {}",
+            req.filename, req.uid
+        ));
+    };
+
+    let content_type = attachment.content_type().map_or_else(
+        || "application/octet-stream".to_string(),
+        |ct| {
+            if let Some(sub) = ct.subtype() {
+                format!("{}/{}", ct.ctype(), sub)
+            } else {
+                ct.ctype().to_string()
+            }
+        },
+    );
+
+    let contents = attachment.contents();
+    let size = contents.len();
+
+    // Determine file extension from original filename
+    let extension = Path::new(&req.filename)
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("bin");
+
+    // Save to /tmp/imap-mcp-rs/ with UUID filename
+    let dir = Path::new("/tmp/imap-mcp-rs");
+    if let Err(e) = std::fs::create_dir_all(dir) {
+        return error_json(&format!("Failed to create directory: {e}"));
+    }
+
+    let uuid = Uuid::new_v4();
+    let save_path = dir.join(format!("{uuid}.{extension}"));
+
+    if let Err(e) = std::fs::write(&save_path, contents) {
+        return error_json(&format!("Failed to write file: {e}"));
+    }
+
+    serde_json::to_string(&serde_json::json!({
+        "saved_to": save_path.to_string_lossy(),
+        "filename": req.filename,
+        "size": size,
+        "content_type": content_type,
     }))
     .unwrap_or_else(|e| error_json(&e.to_string()))
 }

@@ -6,7 +6,7 @@ Built in Rust. Packaged with Nix.
 
 ## Features
 
-- **14 tools** for complete email management
+- **15 tools** for complete email management including attachment downloads
 - **Multi-account** — configure multiple email accounts, switch between them by name
 - **Gmail, Outlook 365, and any IMAP server** — OAuth2 and password auth
 - **Single binary**, no runtime dependencies
@@ -79,6 +79,7 @@ The server finds `~/.config/imap-mcp-rs/config.toml` automatically. Override wit
 | `get_email` | Get a single email with full content: headers, body text, body HTML, attachment metadata, and flags. Uses `BODY.PEEK[]` so it does **not** mark the email as read. |
 | `get_thread` | Reconstruct a full conversation thread from any email in it. Searches by Message-ID, References, and In-Reply-To headers, with a subject-line fallback. Automatically includes your own replies from the Sent folder. |
 | `search_emails` | Search with multiple criteria combined via AND: `from`, `to`, `subject`, `text`, `since`/`before`, `is_read`, `is_flagged`, `is_answered`. At least one criterion required. Omit `folder` to search all folders. |
+| `download_attachment` | Download an email attachment to a local file. Returns the file path. Filenames are UUIDs with the original extension for safety. Use `get_email` first to see available attachments. |
 
 ### Organizing
 
@@ -96,9 +97,11 @@ All organizing tools support **batch operations** — pass an array of UIDs to o
 
 | Tool | Description |
 |------|-------------|
-| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, quoting). Supports `reply_all` and additional `cc`. Warns if original has no Message-ID. |
-| `draft_forward` | Forward an email with the original content included. Optionally add your own message above. |
-| `draft_email` | Compose a new email from scratch with `to`, `subject`, `body`, `cc`, `bcc`. |
+| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, quoting). Supports `reply_all`, `cc`, and `attachments`. |
+| `draft_forward` | Forward an email with the original content included. Optionally add message and `attachments`. |
+| `draft_email` | Compose a new email from scratch with `to`, `subject`, `body`, `cc`, `bcc`, and `attachments`. |
+
+All draft tools accept an optional `attachments` parameter — an array of local file paths to attach (e.g. from `download_attachment`).
 
 **All drafts** are saved to the Drafts folder for manual review and sending. Nothing is ever sent automatically.
 

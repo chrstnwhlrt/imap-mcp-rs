@@ -153,6 +153,18 @@ impl ImapMcpServer {
         read::search_emails(self, req).await
     }
 
+    #[tool(
+        description = "Download an email attachment to a local file. Returns the file path. Use get_email first to see available attachments."
+    )]
+    async fn download_attachment(
+        &self,
+        rmcp::handler::server::wrapper::Parameters(req): rmcp::handler::server::wrapper::Parameters<
+            read::DownloadAttachmentRequest,
+        >,
+    ) -> String {
+        read::download_attachment(self, req).await
+    }
+
     #[tool(description = "Move one or more emails to another folder.")]
     async fn move_email(
         &self,

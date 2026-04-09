@@ -26,3 +26,4 @@ mail-parser = "0.11.2"
 mail-builder = "0.4.4"
 futures-util = "0.3.32"
 socket2 = "0.6.3"
+uuid = { version = "1.23.0", features = ["v4"] }

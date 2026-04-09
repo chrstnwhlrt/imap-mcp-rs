@@ -261,6 +261,22 @@ impl ImapClient {
         Ok((summaries, total, matched))
     }
 
+    /// Fetch raw email bytes for a single message (for attachment extraction).
+    pub async fn fetch_raw(&mut self, folder: &str, uid: u32) -> Result<Option<Vec<u8>>> {
+        self.ensure_selected(folder).await?;
+        let session = self.session()?;
+        let stream = session
+            .uid_fetch(uid.to_string(), "(BODY.PEEK[] FLAGS)")
+            .await?;
+        let fetches: Vec<Fetch> = stream.try_collect().await?;
+
+        let Some(fetch) = fetches.first() else {
+            return Ok(None);
+        };
+
+        Ok(fetch.body().map(<[u8]>::to_vec))
+    }
+
     pub async fn get_email(&mut self, folder: &str, uid: u32) -> Result<Option<EmailFull>> {
         self.ensure_selected(folder).await?;
         let session = self.session()?;
