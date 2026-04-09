@@ -1,0 +1,30 @@
+# imap-mcp-rs configuration
+
+[account]
+# Set to true to disable all write operations (move, delete, flag, draft)
+read_only = false
+
+[imap]
+host = "imap.gmail.com"
+port = 993
+username = "user@gmail.com"
+# email = "user@gmail.com"  # From address for drafts (defaults to username)
+# Restrict accessible folders (optional, all folders accessible if omitted)
+# allowed_folders = ["INBOX", "[Gmail]/Sent Mail", "[Gmail]/Drafts"]
+
+[auth]
+# "password" or "oauth2"
+method = "password"
+# password = "app-specific-password"  # prefer IMAP_PASSWORD env var
+
+# [auth.oauth2]
+# provider = "gmail"        # "gmail", "outlook365", or "custom"
+# client_id = ""             # prefer OAUTH2_CLIENT_ID env var
+# client_secret = ""         # prefer OAUTH2_CLIENT_SECRET env var
+# refresh_token = ""         # prefer OAUTH2_REFRESH_TOKEN env var
+#
+# # Outlook365 only:
+# # tenant = "common"        # or specific tenant ID
+#
+# # Custom provider only:
+# # token_url = "https://..."

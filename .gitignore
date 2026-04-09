@@ -1,0 +1,6 @@
+/target
+/result
+/.mcp.json
+/.envrc
+.env
+config.test.toml
