@@ -531,6 +531,7 @@ impl ImapClient {
             .await
             .unwrap_or_else(|| "Drafts".to_string());
 
+        self.ensure_connected().await?;
         let session = self.session()?;
         session
             .append(&drafts, Some("(\\Draft)"), None, message_bytes)
@@ -825,6 +826,10 @@ fn strip_email_prefixes(subject: &str) -> &str {
             .or_else(|| trimmed.strip_prefix("fwd:"))
             .or_else(|| trimmed.strip_prefix("Fw:"))
             .or_else(|| trimmed.strip_prefix("FW:"))
+            .or_else(|| trimmed.strip_prefix("AW:"))
+            .or_else(|| trimmed.strip_prefix("Aw:"))
+            .or_else(|| trimmed.strip_prefix("WG:"))
+            .or_else(|| trimmed.strip_prefix("Wg:"))
         {
             s = rest;
         } else {

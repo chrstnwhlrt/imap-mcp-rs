@@ -6,6 +6,17 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize, Clone)]
 pub struct ServerConfig {
     pub accounts: Vec<AccountConfig>,
+    /// Filesystem directories from which attachment files may be read.
+    /// Defaults to `["/tmp/imap-mcp-rs"]` (where `download_attachment` saves
+    /// files). Paths outside these directories are rejected — this prevents
+    /// a prompt-injected LLM from attaching arbitrary local files like SSH
+    /// keys or /etc/passwd. Symlinks are resolved via `canonicalize`.
+    #[serde(default = "default_attachment_dirs")]
+    pub allowed_attachment_dirs: Vec<String>,
+}
+
+fn default_attachment_dirs() -> Vec<String> {
+    vec!["/tmp/imap-mcp-rs".to_string()]
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -18,6 +29,13 @@ pub struct AccountConfig {
     pub username: String,
     /// Email address used as From in drafts. Defaults to username if not set.
     pub email: Option<String>,
+    /// Display name for From header (e.g. "John Doe").
+    pub display_name: Option<String>,
+    /// HTML signature appended to all drafts from this account.
+    pub signature_html: Option<String>,
+    /// Locale for draft formatting: "en" or "de". Controls labels (From/Von),
+    /// date format, font, and reply/forward prefixes. Defaults to "en".
+    pub locale: Option<String>,
     #[serde(default)]
     pub read_only: bool,
     #[serde(default = "default_true")]

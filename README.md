@@ -21,7 +21,7 @@ Built in Rust. Packaged with Nix.
 ### Install with Nix
 
 ```bash
-nix profile install github:chrstnwhlrt/imap-mcp-rs
+nix profile add github:chrstnwhlrt/imap-mcp-rs
 ```
 
 ### Build from source
@@ -30,7 +30,7 @@ nix profile install github:chrstnwhlrt/imap-mcp-rs
 git clone https://github.com/chrstnwhlrt/imap-mcp-rs.git
 cd imap-mcp-rs
 nix build
-nix profile install .
+nix profile add .
 ```
 
 ### Configure
@@ -101,7 +101,15 @@ All organizing tools support **batch operations** — pass an array of UIDs to o
 | `draft_forward` | Forward an email with the original content included. Optionally add message and `attachments`. |
 | `draft_email` | Compose a new email from scratch with `to`, `subject`, `body`, `cc`, `bcc`, and `attachments`. |
 
-All draft tools accept an optional `attachments` parameter — an array of local file paths to attach (e.g. from `download_attachment`).
+Drafts are rendered as **Outlook Web–style HTML** with proper structure: `<html>`/`<head>` wrapper, `elementToProof` classes, signature wrapper, appendonsend marker, and `divRplyFwdMsg` quote blocks. In most mail clients the output is indistinguishable from drafts composed in Outlook Web directly.
+
+**Draft customization** (per-account in config):
+
+- **`display_name`** — Name shown in the From header (e.g. `"John Doe" <john@example.com>`)
+- **`signature_html`** — HTML signature appended to all drafts. Raw HTML is inserted (use TOML literal `'''...'''` strings to avoid escape hell)
+- **`locale = "en"` / `"de"`** — Controls reply prefix (`Re:` / `AW:`), forward prefix (`Fwd:` / `WG:`), quote labels (`From/Sent/To/Subject` / `Von/Gesendet/An/Betreff`), date format, and body font (Aptos for EN, Tahoma for DE)
+
+**Attachments** — all draft tools accept an optional `attachments` parameter (array of local file paths). Attachment paths must be within `allowed_attachment_dirs` (default: `/tmp/imap-mcp-rs` where `download_attachment` saves downloaded files). Paths outside the whitelist are rejected, and symlink/`..` escapes are blocked via `canonicalize`. See [Security](#security) for the threat model.
 
 **All drafts** are saved to the Drafts folder for manual review and sending. Nothing is ever sent automatically.
 
@@ -185,11 +193,11 @@ Several tools need to find special folders (Drafts, Sent, Trash). Since folder n
 
 | Role | Matched names |
 |------|---------------|
-| **Sent** | `Sent`, `Sent Items`, `Sent Mail`, `[Gmail]/Sent Mail`, `INBOX.Sent`, `Gesendete Elemente`, `Gesendete Objekte` |
-| **Trash** | `Trash`, `[Gmail]/Trash`, `Deleted Items`, `INBOX.Trash`, `Papierkorb`, `Gelöschte Elemente` |
-| **Drafts** | `Drafts`, `[Gmail]/Drafts`, `Draft`, `INBOX.Drafts`, `Entwürfe` |
+| **Sent** | `Sent`, `Sent Items`, `Sent Mail`, `[Gmail]/Sent Mail`, `[Google Mail]/Sent Mail`, `[Google Mail]/Gesendet`, `INBOX.Sent`, `Gesendete Elemente`, `Gesendete Objekte` |
+| **Trash** | `Trash`, `[Gmail]/Trash`, `[Google Mail]/Trash`, `[Google Mail]/Papierkorb`, `Deleted Items`, `INBOX.Trash`, `Papierkorb`, `Gelöschte Elemente`, `Gel&APY-schte Elemente` |
+| **Drafts** | `Drafts`, `[Gmail]/Drafts`, `[Google Mail]/Drafts`, `[Google Mail]/Entwürfe`, `[Google Mail]/Entw&APw-rfe`, `Draft`, `INBOX.Drafts`, `Entwürfe`, `Entw&APw-rfe` |
 
-Matching is case-insensitive. If no match is found, the server falls back to the English default name.
+Matching is case-insensitive. Both the decoded name (e.g. `Entwürfe`) and the IMAP modified UTF-7 encoded form (e.g. `Entw&APw-rfe`) are recognized, so German and other non-ASCII folder names work regardless of how the server returns them. If no match is found, the server falls back to the English default name.
 
 ## Connection Handling
 
@@ -208,6 +216,7 @@ The server maintains one persistent IMAP connection per account with several res
 - **Credential protection** — passwords, client secrets, and tokens are redacted in debug/log output
 - **No automatic sending** — the server can only create drafts, never send emails
 - **Prompt injection defense** — server instructions explicitly tell the LLM that email content is untrusted external data
+- **Attachment directory whitelist** — draft attachments can only be read from directories listed in `allowed_attachment_dirs` (default: `/tmp/imap-mcp-rs`). Paths are canonicalized, so symlink escapes and `..` traversal are blocked. This prevents a prompt-injected LLM from attaching arbitrary local files (SSH keys, `/etc/passwd`, etc.)
 
 ### Prompt injection
 
@@ -293,12 +302,18 @@ User: "Check my emails"
 ### Full config reference
 
 ```toml
+# Server-wide setting (top level, before [[accounts]])
+allowed_attachment_dirs = ["/tmp/imap-mcp-rs"]  # Whitelist for draft attachments
+
 [[accounts]]
 name = "Personal"                   # Account name (used in tool calls)
 host = "imap.gmail.com"             # IMAP server hostname
 port = 993                          # IMAP port (993 for TLS)
 username = "user@gmail.com"         # IMAP login username
 email = "user@gmail.com"            # From address for drafts (defaults to username)
+display_name = "John Doe"           # Name in From header ("John Doe <user@gmail.com>")
+locale = "en"                       # "en" or "de" — Outlook-style draft formatting
+signature_html = '<div style="color:#888;margin-top:12px;">Best regards,<br>John Doe</div>'
 read_only = false                   # true = only read tools, write/draft blocked
 allow_delete = true                 # false = delete_email blocked
 allow_move = true                   # false = move_email blocked
@@ -502,7 +517,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run all CI checks (build + clippy pedantic + fmt)
-nix profile install .          # Install release binary to PATH
+nix profile add .          # Install release binary to PATH
 cargo fmt                      # Format code
 ```
 
@@ -524,10 +539,10 @@ src/
 ├── oauth2.rs         OAuth2 token refresh (Gmail, Outlook 365, custom)
 ├── imap_client.rs    IMAP client: connection, caching, reconnect, all operations
 └── tools/
-    ├── mod.rs        MCP server, tool registration, account resolution
-    ├── read.rs       list_folders, list_emails, get_email, get_thread, search_emails
+    ├── mod.rs        MCP server, tool registration, account resolution, list_accounts
+    ├── read.rs       list_folders, list_emails, get_email, get_thread, search_emails, download_attachment
     ├── write.rs      mark_as_read/unread, flag_email, move_email, delete_email
-    └── draft.rs      draft_reply, draft_forward, draft_email
+    └── draft.rs      draft_reply, draft_forward, draft_email (Outlook Web–style HTML)
 ```
 
 ### Key design decisions

@@ -1,17 +1,27 @@
 # imap-mcp-rs configuration
 # Each [[accounts]] entry defines one email account.
 
+# Filesystem directories from which attachment files may be read when composing
+# drafts. Defaults to just "/tmp/imap-mcp-rs" (where download_attachment saves
+# downloaded files). Paths outside these dirs are rejected — this prevents a
+# prompt-injected LLM from attaching arbitrary local files like SSH keys.
+# Symlinks are resolved, so links that escape the whitelist are also rejected.
+# allowed_attachment_dirs = ["/tmp/imap-mcp-rs", "/home/user/Documents"]
+
 [[accounts]]
 name = "Personal"
 host = "imap.gmail.com"
 port = 993
 username = "user@gmail.com"
-# email = "user@gmail.com"        # From address for drafts (defaults to username)
-# read_only = false                # true = only read tools, no write/draft
-# allow_delete = true              # false = delete_email blocked
-# allow_move = true                # false = move_email blocked
-# accept_invalid_certs = false     # true for self-signed certs (testing only!)
-# allowed_folders = ["INBOX"]      # restrict accessible folders (optional)
+# email = "user@gmail.com"         # From address for drafts (defaults to username)
+# display_name = "John Doe"        # Name shown in From header (e.g. "John Doe <user@gmail.com>")
+# locale = "en"                     # "en" or "de" — controls draft labels, date format, font, prefixes
+# signature_html = '<div style="color:#888;margin-top:12px;">Best regards,<br>John Doe</div>'
+# read_only = false                 # true = only read tools, no write/draft
+# allow_delete = true               # false = delete_email blocked
+# allow_move = true                 # false = move_email blocked
+# accept_invalid_certs = false      # true for self-signed certs (testing only!)
+# allowed_folders = ["INBOX"]       # restrict accessible folders (optional)
 auth_method = "password"
 password = "your-app-specific-password"  # or use a .env file
 
@@ -20,6 +30,9 @@ password = "your-app-specific-password"  # or use a .env file
 # host = "outlook.office365.com"
 # port = 993
 # username = "user@company.com"
+# email = "user@company.com"
+# display_name = "John Doe"
+# locale = "en"
 # read_only = true
 # auth_method = "oauth2"
 #

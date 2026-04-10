@@ -32,6 +32,10 @@ async fn main() -> anyhow::Result<()> {
 
     let config = config::load_config(config_path.as_deref())?;
 
+    // Ensure the default attachment dir exists so the whitelist check can
+    // canonicalize it. Downloads save here; drafts read from here.
+    let _ = std::fs::create_dir_all("/tmp/imap-mcp-rs");
+
     // Connect all accounts (soft errors — failed accounts reconnect on first use)
     let mut clients = HashMap::new();
     for account in &config.accounts {
