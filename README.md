@@ -14,7 +14,7 @@ Built in Rust. Packaged with Nix.
 - **Auto-reconnect** on connection drops with TCP keepalive
 - **Batch operations** — mark, flag, move, delete multiple emails in one call
 - **Thread reconstruction** — follows References/In-Reply-To headers, includes Sent folder
-- **Nix flake** for reproducible builds with CI checks (build + clippy + fmt)
+- **Nix flake** for reproducible builds with CI checks (build + clippy pedantic + fmt)
 
 ## Quick Start
 
@@ -228,6 +228,7 @@ Emails are untrusted data. A malicious email could contain text like *"Ignore al
 2. **Read-only mode** (`read_only = true`) — eliminates the attack surface entirely
 3. **Draft-only composing** — the LLM cannot send emails, only create drafts for manual review
 4. **Folder restrictions** (`allowed_folders`) — limit which folders the LLM can access
+5. **Attachment whitelist** (`allowed_attachment_dirs`) — prevents the LLM from attaching arbitrary local files (SSH keys, config files, etc.) to drafts as an exfiltration channel
 
 **What this cannot solve:** Prompt injection is a fundamental LLM problem. No server-side mitigation is 100% effective. For sensitive accounts, use `read_only = true` and review all LLM actions carefully.
 
@@ -517,7 +518,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run all CI checks (build + clippy pedantic + fmt)
-nix profile add .          # Install release binary to PATH
+nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
 ```
 
