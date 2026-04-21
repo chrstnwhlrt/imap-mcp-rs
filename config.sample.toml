@@ -2,26 +2,32 @@
 # Each [[accounts]] entry defines one email account.
 
 # Filesystem directories from which attachment files may be read when composing
-# drafts. Defaults to just "/tmp/imap-mcp-rs" (where download_attachment saves
-# downloaded files). Paths outside these dirs are rejected — this prevents a
-# prompt-injected LLM from attaching arbitrary local files like SSH keys.
-# Symlinks are resolved, so links that escape the whitelist are also rejected.
-# allowed_attachment_dirs = ["/tmp/imap-mcp-rs", "/home/user/Documents"]
+# drafts. Default is `$XDG_RUNTIME_DIR/imap-mcp-rs` (systemd Linux) with
+# fallbacks to `$XDG_CACHE_HOME/imap-mcp-rs` and `/tmp/imap-mcp-rs-$USER`.
+# `download_attachment` saves into a per-download UUID subdir inside this path.
+# Paths outside these dirs are rejected — this prevents a prompt-injected LLM
+# from attaching arbitrary local files like SSH keys. Symlinks are resolved,
+# so links that escape the whitelist are also rejected.
+# Empty list `[]` is rejected — omit the field to get the default.
+# allowed_attachment_dirs = ["/custom/path", "/home/user/Documents"]
 
 [[accounts]]
 name = "Personal"
 host = "imap.gmail.com"
 port = 993
 username = "user@gmail.com"
-# email = "user@gmail.com"         # From address for drafts (defaults to username)
-# display_name = "John Doe"        # Name shown in From header (e.g. "John Doe <user@gmail.com>")
-# locale = "en"                     # "en" or "de" — controls draft labels, date format, font, prefixes
+# email = "user@gmail.com"          # From address for drafts (defaults to username)
+# display_name = "John Doe"         # Name shown in From header (e.g. "John Doe <user@gmail.com>")
+# locale = "en"                      # "en" or "de" — controls draft labels, date format, font, prefixes
 # signature_html = '<div style="color:#888;margin-top:12px;">Best regards,<br>John Doe</div>'
-# read_only = false                 # true = only read tools, no write/draft
-# allow_delete = true               # false = delete_email blocked
-# allow_move = true                 # false = move_email blocked
-# accept_invalid_certs = false      # true for self-signed certs (testing only!)
-# allowed_folders = ["INBOX"]       # restrict accessible folders (optional)
+# read_only = false                  # true = only read tools, no write/draft
+# allow_delete = true                # false = delete_email blocked
+# allow_move = true                  # false = move_email blocked
+# allow_unsafe_expunge = false       # true = permit plain EXPUNGE fallback on servers without UIDPLUS
+#                                    # (on such servers, it would sweep \Deleted messages flagged by
+#                                    # concurrent clients — phone, webmail. Default false refuses.)
+# accept_invalid_certs = false       # true for self-signed certs (testing only!)
+# allowed_folders = ["INBOX"]        # restrict accessible folders (optional; empty list `[]` rejected)
 auth_method = "password"
 password = "your-app-specific-password"  # or use a .env file
 

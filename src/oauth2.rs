@@ -1,3 +1,9 @@
+//! `OAuth2` refresh-token flow for Gmail and Outlook 365.
+//!
+//! Exchanges the long-lived refresh token (stored in config) for a short-lived
+//! access token, which the IMAP layer then sends as `XOAUTH2`. We talk HTTPS
+//! directly — no HTTP client crate dependency.
+
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -10,9 +16,34 @@ const OAUTH2_TIMEOUT: Duration = Duration::from_secs(30);
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
     access_token: String,
+    /// Seconds until the access token expires. Gmail and Outlook 365 both
+    /// return 3600 (1 hour). Treated as a hint — the IMAP server is the
+    /// authoritative source of truth if we see an auth error.
+    #[serde(default)]
+    expires_in: Option<u64>,
 }
 
-pub async fn refresh_access_token(config: &OAuth2Config) -> Result<String> {
+/// Access token with its absolute expiry deadline, used by callers to cache
+/// across reconnects and avoid burning a 100-500ms HTTPS roundtrip to the
+/// OAuth provider every time the IMAP session drops.
+#[derive(Debug, Clone)]
+pub struct AccessToken {
+    pub token: String,
+    pub expires_at: std::time::Instant,
+}
+
+impl AccessToken {
+    /// Conservative expiry check: 1 minute of slack so we don't present a
+    /// token that expires while in flight.
+    pub fn is_valid(&self) -> bool {
+        const SLACK: Duration = Duration::from_mins(1);
+        self.expires_at > std::time::Instant::now() + SLACK
+    }
+}
+
+/// Fetch a fresh access token. Returns the raw token plus its expiry deadline
+/// so callers can cache and reuse it until expiry.
+pub async fn refresh_access_token(config: &OAuth2Config) -> Result<AccessToken> {
     let token_url = config.token_url()?;
     let client_id = config
         .client_id
@@ -38,18 +69,30 @@ pub async fn refresh_access_token(config: &OAuth2Config) -> Result<String> {
         .await
         .context("OAuth2 token refresh timed out")?
         .map_err(|e| {
-            tracing::error!("OAuth2 HTTP request failed: {e:#}");
+            // Use `{e}` (not `{e:#}`) so the full chain — which can embed
+            // server-returned body bytes — doesn't hit the stderr log.
+            tracing::error!("OAuth2 HTTP request failed: {e}");
             e
         })
         .context("OAuth2 token refresh failed")?;
 
-    let token_response: TokenResponse = serde_json::from_str(&response).with_context(|| {
-        let preview: String = response.chars().take(200).collect();
-        format!("Failed to parse OAuth2 token response: {preview}")
-    })?;
+    // Do NOT embed the response body in the error message: a success-shaped
+    // but unparseable response could contain the access_token itself, and
+    // anyhow error chains get surfaced through tool responses + tracing.
+    let token_response: TokenResponse = serde_json::from_str(&response)
+        .context("Failed to parse OAuth2 token response (body omitted from log)")?;
 
-    tracing::debug!("OAuth2 access token refreshed successfully");
-    Ok(token_response.access_token)
+    // Default to 30 minutes if the server omits `expires_in` — conservative
+    // compared to Gmail/Outlook's typical 3600s, prevents stale-token reuse.
+    let ttl = Duration::from_secs(token_response.expires_in.unwrap_or(1800));
+    tracing::debug!(
+        expires_in_secs = ttl.as_secs(),
+        "OAuth2 access token refreshed"
+    );
+    Ok(AccessToken {
+        token: token_response.access_token,
+        expires_at: std::time::Instant::now() + ttl,
+    })
 }
 
 fn urlencoded(s: &str) -> String {
@@ -73,6 +116,11 @@ async fn minimal_https_post(url: &str, body: &str) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
     use tokio_rustls::TlsConnector;
+
+    // Cap the buffer: a compromised token endpoint or TLS-terminating proxy
+    // could stream gigabytes pre-EOF to OOM the process. Legitimate token
+    // responses are <2 KB.
+    const MAX_RESPONSE_BYTES: usize = 1024 * 1024;
 
     let url_parsed: url_parts::UrlParts = url.parse().context("Invalid token URL")?;
 
@@ -114,7 +162,12 @@ async fn minimal_https_post(url: &str, body: &str) -> Result<String> {
     loop {
         match tls.read(&mut buf).await {
             Ok(0) => break,
-            Ok(n) => response_bytes.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                response_bytes.extend_from_slice(&buf[..n]);
+                if response_bytes.len() > MAX_RESPONSE_BYTES {
+                    anyhow::bail!("OAuth2 response exceeded {MAX_RESPONSE_BYTES} bytes — aborting");
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
             Err(e) => return Err(e.into()),
         }
@@ -167,7 +220,20 @@ mod url_parts {
                 (host_port.to_string(), 443)
             };
 
-            Ok(UrlParts { host, port, path })
+            // Reject control/CR/LF/whitespace in host + path. The `token_url`
+            // from config is splatted into a raw HTTP request line AND the
+            // Host header; without this check a malicious `custom` OAuth2
+            // URL like `https://host/path\r\nX-Injected: ...` would splice
+            // extra headers or smuggle a second request into the TLS session.
+            let invalid = |c: char| c.is_control() || c == ' ' || c == '\t';
+            if host.chars().any(invalid) {
+                anyhow::bail!("token_url host contains invalid characters");
+            }
+            if path.chars().any(invalid) {
+                anyhow::bail!("token_url path contains invalid characters");
+            }
+
+            Ok(Self { host, port, path })
         }
     }
 }

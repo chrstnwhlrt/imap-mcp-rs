@@ -1,3 +1,10 @@
+//! TOML config loading and validation.
+//!
+//! Supports multiple `[[accounts]]` blocks, each with either password or
+//! `OAuth2` (Gmail / Outlook 365) auth. Per-account `read_only` / `allow_move` /
+//! `allow_delete` switches act as a hard safety gate independent of the
+//! configured `allowed_folders` whitelist.
+
 use std::{env, fs, path::PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -16,7 +23,23 @@ pub struct ServerConfig {
 }
 
 fn default_attachment_dirs() -> Vec<String> {
-    vec!["/tmp/imap-mcp-rs".to_string()]
+    vec![default_attachment_dir()]
+}
+
+/// Default attachment directory. Prefer `$XDG_RUNTIME_DIR` (guaranteed 0700
+/// and user-private on systemd systems) so a multi-user host cannot race us
+/// into a symlink. Falls back to a cache-dir location, finally `/tmp` —
+/// still per-user by virtue of the username suffix on systems where
+/// `dirs::cache_dir()` also fails.
+pub fn default_attachment_dir() -> String {
+    if let Some(runtime) = dirs::runtime_dir() {
+        return runtime.join("imap-mcp-rs").to_string_lossy().into_owned();
+    }
+    if let Some(cache) = dirs::cache_dir() {
+        return cache.join("imap-mcp-rs").to_string_lossy().into_owned();
+    }
+    let user = env::var("USER").unwrap_or_else(|_| "default".to_string());
+    format!("/tmp/imap-mcp-rs-{user}")
 }
 
 #[allow(clippy::struct_excessive_bools)]
@@ -44,6 +67,15 @@ pub struct AccountConfig {
     pub allow_move: bool,
     #[serde(default)]
     pub accept_invalid_certs: bool,
+    /// Opt-in: allow plain IMAP `EXPUNGE` when the server doesn't advertise
+    /// UIDPLUS (no `UID EXPUNGE`). Plain EXPUNGE removes every `\Deleted`
+    /// message in the folder — including ones flagged by a concurrent
+    /// client (phone, webmail) that hasn't expunged yet. On modern servers
+    /// (Gmail, Outlook 365, Dovecot, Cyrus) UIDPLUS is universal and this
+    /// never matters; on older/custom servers a permanent delete or move
+    /// will refuse unless this is explicitly enabled.
+    #[serde(default)]
+    pub allow_unsafe_expunge: bool,
     pub allowed_folders: Option<Vec<String>>,
     #[serde(default = "default_auth_method")]
     pub auth_method: AuthMethod,
@@ -72,22 +104,22 @@ impl std::fmt::Debug for AccountConfig {
     }
 }
 
-fn default_port() -> u16 {
+const fn default_port() -> u16 {
     993
 }
 
-fn default_true() -> bool {
+const fn default_true() -> bool {
     true
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum AuthMethod {
     Password,
     OAuth2,
 }
 
-fn default_auth_method() -> AuthMethod {
+const fn default_auth_method() -> AuthMethod {
     AuthMethod::Password
 }
 
@@ -121,7 +153,7 @@ impl std::fmt::Debug for OAuth2Config {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, PartialEq)]
+#[derive(Debug, Deserialize, Clone, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum OAuth2Provider {
     Gmail,
@@ -129,7 +161,7 @@ pub enum OAuth2Provider {
     Custom,
 }
 
-fn default_provider() -> OAuth2Provider {
+const fn default_provider() -> OAuth2Provider {
     OAuth2Provider::Gmail
 }
 
@@ -185,6 +217,49 @@ pub fn load_config(path: Option<&str>) -> Result<ServerConfig> {
         }
     }
 
+    // `sender_address()` falls back to `username` when `email` is unset. If
+    // the username is not an email (e.g. "alice" for a login-only IMAP setup),
+    // outgoing drafts would have a malformed From header that many MTAs
+    // reject. Fail loudly at config load instead of at first draft_email.
+    for account in &config.accounts {
+        if account.email.is_none() && !account.username.contains('@') {
+            bail!(
+                "Account \"{}\" needs an `email` field — username \"{}\" is not an email address \
+                 and drafts require a valid From header",
+                account.name,
+                account.username
+            );
+        }
+    }
+
+    // `allowed_folders = []` would make every folder operation return
+    // "not in allowed_folders", which is almost certainly a misconfiguration
+    // — users who want "deny all" don't configure the account at all, and
+    // users who want "allow all" omit the field entirely (default `None`).
+    // Fail loudly at load so the operator discovers the broken config at
+    // startup, not at first tool call.
+    for account in &config.accounts {
+        if account.allowed_folders.as_ref().is_some_and(Vec::is_empty) {
+            bail!(
+                "Account \"{}\" has an empty `allowed_folders` list — omit the field to allow \
+                 all folders, or list the folders you want to expose",
+                account.name
+            );
+        }
+    }
+
+    // Same rationale for `allowed_attachment_dirs = []`: if empty,
+    // `download_attachment` would silently fall back to the default dir
+    // (outside the user's explicit opt-out), and `draft_*` would reject
+    // every attachment anyway. Omit the field to get the default; don't
+    // provide an empty list.
+    if config.allowed_attachment_dirs.is_empty() {
+        bail!(
+            "`allowed_attachment_dirs = []` is invalid — omit the field for the default \
+             (XDG_RUNTIME_DIR), or list the dirs from which attachments may be read"
+        );
+    }
+
     tracing::info!("Loaded config from {}", config_path.display());
     for account in &config.accounts {
         tracing::info!(
@@ -200,8 +275,13 @@ pub fn load_config(path: Option<&str>) -> Result<ServerConfig> {
 }
 
 fn find_config_file() -> Option<PathBuf> {
+    // Deliberately do NOT search CWD: if the server is launched from a
+    // user-chosen directory, an attacker with write access to that directory
+    // could drop a `config.toml` with their own OAuth refresh tokens and
+    // have the MCP server read the attacker's mailbox. To opt in to a CWD
+    // config, the user must pass `--config ./config.toml` or set
+    // `IMAP_MCP_CONFIG=./config.toml` explicitly.
     let candidates = [
-        Some(PathBuf::from("config.toml")),
         dirs::config_dir().map(|d| d.join("imap-mcp-rs").join("config.toml")),
         Some(PathBuf::from("/etc/imap-mcp-rs/config.toml")),
     ];

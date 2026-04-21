@@ -6,15 +6,16 @@ Built in Rust. Packaged with Nix.
 
 ## Features
 
-- **15 tools** for complete email management including attachment downloads
+- **19 tools** for complete email management: accounts, folders with role detection, reading, searching, organizing, drafting, attachments, plus `account_health` for connection diagnostics
 - **Multi-account** — configure multiple email accounts, switch between them by name
 - **Gmail, Outlook 365, and any IMAP server** — OAuth2 and password auth
 - **Single binary**, no runtime dependencies
-- **Read-only mode** per account for safe exploration without risk
-- **Auto-reconnect** on connection drops with TCP keepalive
-- **Batch operations** — mark, flag, move, delete multiple emails in one call
-- **Thread reconstruction** — follows References/In-Reply-To headers, includes Sent folder
-- **Nix flake** for reproducible builds with CI checks (build + clippy pedantic + fmt)
+- **Per-account permissions** — `read_only`, `allow_move`, `allow_delete`, `allow_unsafe_expunge`
+- **Auto-reconnect** on connection drops with TCP keepalive and 15s reconnect timeout
+- **Batch operations** — mark, flag, move, delete, delete_draft take arrays of UIDs (capped at 1000 per call)
+- **Thread reconstruction** — `get_thread` follows References/In-Reply-To headers across primary and Sent folders; `list_emails(group_by_thread: true)` collapses inboxes into one row per conversation
+- **Destructive-op dry-run** — `move_email` / `delete_email` accept `dry_run: true` to preview without touching IMAP, so the LLM can confirm with the user before committing
+- **Nix flake** for reproducible builds; CI runs fmt + clippy pedantic + nursery + tests on Linux + macOS + nix flake check
 
 ## Quick Start
 
@@ -68,38 +69,42 @@ The server finds `~/.config/imap-mcp-rs/config.toml` automatically. Override wit
 
 | Tool | Description |
 |------|-------------|
-| `list_accounts` | List all configured email accounts with their names and addresses. Call this first to see available accounts. |
+| `list_accounts` | List all configured email accounts. Returns `{name, email, read_only, allow_move, allow_delete}` per account so the LLM can inspect permissions before planning destructive actions. Call this first. |
+| `account_health` | Diagnose connection state per account. Returns `{accounts: [{name, email, auth_method, connected, last_error?, oauth_token_valid?, oauth_expires_in_secs?}]}` — `auth_method` is `"password"` or `"oauth2"`; `oauth_token_valid` / `oauth_expires_in_secs` are present only for OAuth2 accounts. Answers "why is my Gmail not working?" without tailing logs. Pure local — no IMAP roundtrip. |
 
 ### Reading
 
 | Tool | Description |
 |------|-------------|
-| `list_folders` | List all available email folders with total and unread message counts. |
-| `list_emails` | List emails in a folder with preview snippets (~200 chars). Supports pagination via `limit`/`offset` and filtering with `unread_only`. Returns `total` (folder count) and `matched` (filter count). |
-| `get_email` | Get a single email with full content: headers, body text, body HTML, attachment metadata, and flags. Uses `BODY.PEEK[]` so it does **not** mark the email as read. |
-| `get_thread` | Reconstruct a full conversation thread from any email in it. Searches by Message-ID, References, and In-Reply-To headers, with a subject-line fallback. Automatically includes your own replies from the Sent folder. |
-| `search_emails` | Search with multiple criteria combined via AND: `from`, `to`, `subject`, `text`, `since`/`before`, `is_read`, `is_flagged`, `is_answered`. At least one criterion required. Omit `folder` to search all folders. |
-| `download_attachment` | Download an email attachment to a local file. Returns the file path. Filenames are UUIDs with the original extension for safety. Use `get_email` first to see available attachments. |
+| `list_folders` | List all email folders with total and unread message counts. Well-known folders (Drafts, Sent, Trash) include a `role` field set to `"drafts"` / `"sent"` / `"trash"` so the LLM can pick the right folder without heuristically matching localized names. |
+| `list_emails` | List emails in a folder with preview snippets (~200 chars). Supports pagination via `limit`/`offset`, filtering with `unread_only`, and conversation collapsing via `group_by_thread: true` (annotates `thread_message_count`, fetches 3× the limit internally). Summary rows include `to` truncated to 3 addresses plus `to_count` / `cc_count` for the real sizes — mass-mails don't inflate the response. Returns `total` (folder count) and `matched` (filter count). |
+| `get_email` | Get a single email with full content: headers, body text, attachment metadata, and flags. Uses `BODY.PEEK[]` so it does **not** mark the email as read. Pass `include_html: true` to include `body_html` (off by default — HTML bodies of marketing/order emails are typically 40–60 KB of inlined CSS). |
+| `get_thread` | Reconstruct a full conversation thread from any email in it. Searches by Message-ID, References, and In-Reply-To headers, with a subject-line fallback. Automatically includes your own replies from the Sent folder and deduplicates across folders by Message-ID. `include_html: true` to include HTML bodies. |
+| `search_emails` | Search with multiple criteria combined via AND: `from`/`from_any`/`from_all`, `to`, `subject`/`subject_all`, `text`/`text_any`/`text_all`, `since`/`before`, `is_read`, `is_flagged`, `is_answered`, `has_attachments`, `min_size`/`max_size` (bytes, IMAP-native). `_any` variants OR within a field (`["amazon.de", "paypal.com"]`); `_all` variants AND within a field (narrowing to emails mentioning all given terms). Non-ASCII search terms automatically use `CHARSET UTF-8`. At least one criterion required. Omit `folder` to search all folders (Gmail's `[Gmail]/All Mail` mirror is skipped to avoid duplicates). |
+| `download_attachment` | Download an email attachment to a local file under an allowed attachment directory. Each download gets its own UUID subdirectory containing the file under its **original sanitized filename** (e.g. `<base>/<uuid>/Lebenslauf.pdf`) — so re-attaching via `draft_*(attachments=[...])` preserves the original filename for the recipient. Use `get_email` first to see available attachments. |
 
 ### Organizing
 
-All organizing tools support **batch operations** — pass an array of UIDs to operate on multiple emails in a single call.
+All organizing tools support **batch operations** — pass an array of UIDs to operate on multiple emails in a single call (hard cap: 1000 UIDs per call).
 
 | Tool | Description |
 |------|-------------|
-| `mark_as_read` | Set the `\Seen` flag on one or more emails. |
+| `mark_as_read` | Set the `\Seen` flag on one or more emails. Returns only UIDs the server actually updated (stale UIDs are skipped silently, not lied about). |
 | `mark_as_unread` | Remove the `\Seen` flag from one or more emails. |
-| `flag_email` | Set or remove the `\Flagged` flag (shows as star in Gmail, flag in Outlook/Apple Mail). |
-| `move_email` | Move one or more emails from a source folder to a destination folder. |
-| `delete_email` | Delete one or more emails. Moves to Trash by default; set `permanent: true` for immediate deletion. |
+| `flag_email` | Set the `\Flagged` flag (shows as star in Gmail, flag in Outlook/Apple Mail). |
+| `unflag_email` | Remove the `\Flagged` flag. |
+| `move_email` | Move one or more emails from a source folder to a destination folder. Requires `allow_move = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, target_folder, uids, would_move}`; permission checks still fire so the preview also confirms the action would be allowed. Uses IMAP COPY + `\Deleted` + UID EXPUNGE; on partial failure surfaces a structured error so the caller doesn't retry into a duplicated message. |
+| `delete_email` | Delete one or more emails. Moves to Trash by default (`permanent: false`); `permanent: true` uses UID EXPUNGE scoped to just these UIDs. Requires `allow_delete = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, uids, permanent, would_move_to_trash \| would_expunge_permanently}` (which field is present depends on `permanent`). |
 
 ### Composing
 
 | Tool | Description |
 |------|-------------|
-| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, quoting). Supports `reply_all`, `cc`, and `attachments`. |
-| `draft_forward` | Forward an email with the original content included. Optionally add message and `attachments`. |
+| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, Outlook-style quoting). Supports `reply_all` (excludes your own address automatically), `cc`, and `attachments`. |
+| `draft_forward` | Forward an email with the original content included. **Requires `to`** — forwarding never auto-selects recipients the way `draft_reply` does. Optionally add message body, `cc`, and `attachments`. |
 | `draft_email` | Compose a new email from scratch with `to`, `subject`, `body`, `cc`, `bcc`, and `attachments`. |
+| `list_drafts` | List pending drafts in the account's Drafts folder (newest first). Supports `limit` / `offset` pagination. Useful for tracking drafts awaiting manual send. |
+| `delete_draft` | Delete one or more drafts via UID EXPUNGE (scoped — other drafts are untouched). Takes `uids: [u32...]` for batch cleanup; capped at 1000 per call. Returns `{account, succeeded: [uids]}`. Bypasses `allow_delete` because the Drafts folder is the user's own workspace; only `read_only = true` blocks it. |
 
 Drafts are rendered as **Outlook Web–style HTML** with proper structure: `<html>`/`<head>` wrapper, `elementToProof` classes, signature wrapper, appendonsend marker, and `divRplyFwdMsg` quote blocks. In most mail clients the output is indistinguishable from drafts composed in Outlook Web directly.
 
@@ -109,11 +114,11 @@ Drafts are rendered as **Outlook Web–style HTML** with proper structure: `<htm
 - **`signature_html`** — HTML signature appended to all drafts. Raw HTML is inserted (use TOML literal `'''...'''` strings to avoid escape hell)
 - **`locale = "en"` / `"de"`** — Controls reply prefix (`Re:` / `AW:`), forward prefix (`Fwd:` / `WG:`), quote labels (`From/Sent/To/Subject` / `Von/Gesendet/An/Betreff`), date format, and body font (Aptos for EN, Tahoma for DE)
 
-**Attachments** — all draft tools accept an optional `attachments` parameter (array of local file paths). Attachment paths must be within `allowed_attachment_dirs` (default: `/tmp/imap-mcp-rs` where `download_attachment` saves downloaded files). Paths outside the whitelist are rejected, and symlink/`..` escapes are blocked via `canonicalize`. See [Security](#security) for the threat model.
+**Attachments** — all draft tools accept an optional `attachments` parameter (array of local file paths). Attachment paths must be within `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs` on systemd Linux, otherwise `$XDG_CACHE_HOME/imap-mcp-rs`, with a per-user `/tmp/imap-mcp-rs-$USER` fallback — `download_attachment` saves here). Paths outside the whitelist are rejected, and symlink/`..` escapes are blocked via `canonicalize`. Per-file cap: 50 MiB, aggregate cap per draft: 100 MiB. See [Security](#security) for the threat model.
 
 **All drafts** are saved to the Drafts folder for manual review and sending. Nothing is ever sent automatically.
 
-Every tool (except `list_accounts`) accepts an optional `account` parameter to specify which account to use. If omitted, the first configured account is used.
+Every tool (except `list_accounts` and `account_health`, which cover all accounts) accepts an optional `account` parameter to specify which account to use. If omitted, the first configured account is used.
 
 ## Multi-Account
 
@@ -148,8 +153,10 @@ The LLM discovers accounts via `list_accounts`, then uses the `account` paramete
 
 ```
 → list_accounts()
-  [{"name": "Personal", "email": "user@gmail.com", "read_only": false},
-   {"name": "Work", "email": "user@company.com", "read_only": true}]
+  [{"name": "Personal", "email": "user@gmail.com", "read_only": false,
+    "allow_move": true, "allow_delete": true},
+   {"name": "Work", "email": "user@company.com", "read_only": true,
+    "allow_move": false, "allow_delete": false}]
 
 → list_emails(account: "Personal", folder: "INBOX", unread_only: true)
 → draft_reply(account: "Work", folder: "INBOX", uid: 5, body: "Thanks!")
@@ -160,23 +167,25 @@ Account name matching is case-insensitive. Each account has its own IMAP connect
 
 ## Permissions
 
-Control what the LLM can do per account with three flags:
+Control what the LLM can do per account with four flags:
 
 ```toml
 [[accounts]]
 name = "Work"
-read_only = false       # true = only read tools, all writes blocked
-allow_delete = false    # false = delete_email blocked (default: true)
-allow_move = false      # false = move_email blocked (default: true)
+read_only = false            # true = only read tools, all writes blocked
+allow_delete = false         # false = delete_email blocked (default: true)
+allow_move = false           # false = move_email blocked (default: true)
+allow_unsafe_expunge = false # true = permit plain EXPUNGE fallback on servers without UIDPLUS (default: false)
 ```
 
-**`read_only = true`** overrides everything — all write tools are blocked. When `read_only = false`, `allow_delete` and `allow_move` control those specific operations individually.
+**`read_only = true`** overrides everything — all write tools are blocked. When `read_only = false`, `allow_delete` and `allow_move` control those specific operations individually. `delete_draft` always works (subject only to `read_only`) because the Drafts folder is the user's own workspace.
 
 | Flag | Effect when `false` |
 |------|-------------------|
-| `read_only = true` | All 8 write tools blocked (mark, flag, move, delete, draft) |
+| `read_only = true` | All 10 write tools blocked (mark_as_read/unread, flag_email, unflag_email, move_email, delete_email, draft_reply, draft_forward, draft_email, delete_draft) |
 | `allow_delete = false` | Only `delete_email` blocked |
 | `allow_move = false` | Only `move_email` blocked |
+| `allow_unsafe_expunge = false` | On servers without UIDPLUS, `move_email` and permanent `delete_email` refuse instead of falling back to plain `EXPUNGE` (which would sweep `\Deleted` messages flagged by concurrent clients — phone, webmail) |
 
 **Use cases:**
 
@@ -184,6 +193,7 @@ allow_move = false      # false = move_email blocked (default: true)
 - **`allow_delete = false`** — allow organizing (mark, flag, move, draft) but prevent accidental deletion
 - **`allow_move = false`** — allow reading and drafting but prevent reorganizing folder structure
 - **`allow_delete = false` + `allow_move = false`** — only mark as read, flag, and draft replies
+- **`allow_unsafe_expunge = true`** — enable only on single-client servers without UIDPLUS (very rare; Gmail, Outlook 365, Dovecot, Cyrus all support UIDPLUS)
 
 You can mix read-only and read-write accounts in the same config.
 
@@ -207,6 +217,7 @@ The server maintains one persistent IMAP connection per account with several res
 - **Folder name caching** — IMAP LIST is called once per session per account
 - **TCP keepalive** — probes every 30 seconds (10s interval) to detect dead connections within ~60 seconds
 - **Auto-reconnect** — if a connection drops, the next tool call automatically reconnects. Failed accounts at startup reconnect on first use
+- **Transparent retry** — idempotent read-only operations (SEARCH, FETCH, LIST, STATUS) automatically retry once on connection errors, so transient `broken pipe` failures don't bubble up to the caller. Write operations (APPEND, COPY) never retry to avoid duplicate messages
 - **Connection error detection** — heuristic detection of network errors vs. IMAP protocol errors. Only network errors trigger reconnect
 
 ## Security
@@ -216,7 +227,9 @@ The server maintains one persistent IMAP connection per account with several res
 - **Credential protection** — passwords, client secrets, and tokens are redacted in debug/log output
 - **No automatic sending** — the server can only create drafts, never send emails
 - **Prompt injection defense** — server instructions explicitly tell the LLM that email content is untrusted external data
-- **Attachment directory whitelist** — draft attachments can only be read from directories listed in `allowed_attachment_dirs` (default: `/tmp/imap-mcp-rs`). Paths are canonicalized, so symlink escapes and `..` traversal are blocked. This prevents a prompt-injected LLM from attaching arbitrary local files (SSH keys, `/etc/passwd`, etc.)
+- **Attachment directory whitelist** — draft attachments can only be read from directories listed in `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`, fallbacks to `$XDG_CACHE_HOME/imap-mcp-rs` then `/tmp/imap-mcp-rs-$USER`). Paths are canonicalized, so symlink escapes and `..` traversal are blocked. Symlinks at the base dir are rejected at startup. Downloaded attachments live in a per-download UUID subdirectory with the file under its original sanitized name (0700 dir, 0600 file). This prevents a prompt-injected LLM from attaching arbitrary local files (SSH keys, `/etc/passwd`, etc.)
+- **Input sanitization for LLM-visible strings** — subject, snippet, EmailAddress name/address, Message-ID / In-Reply-To / References, folder names, attachment filenames, content-type, tool error messages, and `account_health.last_error` are all scrubbed for control chars, bidirectional override characters, zero-width characters, line separators, and BOM before reaching the LLM. Outgoing header values get the same treatment to prevent CRLF injection. Folder names containing such characters are dropped from listings entirely, not substituted
+- **Resource caps** — 100 MiB per email body, 10k folders per LIST, 50 references / 200 UIDs per thread expansion, 10 MiB per draft body, 50 MiB per attachment / 100 MiB aggregate, 1000 UIDs per batch write, 1 MiB per OAuth response, 15s reconnect timeout, 5s LOGOUT timeout, 10s per-folder STATUS timeout
 
 ### Prompt injection
 
@@ -304,7 +317,9 @@ User: "Check my emails"
 
 ```toml
 # Server-wide setting (top level, before [[accounts]])
-allowed_attachment_dirs = ["/tmp/imap-mcp-rs"]  # Whitelist for draft attachments
+# allowed_attachment_dirs = ["/custom/path"]  # Whitelist for draft attachments
+                                              # Default: $XDG_RUNTIME_DIR/imap-mcp-rs
+                                              # Empty list `[]` is rejected — omit to get default
 
 [[accounts]]
 name = "Personal"                   # Account name (used in tool calls)
@@ -318,8 +333,9 @@ signature_html = '<div style="color:#888;margin-top:12px;">Best regards,<br>John
 read_only = false                   # true = only read tools, write/draft blocked
 allow_delete = true                 # false = delete_email blocked
 allow_move = true                   # false = move_email blocked
+allow_unsafe_expunge = false        # true = plain EXPUNGE fallback on servers w/o UIDPLUS
 accept_invalid_certs = false        # Accept self-signed TLS certs (testing only!)
-# allowed_folders = ["INBOX"]       # Restrict accessible folders (optional)
+# allowed_folders = ["INBOX"]       # Restrict accessible folders (optional, empty list `[]` rejected)
 auth_method = "password"            # "password" or "oauth2"
 password = "app-specific-password"
 
@@ -341,9 +357,10 @@ The server checks these paths in order:
 
 1. `--config <path>` CLI argument
 2. `IMAP_MCP_CONFIG` environment variable
-3. `./config.toml` (current directory)
-4. `~/.config/imap-mcp-rs/config.toml`
-5. `/etc/imap-mcp-rs/config.toml`
+3. `~/.config/imap-mcp-rs/config.toml`
+4. `/etc/imap-mcp-rs/config.toml`
+
+> **Note:** CWD (`./config.toml`) is **intentionally not searched** — on a shared host it would let any directory the server is launched from inject its own config with attacker-controlled OAuth refresh tokens. Use the `--config` flag or `IMAP_MCP_CONFIG` env var if you want a local file.
 
 ### Provider examples
 
@@ -517,10 +534,14 @@ Account names are matched case-insensitively. Check `list_accounts` to see the e
 nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
-nix flake check                # Run all CI checks (build + clippy pedantic + fmt)
+nix flake check                # Run nix build + flake checks
+cargo test --lib               # Run the 117 unit tests
+cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
 ```
+
+CI (`.github/workflows/ci.yml`) runs the same checks on every push: `cargo fmt --check`, clippy pedantic + nursery, `cargo test --release --all-targets` on Ubuntu + macOS, `cargo build --release`, and `nix build` + `nix flake check`.
 
 ### Local testing with GreenMail
 
@@ -530,20 +551,45 @@ cargo build
 ./target/debug/imap-mcp-rs --config config.test.toml
 ```
 
+### Integration tests
+
+End-to-end tests against the GreenMail container live in `tests/integration_greenmail.rs`. They're gated behind `#[ignore]` so `cargo test` stays fast and CI-friendly without the container:
+
+```bash
+./test-server.sh                                            # start container
+cargo test --test integration_greenmail -- --ignored        # run all 6 tests
+podman rm -f imap-test                                      # stop container when done
+```
+
+The suite covers the wire-protocol path that unit tests can't reach: TLS + IMAP login, `LIST`, FETCH + MIME decode, UID SEARCH, and STORE with server-acknowledged UIDs (the "mark_flags intersects against input" stability fix).
+
 ## Architecture
 
 ```
 src/
-├── main.rs           Entry point, multi-account setup, MCP server lifecycle
-├── config.rs         TOML config with [[accounts]] array, validation
-├── email.rs          Email models, MIME parsing, HTML→text, snippet generation
-├── oauth2.rs         OAuth2 token refresh (Gmail, Outlook 365, custom)
-├── imap_client.rs    IMAP client: connection, caching, reconnect, all operations
+├── main.rs                 Binary entry: multi-account startup, attachment-dir prep, MCP lifecycle
+├── lib.rs                  Library shell exposing modules for integration tests
+├── config.rs               TOML config + validation, default attachment dir (XDG_RUNTIME_DIR)
+├── email.rs                Email models, MIME parsing, HTML→text, sanitize_external_str, build_snippet
+├── oauth2.rs               OAuth2 token refresh (Gmail, Outlook 365, custom) with URL hardening
+├── imap_client/
+│   ├── mod.rs              IMAP client: connection, caching, reconnect, all IMAP ops, FolderInfo,
+│   │                       ConnectionState, has_attachments_from_bs, group thread-UID helpers
+│   └── util.rs             Pure helpers: search criteria, astring escape, prefix detection, error cleanup
 └── tools/
-    ├── mod.rs        MCP server, tool registration, account resolution, list_accounts
-    ├── read.rs       list_folders, list_emails, get_email, get_thread, search_emails, download_attachment
-    ├── write.rs      mark_as_read/unread, flag_email, move_email, delete_email
-    └── draft.rs      draft_reply, draft_forward, draft_email (Outlook Web–style HTML)
+    ├── mod.rs              MCP server, tool registration, account resolution, list_accounts,
+    │                       account_health, error_json
+    ├── read.rs             list_folders, list_emails (+group_by_thread), get_email, get_thread,
+    │                       search_emails, download_attachment, list_drafts, filesystem_safe_filename,
+    │                       group_summaries_by_thread (union-find)
+    ├── write.rs            mark_as_read/unread, flag_email, unflag_email, move_email, delete_email
+    │                       (with dry_run), 1000-UID batch cap
+    └── draft/
+        ├── mod.rs          draft_reply, draft_forward, draft_email, delete_draft (batch),
+        │                   attachment handling, header sanitization
+        └── render.rs       Locale presets (EN/DE), Outlook-Web-style HTML bodies, date formatting
+tests/
+└── integration_greenmail.rs  End-to-end tests against GreenMail container (6 tests, `#[ignore]`-gated)
 ```
 
 ### Key design decisions
