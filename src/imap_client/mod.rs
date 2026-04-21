@@ -201,10 +201,7 @@ impl ImapClient {
                 let now = std::time::Instant::now();
                 let (valid, secs) = self.cached_oauth_token.as_ref().map_or((false, None), |t| {
                     if t.expires_at > now {
-                        (
-                            t.is_valid(),
-                            Some((t.expires_at - now).as_secs()),
-                        )
+                        (t.is_valid(), Some((t.expires_at - now).as_secs()))
                     } else {
                         (false, Some(0))
                     }
@@ -476,8 +473,10 @@ impl ImapClient {
             // ACL loop, broken server-side index) must not hang the whole
             // `list_folders` tool call forever. Missing STATUS falls through
             // to (0, 0) like the non-connection error branch below.
-            let status_fut =
-                tokio::time::timeout(Duration::from_secs(10), session.status(&name, "(MESSAGES UNSEEN)"));
+            let status_fut = tokio::time::timeout(
+                Duration::from_secs(10),
+                session.status(&name, "(MESSAGES UNSEEN)"),
+            );
             let (total, unread) = match status_fut.await {
                 Ok(Ok(mailbox)) => (mailbox.exists, mailbox.unseen.unwrap_or(0)),
                 Ok(Err(e)) => {
@@ -712,15 +711,32 @@ impl ImapClient {
         Ok(summarize_fetches(&fetches, folder))
     }
 
-    pub async fn get_thread(&mut self, folder: &str, uid: u32) -> Result<Vec<EmailFull>> {
-        retry_read!(self.get_thread_once(folder, uid))
+    /// `strict=true` (recommended): match only via `Message-ID` /
+    /// `In-Reply-To` / `References` — same algorithm as
+    /// `list_emails(group_by_thread=true)`, so the counts line up.
+    /// `strict=false`: additionally fall back to subject-kernel matching
+    /// for small threads; useful on Lotus-Notes-style mailers that omit
+    /// References headers, but can merge unrelated mails that happen to
+    /// share a subject keyword.
+    pub async fn get_thread(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        strict: bool,
+    ) -> Result<Vec<EmailFull>> {
+        retry_read!(self.get_thread_once(folder, uid, strict))
     }
 
     // Linear 5-phase workflow (fetch initial, primary search, subject fallback,
     // fetch thread emails, sent-folder search) — splitting would trade
     // readability for line count.
     #[allow(clippy::too_many_lines)]
-    async fn get_thread_once(&mut self, folder: &str, uid: u32) -> Result<Vec<EmailFull>> {
+    async fn get_thread_once(
+        &mut self,
+        folder: &str,
+        uid: u32,
+        strict: bool,
+    ) -> Result<Vec<EmailFull>> {
         // Caps against attacker-controlled fan-out. A malicious email can ship
         // thousands of entries in its `References:` header; without caps we'd
         // build a giant OR-criteria SEARCH and then FETCH every returned UID
@@ -771,8 +787,12 @@ impl ImapClient {
             }
         }
 
-        // 3. Subject-based fallback for small threads (0-1 roundtrips, conditional)
-        if thread_uids.len() <= 2 {
+        // 3. Subject-based fallback for small threads (0-1 roundtrips, conditional).
+        //    Off by default — it merges mails that only share a subject word
+        //    (e.g. every quarterly "Abrechnungsportal" reminder ends up in
+        //    one fake thread) and makes `get_thread` inconsistent with
+        //    `list_emails(group_by_thread)`. Opt-in via `strict=false`.
+        if !strict && thread_uids.len() <= 2 {
             let clean_subject = strip_email_prefixes(&initial.subject);
             if !clean_subject.is_empty() {
                 self.ensure_selected(folder).await?;
@@ -987,15 +1007,12 @@ impl ImapClient {
                          re-listing the source folder",
                     )
                 })?;
-            store_stream
-                .try_collect::<Vec<_>>()
-                .await
-                .map_err(|e| {
-                    anyhow::Error::new(e).context(
-                        "COPY + STORE submitted but response stream errored — source likely \
+            store_stream.try_collect::<Vec<_>>().await.map_err(|e| {
+                anyhow::Error::new(e).context(
+                    "COPY + STORE submitted but response stream errored — source likely \
                          flagged \\Deleted; re-list source before retrying",
-                    )
-                })?;
+                )
+            })?;
         }
         if let Err(e) = self.scoped_expunge(&uid_set).await {
             return Err(e.context(
@@ -1310,13 +1327,22 @@ pub struct FolderInfo {
 /// Classify a folder name against the well-known role lists. Returns a
 /// stable role tag the LLM can match against ("drafts" | "sent" | "trash").
 fn detect_folder_role(name: &str) -> Option<&'static str> {
-    if DRAFTS_FOLDER_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n)) {
+    if DRAFTS_FOLDER_NAMES
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+    {
         return Some("drafts");
     }
-    if SENT_FOLDER_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n)) {
+    if SENT_FOLDER_NAMES
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+    {
         return Some("sent");
     }
-    if TRASH_FOLDER_NAMES.iter().any(|n| name.eq_ignore_ascii_case(n)) {
+    if TRASH_FOLDER_NAMES
+        .iter()
+        .any(|n| name.eq_ignore_ascii_case(n))
+    {
         return Some("trash");
     }
     None

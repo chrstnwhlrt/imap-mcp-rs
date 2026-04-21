@@ -189,8 +189,7 @@ pub const FORWARD_PREFIXES: &[&str] = &["fwd:", "fw:", "wg:", "weitergeleitet:"]
 /// Case-insensitive `starts_with` for ASCII prefixes without allocating.
 /// (`str::eq_ignore_ascii_case` exists but there's no `str::starts_with_ignore_ascii_case`.)
 pub fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-    s.len() >= prefix.len()
-        && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
+    s.len() >= prefix.len() && s.as_bytes()[..prefix.len()].eq_ignore_ascii_case(prefix.as_bytes())
 }
 
 /// Strip `Re:` / `Fwd:` / locale equivalents repeatedly until the subject

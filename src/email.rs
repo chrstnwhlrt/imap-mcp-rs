@@ -571,7 +571,10 @@ mod tests {
     #[test]
     fn sanitize_external_str_strips_bidi_and_zero_width() {
         // Bidi overrides
-        assert_eq!(sanitize_external_str("invoice\u{202E}gpj.exe"), "invoicegpj.exe");
+        assert_eq!(
+            sanitize_external_str("invoice\u{202E}gpj.exe"),
+            "invoicegpj.exe"
+        );
         // Zero-width space
         assert_eq!(sanitize_external_str("inv\u{200B}oice"), "invoice");
         // LRM/RLM

@@ -63,9 +63,8 @@ async fn main() -> anyhow::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ =
-            tokio::fs::set_permissions(&attachment_dir, std::fs::Permissions::from_mode(0o700))
-                .await;
+        let _ = tokio::fs::set_permissions(&attachment_dir, std::fs::Permissions::from_mode(0o700))
+            .await;
     }
 
     // Prune stale downloads at startup — download_attachment writes per-call
@@ -170,7 +169,9 @@ async fn prune_stale_attachments(dir: &str, max_age: std::time::Duration) -> any
             continue;
         }
         let Ok(mtime) = meta.modified() else { continue };
-        let age = now.duration_since(mtime).unwrap_or(std::time::Duration::ZERO);
+        let age = now
+            .duration_since(mtime)
+            .unwrap_or(std::time::Duration::ZERO);
         if age <= max_age {
             continue;
         }

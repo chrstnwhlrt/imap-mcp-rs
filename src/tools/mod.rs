@@ -196,7 +196,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "List emails in a folder with snippets for quick triage. Returns {account, folder, total (folder size), matched (after filter), offset, limit, emails: [{uid, date, from, to (first 3), to_count, cc_count, subject, snippet, flags, has_attachments, message_id?, in_reply_to?, references?, thread_message_count?}]} — newest first. `to` is truncated to 3 addresses per row to keep payloads bounded on mass-mails; the full recipient list is available via get_email. Use `offset` for pagination, `unread_only: true` to filter to unseen, `group_by_thread: true` to collapse into one row per conversation (newest-in-thread wins; `thread_message_count` tells you how big the thread is)."
+        description = "List emails in a folder with snippets for quick triage. Returns {account, folder, total (folder size), matched (after filter), offset, limit, emails: [{uid, date, from, to (first 3), to_count, cc_count, subject, snippet, flags, has_attachments, message_id?, in_reply_to?, references?, thread_message_count?}]} — newest first. `to` is truncated to 3 addresses per row to keep payloads bounded on mass-mails; the full recipient list is available via get_email. Use `offset` for pagination, `unread_only: true` to filter to unseen, `group_by_thread: true` to collapse into one row per conversation (newest-in-thread wins; `thread_message_count` tells you how big the thread *within this fetch window* is — older members outside the window aren't counted, use get_thread for the full count)."
     )]
     async fn list_emails(
         &self,
@@ -220,7 +220,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Get the full conversation thread for an email, sorted chronologically (oldest first). Finds related messages via References/In-Reply-To headers and automatically includes your own replies from the Sent folder, deduplicated by Message-ID. `include_html: true` to include each message's body_html (off by default — HTML can be large). Returns {account, subject, message_count, emails: [EmailFull, ...]} — same `emails` key as list_emails/search_emails for consistent downstream handling."
+        description = "Get the full conversation thread for an email, sorted chronologically (oldest first). Matches by Message-ID / References / In-Reply-To across the primary folder and automatically merges your own replies from Sent, deduplicated by Message-ID. Same thread-grouping algorithm as `list_emails(group_by_thread=true)`, so counts line up.\n\nParameters:\n- `strict` (default true): strict Message-ID matching only. Set `false` to additionally match by subject-kernel for small threads — helpful for mailers that omit References (Lotus Notes), but can merge unrelated conversations sharing a subject keyword.\n- `include_body` (default true): include full bodies + attachments per message. Set `false` to get list_emails-style summaries (~1–2 KB vs. 5–20 KB per message) for thread overviews.\n- `include_html` (default false): include body_html alongside body_text.\n- `max_messages` (default 50, cap 200): caps response size; oldest messages drop first and `truncated_from` reports the original count.\n\nReturns {account, subject, message_count, emails: [...], truncated_from?} — same `emails` key as list_emails/search_emails for consistent downstream handling."
     )]
     async fn get_thread(
         &self,

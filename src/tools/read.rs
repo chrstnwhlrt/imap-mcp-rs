@@ -36,7 +36,7 @@ pub struct ListEmailsRequest {
     #[schemars(description = "Only show unread emails (default: false)")]
     pub unread_only: Option<bool>,
     #[schemars(
-        description = "Collapse results into conversation threads by Message-ID / References (default: false). Returns one row per thread (newest message), with `thread_message_count` indicating thread size. Fetches ~3× the limit internally to compensate for collapsing."
+        description = "Collapse results into conversation threads by Message-ID / References (default: false). Returns one row per thread (newest message), with `thread_message_count` indicating thread size. Fetches ~3× the limit internally to compensate for collapsing. Note: `thread_message_count` counts only messages within the fetched window — older thread members outside the window are not included. For the full thread, call `get_thread(uid)` on the representative."
     )]
     pub group_by_thread: Option<bool>,
 }
@@ -66,9 +66,21 @@ pub struct GetThreadRequest {
     )]
     pub uid: u32,
     #[schemars(
-        description = "Include body_html in each thread message (default: false). HTML bodies are large; body_text is usually sufficient."
+        description = "Strict thread matching via Message-ID / References / In-Reply-To only (default: true). Matches `list_emails(group_by_thread=true)` semantics. Set to `false` to additionally merge messages by subject-kernel for small threads — useful for mailers that omit References headers (Lotus Notes), but can merge unrelated conversations that share subject keywords."
+    )]
+    pub strict: Option<bool>,
+    #[schemars(
+        description = "Include full message bodies + attachments per thread message (default: true). Set to `false` for a compact summary-only response (same shape as list_emails entries, ~1–2 KB per message instead of 5–20 KB) when you only need to overview a thread."
+    )]
+    pub include_body: Option<bool>,
+    #[schemars(
+        description = "Include body_html in each thread message (default: false). HTML bodies are large; body_text is usually sufficient. Ignored when include_body is false."
     )]
     pub include_html: Option<bool>,
+    #[schemars(
+        description = "Maximum number of thread messages to return (default: 50, hard cap: 200). Oldest messages are dropped first; response includes `truncated_from` when truncation occurred."
+    )]
+    pub max_messages: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -271,10 +283,7 @@ fn group_summaries_by_thread(mut summaries: Vec<EmailSummary>) -> Vec<EmailSumma
     let mut id_of: HashMap<String, usize> = HashMap::new();
     let mut parent: Vec<usize> = Vec::new();
     // Inline intern — closures with mutable borrows get ugly under clippy.
-    let intern = |s: &str,
-                  parent: &mut Vec<usize>,
-                  id_of: &mut HashMap<String, usize>|
-     -> usize {
+    let intern = |s: &str, parent: &mut Vec<usize>, id_of: &mut HashMap<String, usize>| -> usize {
         if let Some(&i) = id_of.get(s) {
             return i;
         }
@@ -377,26 +386,52 @@ pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> String
         Err(e) => return error_json(&e),
     };
     let account_name = account_config.name.clone();
+    let strict = req.strict.unwrap_or(true);
+    let include_body = req.include_body.unwrap_or(true);
     let include_html = req.include_html.unwrap_or(false);
+    let max_messages = req.max_messages.unwrap_or(50).clamp(1, 200) as usize;
     let mut client = client_arc.lock().await;
-    match client.get_thread(&req.folder, req.uid).await {
+    match client.get_thread(&req.folder, req.uid, strict).await {
         Ok(mut emails) => {
-            if !include_html {
-                for email in &mut emails {
-                    email.body_html = None;
-                }
+            let original_count = emails.len();
+            let truncated = original_count > max_messages;
+            // Drop oldest messages when over budget. `emails` is already sorted
+            // chronologically (oldest first) by get_thread_once, so drain the head.
+            if truncated {
+                emails.drain(..original_count - max_messages);
             }
             let subject = emails
                 .first()
                 .map(|e| e.subject.clone())
                 .unwrap_or_default();
-            serde_json::to_string(&serde_json::json!({
-                "account": account_name,
-                "subject": subject,
-                "message_count": emails.len(),
-                "emails": emails,
-            }))
-            .unwrap_or_else(|e| error_json(&e.to_string()))
+
+            let emails_value = if include_body {
+                if !include_html {
+                    for email in &mut emails {
+                        email.body_html = None;
+                    }
+                }
+                serde_json::to_value(&emails).unwrap_or(serde_json::Value::Array(vec![]))
+            } else {
+                let summaries: Vec<_> = emails
+                    .into_iter()
+                    .map(|e| crate::email::summarize(e, 200))
+                    .collect();
+                serde_json::to_value(&summaries).unwrap_or(serde_json::Value::Array(vec![]))
+            };
+
+            let message_count = emails_value.as_array().map_or(0, Vec::len);
+            let mut payload = serde_json::Map::with_capacity(5);
+            payload.insert("account".into(), account_name.into());
+            payload.insert("subject".into(), subject.into());
+            payload.insert("message_count".into(), message_count.into());
+            if truncated {
+                payload.insert("truncated_from".into(), original_count.into());
+            }
+            payload.insert("emails".into(), emails_value);
+
+            serde_json::to_string(&serde_json::Value::Object(payload))
+                .unwrap_or_else(|e| error_json(&e.to_string()))
         }
         Err(e) => error_json(&client.check_error(e).to_string()),
     }
@@ -898,8 +933,7 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
     {
         use std::os::unix::fs::PermissionsExt;
         let _ =
-            tokio::fs::set_permissions(&download_dir, std::fs::Permissions::from_mode(0o700))
-                .await;
+            tokio::fs::set_permissions(&download_dir, std::fs::Permissions::from_mode(0o700)).await;
     }
 
     // Strip path separators + NUL from the LLM-supplied filename before
@@ -927,11 +961,8 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        if let Err(e) = tokio::fs::set_permissions(
-            &partial_path,
-            std::fs::Permissions::from_mode(0o600),
-        )
-        .await
+        if let Err(e) =
+            tokio::fs::set_permissions(&partial_path, std::fs::Permissions::from_mode(0o600)).await
         {
             let _ = tokio::fs::remove_file(&partial_path).await;
             return error_json(&format!(
@@ -1306,8 +1337,20 @@ mod tests {
     fn group_by_thread_merges_reply_chain() {
         // m1 → m2 (replies to m1) → m3 (replies to m2, references both).
         let m1 = thread_summary(1, "2026-01-01T10:00:00Z", Some("<m1>"), None, &[]);
-        let m2 = thread_summary(2, "2026-01-02T10:00:00Z", Some("<m2>"), Some("<m1>"), &["<m1>"]);
-        let m3 = thread_summary(3, "2026-01-03T10:00:00Z", Some("<m3>"), Some("<m2>"), &["<m1>", "<m2>"]);
+        let m2 = thread_summary(
+            2,
+            "2026-01-02T10:00:00Z",
+            Some("<m2>"),
+            Some("<m1>"),
+            &["<m1>"],
+        );
+        let m3 = thread_summary(
+            3,
+            "2026-01-03T10:00:00Z",
+            Some("<m3>"),
+            Some("<m2>"),
+            &["<m1>", "<m2>"],
+        );
         let grouped = group_summaries_by_thread(vec![m1, m2, m3]);
         assert_eq!(grouped.len(), 1, "should collapse to one thread");
         let rep = &grouped[0];
@@ -1336,7 +1379,13 @@ mod tests {
     #[test]
     fn group_by_thread_picks_newest_as_representative() {
         let old = thread_summary(10, "2026-01-01T00:00:00Z", Some("<m1>"), None, &[]);
-        let new = thread_summary(20, "2026-05-01T00:00:00Z", Some("<m2>"), Some("<m1>"), &["<m1>"]);
+        let new = thread_summary(
+            20,
+            "2026-05-01T00:00:00Z",
+            Some("<m2>"),
+            Some("<m1>"),
+            &["<m1>"],
+        );
         let grouped = group_summaries_by_thread(vec![old, new]);
         assert_eq!(grouped.len(), 1);
         assert_eq!(grouped[0].uid, 20);
