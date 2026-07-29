@@ -3,6 +3,22 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 1.4.1
+
+### Changed
+
+- Integration coverage now includes every public client method. `move_emails`,
+  `delete_emails`, `fetch_raw` and `get_folder_names` had none — the two most
+  destructive operations in the tool among them. A move is COPY plus `\Deleted`
+  plus UID EXPUNGE rather than one atomic step, and the failure that matters
+  leaves the message in both folders or in neither; the new test asserts both
+  ends. Deletion is checked in both modes: the default must leave the message
+  recoverable in Trash, and a permanent delete must not quietly route through
+  it. `fetch_raw` must return the message verbatim with headers, and report a
+  stale UID as absent rather than as an error, so a caller can tell "gone"
+  from "broken". 15 integration tests, up from 11.
+- README test counts corrected alongside.
+
 ## 1.4.0
 
 ### Fixed

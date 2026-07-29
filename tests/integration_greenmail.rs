@@ -366,6 +366,204 @@ async fn mark_flags_intersects_against_input() {
 /// old UID is really gone.
 #[tokio::test]
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
+async fn get_folder_names_lists_every_mailbox_and_serves_repeats_from_cache() {
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let first = client
+        .get_folder_names()
+        .await
+        .expect("listing folder names failed");
+    for expected in ["INBOX", "Drafts", "Sent", "Trash"] {
+        assert!(
+            first.iter().any(|n| n == expected),
+            "{expected} missing from {first:?}"
+        );
+    }
+
+    // The result is cached for the session (IMAP LIST runs once). A cache that
+    // returned something different on the second call would make folder
+    // resolution depend on how often it was asked.
+    let second = client.get_folder_names().await.expect("second call failed");
+    assert_eq!(first, second, "cached listing must match the first");
+    client.disconnect().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running GreenMail server (./test-server.sh)"]
+async fn move_emails_lands_the_message_in_the_target_and_clears_the_source() {
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let drafts = client
+        .detect_drafts_folder()
+        .await
+        .expect("drafts detection failed")
+        .expect("no Drafts folder on the test server");
+
+    // A move is COPY + \Deleted + UID EXPUNGE, not an atomic operation. The
+    // failure that matters is a half-done one: present in both folders (a
+    // duplicate) or in neither (data loss). Assert both ends explicitly.
+    let subject = "Move probe";
+    client
+        .save_draft(
+            format!("From: test@localhost\r\nTo: bob@localhost\r\nMessage-ID: <move@probe>\r\nSubject: {subject}\r\n\r\nbody\r\n")
+                .as_bytes(),
+        )
+        .await
+        .expect("saving the probe failed");
+    let (before, _, _) = client
+        .list_emails(&drafts, 50, 0, false)
+        .await
+        .expect("listing failed");
+    let uid = before
+        .iter()
+        .find(|e| e.subject == subject)
+        .expect("probe not in Drafts")
+        .uid;
+
+    let moved = client
+        .move_emails(&drafts, &[uid], "Trash")
+        .await
+        .expect("move failed");
+    assert_eq!(moved, vec![uid], "server must confirm the moved UID");
+
+    let (source_after, _, _) = client
+        .list_emails(&drafts, 50, 0, false)
+        .await
+        .expect("listing source failed");
+    assert!(
+        !source_after.iter().any(|e| e.subject == subject),
+        "message still in the source folder — a move that copies is a duplicate"
+    );
+    let (target_after, _, _) = client
+        .list_emails("Trash", 50, 0, false)
+        .await
+        .expect("listing target failed");
+    let landed = target_after
+        .iter()
+        .find(|e| e.subject == subject)
+        .expect("message reached neither folder — that is data loss");
+    // UIDs are per-folder; the target assigns its own.
+    let _ = landed.uid;
+
+    let _ = client.delete_emails("Trash", &[landed.uid], true).await;
+    client.disconnect().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running GreenMail server (./test-server.sh)"]
+async fn delete_emails_moves_to_trash_by_default_and_expunges_when_asked() {
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let drafts = client
+        .detect_drafts_folder()
+        .await
+        .expect("drafts detection failed")
+        .expect("no Drafts folder on the test server");
+
+    let make = |id: &str, subject: &str| {
+        format!("From: test@localhost\r\nTo: bob@localhost\r\nMessage-ID: <{id}@del>\r\nSubject: {subject}\r\n\r\nbody\r\n")
+            .into_bytes()
+    };
+    let uid_of = |rows: &[imap_mcp_rs::email::EmailSummary], s: &str| {
+        rows.iter().find(|e| e.subject == s).map(|e| e.uid)
+    };
+
+    client
+        .save_draft(&make("soft", "Delete probe soft"))
+        .await
+        .expect("save failed");
+    client
+        .save_draft(&make("hard", "Delete probe hard"))
+        .await
+        .expect("save failed");
+    let (rows, _, _) = client
+        .list_emails(&drafts, 50, 0, false)
+        .await
+        .expect("listing failed");
+    let soft = uid_of(&rows, "Delete probe soft").expect("soft probe missing");
+    let hard = uid_of(&rows, "Delete probe hard").expect("hard probe missing");
+
+    // Default delete is recoverable: the message must be findable in Trash,
+    // otherwise "moves to Trash" is a promise the tool does not keep.
+    client
+        .delete_emails(&drafts, &[soft], false)
+        .await
+        .expect("soft delete failed");
+    let (trash, _, _) = client
+        .list_emails("Trash", 50, 0, false)
+        .await
+        .expect("listing trash failed");
+    let recovered = uid_of(&trash, "Delete probe soft")
+        .expect("non-permanent delete must leave the message recoverable in Trash");
+
+    // Permanent delete expunges in place — gone from the source, and not
+    // quietly relocated to Trash either.
+    client
+        .delete_emails(&drafts, &[hard], true)
+        .await
+        .expect("permanent delete failed");
+    let (after, _, _) = client
+        .list_emails(&drafts, 50, 0, false)
+        .await
+        .expect("listing failed");
+    assert!(
+        uid_of(&after, "Delete probe hard").is_none(),
+        "permanently deleted message still in the folder"
+    );
+    let (trash2, _, _) = client
+        .list_emails("Trash", 50, 0, false)
+        .await
+        .expect("listing trash failed");
+    assert!(
+        uid_of(&trash2, "Delete probe hard").is_none(),
+        "permanent delete must not silently route through Trash"
+    );
+
+    let _ = client.delete_emails("Trash", &[recovered], true).await;
+    client.disconnect().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running GreenMail server (./test-server.sh)"]
+async fn fetch_raw_returns_the_verbatim_message_and_none_for_unknown_uids() {
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let (rows, _, _) = client
+        .list_emails("INBOX", 5, 0, false)
+        .await
+        .expect("listing failed");
+    let first = rows.first().expect("seeded INBOX is empty");
+
+    // The attachment path decodes MIME from these bytes, so they have to be
+    // the message as the server stores it — headers included, not a rendering.
+    let raw = client
+        .fetch_raw("INBOX", first.uid)
+        .await
+        .expect("fetch_raw failed")
+        .expect("no body for an existing UID");
+    let text = String::from_utf8_lossy(&raw);
+    assert!(text.contains("Subject:"), "raw message must carry headers");
+    assert!(
+        text.contains(&first.subject),
+        "raw message must be the one that was asked for"
+    );
+
+    // A stale UID must be reported as absent rather than as an error, so a
+    // caller can tell "gone" from "broken".
+    let missing = client
+        .fetch_raw("INBOX", 999_999)
+        .await
+        .expect("a missing UID is not an error");
+    assert!(missing.is_none(), "unknown UID must yield None");
+    client.disconnect().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn save_draft_reports_the_uid_it_landed_on() {
     let Some(mut client) = client_or_skip().await else {
         return;
