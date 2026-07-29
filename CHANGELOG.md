@@ -3,6 +3,24 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 1.4.2
+
+### Changed
+
+- The permission gates now have tests. `read_only`, `allow_move`,
+  `allow_delete`, `dry_run` and the 1000-UID cap were implemented and
+  documented but never verified — the switches a user sets to make an account
+  observable-but-untouchable, checked by nothing. Covered now: `read_only`
+  refuses all six mutating tools, the finer switches refuse on their own and
+  *stop* refusing once enabled, oversized UID lists are rejected rather than
+  truncated (truncating would act on a different set than asked for), and
+  `dry_run` previews without reaching the network while still respecting the
+  gates — previewing a forbidden action would suggest it is available.
+- The tests point the account at a closed port, so a gate that stopped firing
+  before the IMAP call would attempt a connection and fail the test instead of
+  passing quietly. They complete in microseconds, which is itself the evidence
+  that nothing went out. 204 unit tests, up from 199.
+
 ## 1.4.1
 
 ### Changed
