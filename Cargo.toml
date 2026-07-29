@@ -1,0 +1,33 @@
+[package]
+name = "imap-mcp-rs"
+version = "1.3.1"
+edition = "2024"
+description = "IMAP MCP Server — email tools for LLM assistants"
+license = "MIT"
+repository = "https://github.com/chrstnwhlrt/imap-mcp-rs"
+
+[dependencies]
+rmcp = { version = "1.5.0", features = ["server", "macros", "transport-io"] }
+tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "io-std", "fs"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+schemars = "1.2.1"
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+anyhow = "1.0.102"
+toml = "1.1.2"
+dotenvy = "0.15.7"
+dirs = "6.0.0"
+async-imap = { version = "0.11.2", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws-lc-rs", "tls12"] }
+rustls = { version = "0.23.38", default-features = false, features = ["aws-lc-rs", "tls12", "std"] }
+webpki-roots = "1.0.7"
+mail-parser = "0.11.2"
+mail-builder = "0.4.4"
+futures-util = "0.3.32"
+socket2 = "0.6.3"
+uuid = { version = "1.23.1", features = ["v4"] }
+# PKCE (RFC 7636): SHA-256 + CSPRNG from the same provider rustls already
+# uses, and URL-safe base64. Both are already in the tree transitively.
+aws-lc-rs = { version = "1.16.2", default-features = false, features = ["aws-lc-sys"] }
+base64 = "0.22.1"

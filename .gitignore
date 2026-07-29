@@ -1,0 +1,12 @@
+/target
+/result
+/.mcp.json
+/.envrc
+.env
+config.test.toml
+# A real config carries client secrets, a token state file carries refresh
+# tokens. Neither is looked for here (the working directory is deliberately
+# not a config search path), but both land here easily while testing with
+# `--config ./config.toml`. Anchored so config.sample.toml stays tracked.
+/config.toml
+tokens.toml
