@@ -457,6 +457,62 @@ mod tests {
     }
 
     /// Real folder names as Gmail and Outlook send them over the wire.
+    /// Parsers see hostile input: folder names come from the server, MIME from
+    /// whoever sent the mail. None of these may panic, whatever they are fed.
+    #[test]
+    fn parsers_never_panic_on_arbitrary_input() {
+        let seeds: &[&str] = &[
+            "",
+            "&",
+            "&-",
+            "&&",
+            "-",
+            "&-&-",
+            "&A",
+            "&AAAA",
+            "&AAA-",
+            "&////-",
+            "&,,,,-",
+            "INBOX",
+            "a&b",
+            "&\u{202E}-",
+            "ä&ö-ü",
+            "&AAAAAAAAAAAAAAAA-",
+            "&\u{0}-",
+            "&%%%%-",
+            "\u{FEFF}&AAA-",
+            "&-&-&-&-&-",
+            "&AAAAA-",
+        ];
+        let mut cases: Vec<String> = seeds.iter().map(|s| (*s).to_string()).collect();
+        // Deterministic combinations — every seed against every other, plus
+        // truncations, which is where index arithmetic tends to break.
+        for a in seeds {
+            for b in seeds {
+                cases.push(format!("{a}{b}"));
+            }
+        }
+        for s in seeds {
+            for cut in 0..s.len() {
+                if s.is_char_boundary(cut) {
+                    cases.push(s[..cut].to_string());
+                }
+            }
+        }
+        for c in &cases {
+            let _ = decode_modified_utf7(c);
+            let _ = extract_message_id(c.as_bytes());
+            let _ = clean_message_id(c);
+            let _ = sanitize_log_str(c);
+            let _ = imap_astring(c);
+        }
+        // Raw bytes too: MIME is not guaranteed to be valid UTF-8.
+        for b in 0u8..=255 {
+            let _ = extract_message_id(&[b, b'\n', b, b':', b]);
+        }
+        let _ = extract_message_id(&[0xff, 0xfe, b'\n', b'\n', 0x80]);
+    }
+
     #[test]
     fn decode_modified_utf7_handles_real_folder_names() {
         assert_eq!(

@@ -3,6 +3,20 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 1.4.3
+
+### Changed
+
+- The parsers are now fuzzed. `decode_modified_utf7` and `extract_message_id`
+  read data that arrives from the server or the sender; `percent_decode` and
+  `parse_query` read a browser redirect that the authorization URL can
+  influence. Each is now driven through several hundred adversarial inputs —
+  truncations at every byte boundary, pairwise concatenations, lone `%` and
+  `&`, invalid base64, bare surrogates and byte sequences that are not valid
+  UTF-8 — asserting only that nothing panics. An earlier `percent_decode`
+  sliced a multi-byte character in half and did exactly that, so the class of
+  bug is not hypothetical. 206 unit tests, up from 204.
+
 ## 1.4.2
 
 ### Changed

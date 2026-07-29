@@ -718,6 +718,64 @@ mod tests {
         assert!(err.contains("custom"));
     }
 
+    /// The redirect query arrives from a browser and is attacker-influenceable
+    /// via the authorization URL. Neither parser may panic on it — an earlier
+    /// version sliced a multi-byte character in half and did exactly that.
+    #[test]
+    fn query_parsers_never_panic_on_arbitrary_input() {
+        let seeds: &[&str] = &[
+            "",
+            "%",
+            "%%",
+            "%a",
+            "%aä",
+            "%ä",
+            "+",
+            "=",
+            "&",
+            "&&",
+            "==",
+            "a=b",
+            "a=b&c=d",
+            "code=x&state=y",
+            "%C3%BC",
+            "%FF",
+            "%00",
+            "%zz",
+            "a%",
+            "=&=",
+            "ä=ö",
+            "%E2%82",
+            "code=%",
+            "&=&",
+            "%2500",
+            "a=b%",
+        ];
+        let mut cases: Vec<String> = seeds.iter().map(|s| (*s).to_string()).collect();
+        for a in seeds {
+            for b in seeds {
+                cases.push(format!("{a}{b}"));
+                cases.push(format!("{a}={b}"));
+                cases.push(format!("{a}&{b}"));
+            }
+        }
+        for s in seeds {
+            for cut in 0..s.len() {
+                if s.is_char_boundary(cut) {
+                    cases.push(s[..cut].to_string());
+                }
+            }
+        }
+        for c in &cases {
+            let _ = percent_decode(c);
+            let map = parse_query(c);
+            // Whatever comes out must be usable as ordinary strings.
+            for (k, v) in map {
+                let _ = k.len() + v.len();
+            }
+        }
+    }
+
     #[test]
     fn percent_decode_basics() {
         assert_eq!(percent_decode("a%20b+c"), "a b c");
