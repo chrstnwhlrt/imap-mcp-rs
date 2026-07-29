@@ -1,6 +1,6 @@
 [package]
 name = "imap-mcp-rs"
-version = "1.4.2"
+version = "1.4.3"
 edition = "2024"
 description = "IMAP MCP Server — email tools for LLM assistants"
 license = "MIT"
