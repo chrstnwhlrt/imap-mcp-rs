@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 use rmcp::{
     ServerHandler,
     handler::server::router::tool::ToolRouter,
-    model::{ServerCapabilities, ServerInfo},
+    model::{Implementation, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
 };
 
@@ -391,7 +391,16 @@ impl ImapMcpServer {
 #[tool_handler]
 impl ServerHandler for ImapMcpServer {
     fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build()).with_instructions(
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            // Without this the handshake reports the SDK's own crate name and
+            // version — `rmcp 3.0.0` — leaving a client unable to tell which
+            // server it is talking to, or which release of it. `env!` resolves
+            // against this crate, so the two stay in step by construction.
+            .with_server_info(Implementation::new(
+                env!("CARGO_PKG_NAME"),
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
             concat!(
                 "IMAP email server for LLM assistants. Supports multiple accounts.\n\n",
                 // Deliberately the FIRST block: MCP clients truncate long

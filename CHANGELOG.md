@@ -3,6 +3,34 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 1.4.0
+
+### Fixed
+
+- **The server identified itself as the SDK.** `ServerInfo::new` fills
+  `serverInfo` from `Implementation::from_build_env()`, which resolves
+  `CARGO_CRATE_NAME` inside `rmcp` — so every handshake announced `rmcp` and
+  the SDK's version instead of this server and its own. A client could not
+  tell which server it was talking to, nor which release. Now set explicitly
+  from this crate's `CARGO_PKG_NAME` / `CARGO_PKG_VERSION`, so the two cannot
+  drift apart. Present since the first release; found by running an actual
+  handshake rather than trusting the build.
+
+### Changed
+
+- **`rmcp` 1.5 → 3.0**, across two major versions, with no source change
+  required. Verified beyond compilation: a real `initialize` / `tools/list`
+  exchange returns all 19 tools with their full parameter sets, and the
+  instructions still lead with the untrusted-content warning.
+- **`base64` 0.22 → 0.23**, likewise without source changes.
+- Fourteen compatible dependency updates, including `tokio` 1.53, `rustls`
+  0.23.42, `aws-lc-rs` 1.17, `async-imap` 0.11.3 and `mail-parser` 0.11.5.
+- Flake inputs refreshed (`nixpkgs`, `crane`, `rust-overlay`).
+
+All six CI gates pass, plus the 11 integration tests against a real IMAP
+server — which is what actually exercises the updated TLS, IMAP and MIME
+crates.
+
 ## 1.3.1
 
 ### Changed

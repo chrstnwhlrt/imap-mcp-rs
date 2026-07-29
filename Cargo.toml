@@ -7,7 +7,7 @@ license = "MIT"
 repository = "https://github.com/chrstnwhlrt/imap-mcp-rs"
 
 [dependencies]
-rmcp = { version = "1.5.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.0.0", features = ["server", "macros", "transport-io"] }
 tokio = { version = "1.52.1", features = ["macros", "rt-multi-thread", "io-std", "fs"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -30,4 +30,4 @@ uuid = { version = "1.23.1", features = ["v4"] }
 # PKCE (RFC 7636): SHA-256 + CSPRNG from the same provider rustls already
 # uses, and URL-safe base64. Both are already in the tree transitively.
 aws-lc-rs = { version = "1.16.2", default-features = false, features = ["aws-lc-sys"] }
-base64 = "0.22.1"
+base64 = "0.23.0"
