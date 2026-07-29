@@ -661,7 +661,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --lib               # Run the 117 unit tests
+cargo test --lib               # Run the 199 unit tests
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
@@ -683,7 +683,7 @@ End-to-end tests against the GreenMail container live in `tests/integration_gree
 
 ```bash
 ./test-server.sh                                            # start container
-cargo test --test integration_greenmail -- --ignored        # run all 10 tests
+cargo test --test integration_greenmail -- --ignored        # run all 11 tests
 podman rm -f imap-test                                      # stop container when done
 ```
 
@@ -720,7 +720,7 @@ src/
         │                   delete_draft (25-UID cap), attachment handling, header sanitization
         └── render.rs       Locale presets (EN/DE), Outlook-Web-style HTML bodies, date formatting
 tests/
-└── integration_greenmail.rs  End-to-end tests against GreenMail container (10 tests, `#[ignore]`-gated)
+└── integration_greenmail.rs  End-to-end tests against GreenMail container (11 tests, `#[ignore]`-gated)
 ```
 
 ### Key design decisions
