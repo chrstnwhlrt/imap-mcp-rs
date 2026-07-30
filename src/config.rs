@@ -59,6 +59,18 @@ pub struct AccountConfig {
     pub display_name: Option<String>,
     /// HTML signature appended to all drafts from this account.
     pub signature_html: Option<String>,
+    /// Plain-text signature for the text/plain MIME part of drafts. When
+    /// unset, a text rendering is derived from `signature_html` so both MIME
+    /// parts carry the signature — desktop clients include it in both, and a
+    /// draft whose text part lacks it is distinguishable from a hand-written
+    /// one.
+    pub signature_text: Option<String>,
+    /// Domain used in generated `Message-ID` headers (`<random@domain>`).
+    /// Defaults to the domain of the sender address. Without an explicit
+    /// Message-ID the MIME builder would fall back to the machine's hostname,
+    /// which both leaks the local machine name and marks the draft as
+    /// machine-generated.
+    pub message_id_domain: Option<String>,
     /// Locale for draft formatting: "en" or "de". Controls labels (From/Von),
     /// date format, font, and reply/forward prefixes. Defaults to "en".
     pub locale: Option<String>,
@@ -90,6 +102,19 @@ impl AccountConfig {
     /// The email address to use as From in outgoing drafts.
     pub fn sender_address(&self) -> &str {
         self.email.as_deref().unwrap_or(&self.username)
+    }
+
+    /// Domain for generated `Message-ID` headers: the configured
+    /// `message_id_domain`, otherwise the domain of the sender address,
+    /// otherwise the RFC 2606 reserved `.invalid` TLD (never a real host).
+    pub fn message_id_domain(&self) -> &str {
+        if let Some(domain) = self.message_id_domain.as_deref() {
+            return domain;
+        }
+        match self.sender_address().rsplit_once('@') {
+            Some((_, domain)) if !domain.is_empty() => domain,
+            _ => "message-id.invalid",
+        }
     }
 }
 
@@ -393,5 +418,46 @@ mod tests {
         // Custom without an explicit URL is a config error, not a guess.
         let custom: OAuth2Config = toml::from_str(r#"provider = "custom""#).unwrap();
         assert!(custom.token_url().is_err());
+    }
+
+    fn account_toml(extra: &str) -> AccountConfig {
+        toml::from_str(&format!(
+            "name = \"Test\"\n\
+             host = \"imap.example.com\"\n\
+             username = \"user@example.com\"\n\
+             password = \"x\"\n\
+             {extra}"
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn message_id_domain_defaults_to_sender_domain() {
+        let account = account_toml("");
+        assert_eq!(account.message_id_domain(), "example.com");
+        // `email` overrides `username` for the sender address — and with it
+        // the derived Message-ID domain.
+        let account = account_toml("email = \"other@example.org\"\n");
+        assert_eq!(account.message_id_domain(), "example.org");
+    }
+
+    #[test]
+    fn message_id_domain_explicit_config_wins() {
+        let account = account_toml("message_id_domain = \"mail.example.net\"\n");
+        assert_eq!(account.message_id_domain(), "mail.example.net");
+    }
+
+    #[test]
+    fn message_id_domain_falls_back_to_invalid_tld() {
+        // A username without an @ (some providers use bare logins) must not
+        // produce an empty domain — the RFC 2606 `.invalid` TLD marks it.
+        let account: AccountConfig = toml::from_str(
+            "name = \"Test\"\n\
+             host = \"imap.example.com\"\n\
+             username = \"bareuser\"\n\
+             password = \"x\"\n",
+        )
+        .unwrap();
+        assert_eq!(account.message_id_domain(), "message-id.invalid");
     }
 }

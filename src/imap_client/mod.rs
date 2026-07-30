@@ -1375,8 +1375,11 @@ impl ImapClient {
 
         self.ensure_connected().await?;
         let session = self.session()?;
+        // `\Seen` alongside `\Draft`: clients save their own drafts as read;
+        // an unseen draft shows up bold/unread in the Drafts folder and marks
+        // it as externally injected.
         session
-            .append(&drafts, Some("(\\Draft)"), None, message_bytes)
+            .append(&drafts, Some("(\\Draft \\Seen)"), None, message_bytes)
             .await?;
         // APPEND doesn't change selection, but be safe
         self.selected_folder = None;

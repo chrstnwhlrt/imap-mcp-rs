@@ -3,6 +3,51 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 1.5.0
+
+Draft fidelity release: a saved draft is now indistinguishable from one
+composed in the mail client itself. Found by diffing a hand-written client
+draft against a generated one — same HTML, but four tells in the headers and
+the text part.
+
+### Added
+
+- **`message_id_domain` config option (per account).** Without an explicit
+  Message-ID the MIME builder generated one at write time using the
+  **machine's hostname** as the domain — leaking the local machine name into
+  every draft and marking it as machine-built. Drafts now always carry an
+  explicit Message-ID; the domain defaults to the sender address's domain, so
+  the fix needs no configuration.
+- **`signature_text` config option (per account).** The signature previously
+  existed only in the HTML part; a client whose user reads the text part saw
+  none, and the text/HTML divergence is exactly what this server flags on
+  *incoming* mail. When unset, a text rendering is derived from
+  `signature_html` automatically.
+
+### Changed
+
+- **Reply and forward quotes keep the original's formatting.** The quoted
+  HTML is now the original's own HTML run through a sanitizer (ammonia):
+  bold, links, tables and inline styles survive; scripts, event handlers and
+  `javascript:` URLs do not. Previously the quote was the escaped plaintext
+  body — safe, but visibly not what a mail client produces. Text-only
+  originals keep the escaped-plaintext path, wrapped in the same structure
+  desktop clients use for them.
+- **The plaintext part now mirrors the client format**: signature included,
+  original quoted below a locale-aware `From/Sent/To/Subject` header block —
+  replacing the `> `-prefixed quote with an "On … wrote:" intro line, which
+  no desktop client writes.
+- **`Date` header in the local timezone** (via jiff) instead of the MIME
+  builder's UTC fallback.
+- **Drafts are appended with `\Seen`** alongside `\Draft` — clients save
+  their own drafts as read; an unseen draft renders bold in the Drafts
+  folder and marks it as externally injected.
+- **Reply To/Cc headers keep display names** (`Name <addr>`) from the
+  original instead of bare addresses.
+
+216 unit tests (up from 206), 15 integration tests against a real IMAP
+server, clippy pedantic clean.
+
 ## 1.4.3
 
 ### Changed

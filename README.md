@@ -109,12 +109,14 @@ All organizing tools support **batch operations** — pass an array of UIDs to o
 | `list_drafts` | List pending drafts in the account's Drafts folder (newest first). Supports `limit` / `offset` pagination and returns `total` (all drafts) alongside `returned`. `compact: true` trims each row as in `list_emails`. Useful for tracking drafts awaiting manual send. |
 | `delete_draft` | Delete one or more drafts via UID EXPUNGE (scoped — other drafts are untouched). Takes `uids: [u32...]`; capped at 25 per call, since there is no Trash to recover from. Returns `{account, succeeded: [uids]}`. Bypasses `allow_delete` because the Drafts folder is the user's own workspace; only `read_only = true` blocks it. **To revise a draft, don't use this** — pass `replaces_uid` to `draft_*` instead. |
 
-Drafts are rendered as **Outlook Web–style HTML** with proper structure: `<html>`/`<head>` wrapper, `elementToProof` classes, signature wrapper, appendonsend marker, and `divRplyFwdMsg` quote blocks. In most mail clients the output is indistinguishable from drafts composed in Outlook Web directly.
+Drafts are rendered as **Outlook Web–style HTML** with proper structure: `<html>`/`<head>` wrapper, `elementToProof` classes, signature wrapper, appendonsend marker, and `divRplyFwdMsg` quote blocks. The plaintext MIME part mirrors the same format — signature included, original quoted below a `From/Sent/To/Subject` header block instead of `> ` prefixes. Replies and forwards quote the original's **sanitized HTML** (formatting, links and tables survive; scripts, event handlers and `javascript:` URLs are stripped), falling back to escaped plaintext when the original has no HTML part. Drafts carry an explicit `Message-ID` (domain from config or the sender address — never the machine's hostname), a `Date` header in the local timezone, and the `\Seen` flag, so the saved draft is indistinguishable from one composed in the mail client directly.
 
 **Draft customization** (per-account in config):
 
 - **`display_name`** — Name shown in the From header (e.g. `"John Doe" <john@example.com>`)
 - **`signature_html`** — HTML signature appended to all drafts. Raw HTML is inserted (use TOML literal `'''...'''` strings to avoid escape hell)
+- **`signature_text`** — Plaintext signature for the text/plain MIME part. Optional: when unset, a text rendering is derived from `signature_html` automatically
+- **`message_id_domain`** — Domain used in generated `Message-ID` headers (`<random@domain>`). Optional: defaults to the domain of the sender address
 - **`locale = "en"` / `"de"`** — Controls reply prefix (`Re:` / `AW:`), forward prefix (`Fwd:` / `WG:`), quote labels (`From/Sent/To/Subject` / `Von/Gesendet/An/Betreff`), date format, and body font (Aptos for EN, Tahoma for DE)
 
 **Attachments** — all draft tools accept an optional `attachments` parameter (array of local file paths). Attachment paths must be within `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs` on systemd Linux, otherwise `$XDG_CACHE_HOME/imap-mcp-rs`, with a per-user `/tmp/imap-mcp-rs-$USER` fallback — `download_attachment` saves here). Paths outside the whitelist are rejected, and symlink/`..` escapes are blocked via `canonicalize`. Per-file cap: 50 MiB, aggregate cap per draft: 100 MiB. See [Security](#security) for the threat model.
@@ -375,6 +377,8 @@ email = "user@gmail.com"            # From address for drafts (defaults to usern
 display_name = "John Doe"           # Name in From header ("John Doe <user@gmail.com>")
 locale = "en"                       # "en" or "de" — Outlook-style draft formatting
 signature_html = '<div style="color:#888;margin-top:12px;">Best regards,<br>John Doe</div>'
+# signature_text = "Best regards,\nJohn Doe"   # text/plain signature (default: derived from signature_html)
+# message_id_domain = "example.com"            # Message-ID domain (default: domain of the sender address)
 read_only = false                   # true = only read tools, write/draft blocked
 allow_delete = true                 # false = delete_email blocked
 allow_move = true                   # false = move_email blocked
@@ -661,7 +665,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --lib               # Run the 206 unit tests
+cargo test --lib               # Run the 216 unit tests
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code

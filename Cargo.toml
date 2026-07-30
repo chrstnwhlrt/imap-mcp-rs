@@ -31,3 +31,9 @@ uuid = { version = "1.23.1", features = ["v4"] }
 # uses, and URL-safe base64. Both are already in the tree transitively.
 aws-lc-rs = { version = "1.16.2", default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.23.0"
+# Draft fidelity: ammonia sanitizes original HTML for reply/forward quotes
+# (formatting survives, scripts/event handlers/javascript: URLs do not);
+# jiff renders the Date header with the local UTC offset like desktop
+# clients do, instead of mail-builder's UTC fallback.
+ammonia = "4.1.4"
+jiff = "0.2.35"

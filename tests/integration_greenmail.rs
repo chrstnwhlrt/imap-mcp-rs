@@ -31,6 +31,8 @@ fn greenmail_config() -> AccountConfig {
         email: Some("test@localhost".to_string()),
         display_name: None,
         signature_html: None,
+        signature_text: None,
+        message_id_domain: None,
         locale: None,
         read_only: false,
         allow_delete: true,

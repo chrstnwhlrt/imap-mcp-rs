@@ -71,57 +71,92 @@ impl Locale {
             Self::En => "unknown date",
         }
     }
-
-    /// Locale-aware intro line for plaintext reply quotes.
-    /// EN: "On {date}, {from} wrote:"
-    /// DE: "Am {date} schrieb {from}:"
-    fn plain_reply_intro(self, date: &str, from: &str) -> String {
-        match self {
-            Self::De => format!("Am {date} schrieb {from}:"),
-            Self::En => format!("On {date}, {from} wrote:"),
-        }
-    }
-
-    /// Locale-aware "Forwarded message" label for plaintext forwards.
-    const fn forwarded_message_label(self) -> &'static str {
-        match self {
-            Self::De => "Weitergeleitete Nachricht",
-            Self::En => "Forwarded message",
-        }
-    }
 }
 
 // ========== Body builders ==========
 
-/// Build `(plain_body, html_body)` for a reply draft. Plaintext quotes each
-/// line with `> ` and adds a locale-aware intro (`Am … schrieb …:`). HTML uses
-/// the Outlook Web metablock format.
+/// Signatures for both MIME parts of a draft. Desktop clients put the
+/// signature into the text/plain part as well as the HTML part; carrying it
+/// only in HTML would make the text part distinguishable from a hand-written
+/// draft (and trip divergence heuristics like our own `body_parts_diverge`).
+pub(super) struct Signatures {
+    pub html: String,
+    pub text: String,
+}
+
+impl Signatures {
+    /// Resolve the signature pair from config: explicit `signature_text`
+    /// wins, otherwise a text rendering is derived from `signature_html`.
+    pub fn resolve(signature_html: Option<&str>, signature_text: Option<&str>) -> Self {
+        let html = signature_html.unwrap_or("");
+        let text = signature_text.map_or_else(|| signature_text_from_html(html), str::to_string);
+        Self {
+            html: html.to_string(),
+            text,
+        }
+    }
+
+    /// `{body}\n{signature}` when a text signature exists, `{body}` otherwise.
+    fn apply_plain(&self, body: &str) -> String {
+        if self.text.is_empty() {
+            body.to_string()
+        } else {
+            format!("{body}\n{}", self.text)
+        }
+    }
+}
+
+/// The Outlook-style plaintext quote header:
+/// `Von: … / Gesendet: … / An: … / Betreff: …` followed by a blank line.
+/// Desktop clients repeat exactly this block (not a `> `-quoted body with an
+/// "On … wrote:" intro) in the text part of replies and forwards.
+fn plain_quote_header(
+    locale: Locale,
+    from_display: &str,
+    date_display: &str,
+    to_display: &str,
+    subject: &str,
+) -> String {
+    let labels = locale.quote_labels();
+    format!(
+        "{from_label}: {from_display}\n\
+         {sent_label}: {date_display}\n\
+         {to_label}: {to_display}\n\
+         {subj_label}: {subject}",
+        from_label = labels[0],
+        sent_label = labels[1],
+        to_label = labels[2],
+        subj_label = labels[3],
+    )
+}
+
+/// Build `(plain_body, html_body)` for a reply draft. Both parts follow the
+/// Outlook format: the plaintext part repeats the From/Sent/To/Subject header
+/// block above the unprefixed original text, the HTML part uses the Outlook
+/// Web metablock.
 pub(super) fn build_reply_bodies(
     original: &EmailFull,
     user_body: &str,
     locale: Locale,
-    signature_html: &str,
+    signatures: &Signatures,
 ) -> (String, String) {
     let from_display = format_sender(original.from.as_ref());
     let date_display = format_date_outlook(original.date.as_deref(), locale);
     let to_display = format_recipients(&original.to);
 
-    // Plaintext — stream-build the quoted body into a single pre-sized String.
-    // The map+collect+join pattern allocated one String per line plus a Vec
-    // plus the join output; ~2000 allocations for a 1000-line body. Single
-    // pass here = one allocation.
-    let body_text = &original.body_text;
-    let line_count = body_text.matches('\n').count() + 1;
-    let mut quoted_plain = String::with_capacity(body_text.len() + line_count * 3);
-    for (i, line) in body_text.lines().enumerate() {
-        if i > 0 {
-            quoted_plain.push('\n');
-        }
-        quoted_plain.push_str("> ");
-        quoted_plain.push_str(line);
-    }
-    let intro = locale.plain_reply_intro(&date_display, &from_display);
-    let plain_body = format!("{user_body}\n\n{intro}\n{quoted_plain}");
+    // Plaintext (Outlook style: no `> ` prefixes, header block instead)
+    let quote_header = plain_quote_header(
+        locale,
+        &from_display,
+        &date_display,
+        &to_display,
+        &original.subject,
+    );
+    let plain_body = format!(
+        "{body}\n\n{quote_header}\n\n{original_text}",
+        body = signatures.apply_plain(user_body),
+        original_text = original.body_text,
+    );
 
     // HTML (Outlook Web style)
     let quoted_content = prepare_quoted_content(original.body_html.as_deref(), &original.body_text);
@@ -136,44 +171,37 @@ pub(super) fn build_reply_bodies(
     let html_body = wrap_html_document(&format!(
         "{body}{sig}{appendonsend}{metablock}",
         body = body_div(&html_escape(user_body), locale),
-        sig = signature_block(signature_html, locale),
+        sig = signature_block(&signatures.html, locale),
         appendonsend = APPEND_ON_SEND,
     ));
 
     (plain_body, html_body)
 }
 
-/// Build `(plain_body, html_body)` for a forward draft. Plaintext uses
-/// "---------- Forwarded message ----------" delimiter with From/Sent/To/Subject;
-/// HTML uses the Outlook Web metablock format.
+/// Build `(plain_body, html_body)` for a forward draft. Same Outlook format
+/// as replies — desktop clients do not distinguish the two in body layout.
 pub(super) fn build_forward_bodies(
     original: &EmailFull,
     user_body: Option<&str>,
     locale: Locale,
-    signature_html: &str,
+    signatures: &Signatures,
 ) -> (String, String) {
     let from_display = format_sender(original.from.as_ref());
     let date_display = format_date_outlook(original.date.as_deref(), locale);
     let to_display = format_recipients(&original.to);
 
-    // Plaintext
-    let labels = locale.quote_labels();
-    let fwd_header = format!(
-        "---------- {header} ----------\n\
-         {from_label}: {from_display}\n\
-         {sent_label}: {date_display}\n\
-         {to_label}: {to_display}\n\
-         {subj_label}: {subject}",
-        header = locale.forwarded_message_label(),
-        from_label = labels[0],
-        sent_label = labels[1],
-        to_label = labels[2],
-        subj_label = labels[3],
-        subject = original.subject,
+    // Plaintext (Outlook style, same header block as replies)
+    let quote_header = plain_quote_header(
+        locale,
+        &from_display,
+        &date_display,
+        &to_display,
+        &original.subject,
     );
-    let plain_body = user_body.map_or_else(
-        || format!("{fwd_header}\n\n{}", original.body_text),
-        |msg| format!("{msg}\n\n{fwd_header}\n\n{}", original.body_text),
+    let plain_body = format!(
+        "{body}\n\n{quote_header}\n\n{original_text}",
+        body = signatures.apply_plain(user_body.unwrap_or("")),
+        original_text = original.body_text,
     );
 
     // HTML (Outlook Web style)
@@ -193,22 +221,93 @@ pub(super) fn build_forward_bodies(
     let html_body = wrap_html_document(&format!(
         "{body}{sig}{appendonsend}{metablock}",
         body = body_div(&body_html_content, locale),
-        sig = signature_block(signature_html, locale),
+        sig = signature_block(&signatures.html, locale),
         appendonsend = APPEND_ON_SEND,
     ));
 
     (plain_body, html_body)
 }
 
-/// Build a fresh-compose HTML body (no quote, no forwarded content) for
-/// `draft_email`. Wraps the user's plaintext in the Outlook Web body div +
-/// optional signature.
-pub(super) fn build_compose_html(body: &str, signature_html: &str, locale: Locale) -> String {
-    wrap_html_document(&format!(
+/// Build `(plain_body, html_body)` for a fresh compose (no quote). The
+/// signature goes into both parts, matching what desktop clients save.
+pub(super) fn build_compose_bodies(
+    body: &str,
+    locale: Locale,
+    signatures: &Signatures,
+) -> (String, String) {
+    let plain_body = signatures.apply_plain(body);
+    let html_body = wrap_html_document(&format!(
         "{body}{sig}",
         body = body_div(&html_escape(body), locale),
-        sig = signature_block(signature_html, locale),
-    ))
+        sig = signature_block(&signatures.html, locale),
+    ));
+    (plain_body, html_body)
+}
+
+/// Derive a plaintext signature from the configured HTML signature: block
+/// tags become newlines, remaining tags are stripped, basic entities are
+/// decoded, and runs of blank lines collapse. Good enough for signatures —
+/// which are trusted config, not arbitrary mail content.
+fn signature_text_from_html(html: &str) -> String {
+    if html.is_empty() {
+        return String::new();
+    }
+    let mut out = String::with_capacity(html.len());
+    let mut rest = html;
+    while let Some(start) = rest.find('<') {
+        out.push_str(&rest[..start]);
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('>') else {
+            // Unterminated tag: treat the remainder as text.
+            out.push_str(&rest[start..]);
+            rest = "";
+            break;
+        };
+        let tag = after[..end].trim().to_ascii_lowercase();
+        let name = tag
+            .trim_start_matches('/')
+            .split([' ', '\t', '\n', '/'])
+            .next()
+            .unwrap_or("");
+        // Opening <br>, and closing block tags, produce line breaks.
+        if name == "br" || (tag.starts_with('/') && matches!(name, "p" | "div" | "tr" | "li")) {
+            out.push('\n');
+        }
+        rest = &after[end + 1..];
+    }
+    out.push_str(rest);
+
+    // Decode the entities that realistically appear in signature markup.
+    let decoded = out
+        .replace("&nbsp;", " ")
+        .replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&#39;", "'")
+        .replace("&amp;", "&");
+
+    // Trim trailing whitespace per line and collapse blank-line runs.
+    let mut lines: Vec<&str> = Vec::new();
+    let mut blank_run = 0usize;
+    for line in decoded.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            blank_run += 1;
+            if blank_run > 1 {
+                continue;
+            }
+        } else {
+            blank_run = 0;
+        }
+        lines.push(trimmed);
+    }
+    while lines.last().is_some_and(|l| l.is_empty()) {
+        lines.pop();
+    }
+    while lines.first().is_some_and(|l| l.is_empty()) {
+        lines.remove(0);
+    }
+    lines.join("\n")
 }
 
 // ========== HTML construction (Outlook Web style) ==========
@@ -256,17 +355,36 @@ fn signature_block(signature_html: &str, locale: Locale) -> String {
     )
 }
 
+/// Quoted original content for the HTML part: either sanitized original HTML
+/// (embedded directly, the way desktop clients quote HTML mail) or escaped
+/// plaintext (wrapped in the `BodyFragment`/`PlainText` structure desktop
+/// clients use for text-only originals).
+enum QuotedContent {
+    Html(String),
+    Plain(String),
+}
+
 /// Outlook Web quote-message block: hr separator + `divRplyFwdMsg` header
-/// (with `<font>` wrapper) + `BodyFragment` quoted content.
+/// (with `<font>` wrapper) + the quoted original content.
 fn quote_metablock_html(
     from_display: &str,
     sent: &str,
     to_display: &str,
     subject: &str,
-    quoted_content: &str,
+    quoted_content: &QuotedContent,
     locale: Locale,
 ) -> String {
     let labels = locale.quote_labels();
+    let quoted_block = match quoted_content {
+        // Sanitized original HTML is embedded as-is — matching how desktop
+        // clients splice the original HTML body below the header block.
+        QuotedContent::Html(html) => format!("<div>\n{html}\n</div>\n"),
+        QuotedContent::Plain(text) => format!(
+            "<div class=\"BodyFragment\"><font size=\"2\"><span style=\"font-size:11pt;\">\n\
+             <div class=\"PlainText\">{text}</div>\n\
+             </span></font></div>\n"
+        ),
+    };
     format!(
         "<hr style=\"display:inline-block;width:98%\" tabindex=\"-1\"><div id=\"divRplyFwdMsg\" dir=\"ltr\"><font face=\"Calibri, sans-serif\" style=\"font-size:11pt\" color=\"#000000\">\
          <b>{l0}:</b> {from}<br>\n\
@@ -275,9 +393,7 @@ fn quote_metablock_html(
          <b>{l3}:</b> {subj}</font>\n\
          <div>&nbsp;</div>\n\
          </div>\n\
-         <div class=\"BodyFragment\"><font size=\"2\"><span style=\"font-size:11pt;\">\n\
-         <div class=\"PlainText\">{quoted_content}</div>\n\
-         </span></font></div>\n",
+         {quoted_block}",
         l0 = labels[0],
         l1 = labels[1],
         l2 = labels[2],
@@ -290,19 +406,59 @@ fn quote_metablock_html(
 
 /// Prepare the original email content for quoting in HTML.
 ///
-/// **Security**: we deliberately DO NOT pass through the original `body_html`
-/// verbatim. Reproducing remote HTML inside the user's outgoing draft is a
-/// propagation vector — a malicious sender embeds `<script>` / `<iframe>` /
-/// `on*` handlers / `javascript:` links, the user replies, and the recipient's
-/// mail client renders the payload. Without a full HTML sanitizer (e.g.
-/// `ammonia`) we cannot safely quote arbitrary attacker-controlled markup.
+/// **Security**: the original `body_html` is attacker-controlled — quoting it
+/// verbatim would propagate `<script>` / `<iframe>` / `on*` handlers /
+/// `javascript:` links into the user's outgoing draft. It therefore runs
+/// through `ammonia` first: scripts, event handlers, dangerous URL schemes
+/// and unknown tags are removed while formatting (links, tables, inline
+/// styles, images) survives — so the quote looks like what the user saw,
+/// the way desktop clients quote HTML mail.
 ///
-/// Instead we always HTML-escape the plaintext body (which every well-formed
-/// email carries alongside or converted-from HTML). Line breaks are preserved
-/// via `html_escape`'s `\n → <br>\n` rule. Users lose HTML formatting in the
-/// quote (links, images, tables) but the draft stays safe by construction.
-fn prepare_quoted_content(_body_html: Option<&str>, body_text: &str) -> String {
-    html_escape(body_text)
+/// When the original has no HTML part, the plaintext body is HTML-escaped
+/// (line breaks preserved via `html_escape`'s `\n → <br>\n` rule).
+fn prepare_quoted_content(body_html: Option<&str>, body_text: &str) -> QuotedContent {
+    match body_html {
+        Some(html) if !html.trim().is_empty() => QuotedContent::Html(sanitize_quoted_html(html)),
+        _ => QuotedContent::Plain(html_escape(body_text)),
+    }
+}
+
+/// Sanitize untrusted original HTML for embedding in a draft quote.
+///
+/// Beyond ammonia's defaults (which already remove scripts, event handlers
+/// and unsafe URL schemes) this allows the presentational tags and
+/// attributes that real HTML email is built from — `div`/`span`/`font`,
+/// tables with layout attributes, inline `style` — so the quoted mail keeps
+/// its appearance. `style` cannot execute script in any modern client; the
+/// worst it can do is load remote background images, which mail clients
+/// already gate behind their remote-content setting.
+fn sanitize_quoted_html(html: &str) -> String {
+    use std::collections::HashSet;
+    let mut builder = ammonia::Builder::default();
+    builder
+        .add_tags(["div", "span", "font", "center", "u", "big", "small"])
+        .add_generic_attributes([
+            "style",
+            "class",
+            "dir",
+            "align",
+            "valign",
+            "width",
+            "height",
+            "border",
+            "cellpadding",
+            "cellspacing",
+            "bgcolor",
+            "color",
+            "face",
+            "size",
+            "lang",
+        ])
+        .url_schemes(HashSet::from(["http", "https", "mailto", "tel", "cid"]))
+        // Desktop clients do not decorate quoted links with rel attributes;
+        // adding them would mark the draft as machine-processed.
+        .link_rel(None);
+    builder.clean(html).to_string()
 }
 
 /// Apply a From address to a `MessageBuilder`, optionally with a display name.
@@ -573,15 +729,118 @@ mod tests {
         assert_eq!(format_sender(None), "unknown");
     }
 
+    fn quoted_as_html(q: &QuotedContent) -> &str {
+        match q {
+            QuotedContent::Html(s) => s,
+            QuotedContent::Plain(_) => panic!("expected HTML quote path"),
+        }
+    }
+
     #[test]
-    fn prepare_quoted_content_always_escapes_plaintext() {
-        // Even when original HTML is present, we ignore it and use the safe
-        // plaintext path. Malicious `<script>` in the HTML must not survive.
-        let html = "<html><body>hi<script>alert(1)</script></body></html>";
-        let text = "hi alert(1)";
-        let quoted = prepare_quoted_content(Some(html), text);
-        assert!(!quoted.contains("<script>"));
-        assert!(!quoted.contains("alert(1)") || quoted.contains("alert(1)")); // escaped form is OK
-        assert!(quoted.starts_with("hi"));
+    fn prepare_quoted_content_sanitizes_html_keeps_formatting() {
+        // Formatting survives sanitization; script payloads do not.
+        let html = "<div>hi <b>bold</b><script>alert(1)</script></div>";
+        let quoted = prepare_quoted_content(Some(html), "hi bold");
+        let out = quoted_as_html(&quoted);
+        assert!(!out.contains("script"), "script must be stripped: {out}");
+        assert!(!out.contains("alert(1)"), "script body must go too: {out}");
+        assert!(
+            out.contains("<b>bold</b>"),
+            "formatting must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn prepare_quoted_content_strips_event_handlers_and_js_urls() {
+        let html = r#"<div onclick="alert(1)"><a href="javascript:alert(2)">x</a></div>"#;
+        let quoted = prepare_quoted_content(Some(html), "x");
+        let out = quoted_as_html(&quoted);
+        assert!(!out.contains("onclick"), "event handler survived: {out}");
+        assert!(!out.contains("javascript:"), "js URL survived: {out}");
+    }
+
+    #[test]
+    fn prepare_quoted_content_keeps_inline_styles_without_link_rel() {
+        let html = r#"<div style="color: red"><a href="https://example.com">link</a></div>"#;
+        let quoted = prepare_quoted_content(Some(html), "link");
+        let out = quoted_as_html(&quoted);
+        assert!(out.contains("style=\"color: red\""), "style dropped: {out}");
+        assert!(!out.contains("rel="), "rel decoration added: {out}");
+        assert!(out.contains("https://example.com"), "href dropped: {out}");
+    }
+
+    #[test]
+    fn prepare_quoted_content_falls_back_to_escaped_text() {
+        let quoted = prepare_quoted_content(None, "a<b\nnext");
+        match quoted {
+            QuotedContent::Plain(s) => assert_eq!(s, "a&lt;b<br>\nnext"),
+            QuotedContent::Html(_) => panic!("expected plaintext quote path"),
+        }
+    }
+
+    #[test]
+    fn signature_text_from_html_strips_tags_and_decodes_entities() {
+        let html = "<p>--&nbsp;</p><p>Example Corp &amp; Co<br>Line two</p>";
+        assert_eq!(
+            signature_text_from_html(html),
+            "--\nExample Corp & Co\nLine two"
+        );
+    }
+
+    #[test]
+    fn signature_text_from_html_collapses_blank_runs() {
+        let html = "<div>top</div><div><br></div><div><br></div><div>bottom</div>";
+        let text = signature_text_from_html(html);
+        assert!(!text.contains("\n\n\n"), "blank run survived: {text:?}");
+        assert!(text.starts_with("top"));
+        assert!(text.ends_with("bottom"));
+    }
+
+    #[test]
+    fn signatures_resolve_prefers_explicit_text() {
+        let sigs = Signatures::resolve(Some("<p>HTML sig</p>"), Some("custom text sig"));
+        assert_eq!(sigs.text, "custom text sig");
+        assert_eq!(sigs.html, "<p>HTML sig</p>");
+    }
+
+    #[test]
+    fn reply_plaintext_uses_outlook_header_block_and_signature() {
+        let mut original = EmailFull {
+            uid: 1,
+            folder: "INBOX".to_string(),
+            from: Some(EmailAddress {
+                name: Some("Alice".to_string()),
+                address: "alice@example.com".to_string(),
+            }),
+            to: vec![EmailAddress {
+                name: None,
+                address: "me@example.com".to_string(),
+            }],
+            cc: vec![],
+            subject: "Hello".to_string(),
+            date: Some("2026-07-30T21:18:00+02:00".to_string()),
+            message_id: None,
+            in_reply_to: None,
+            references: vec![],
+            flags: vec![],
+            body_text: "original text".to_string(),
+            body_html: None,
+            attachments: vec![],
+            body_parts_diverge: false,
+        };
+        original.subject = "Hello".to_string();
+        let sigs = Signatures::resolve(Some("<p>-- </p><p>Sig line</p>"), None);
+        let (plain, html) = build_reply_bodies(&original, "my reply", Locale::De, &sigs);
+
+        // Outlook text part: body, signature, blank line, Von/Gesendet/An/
+        // Betreff block, blank line, unprefixed original text.
+        assert!(plain.starts_with("my reply\n--\nSig line\n\nVon: Alice <alice@example.com>\n"));
+        assert!(plain.contains("\nGesendet: Donnerstag, 30. Juli 2026 21:18\n"));
+        assert!(plain.contains("\nAn: me@example.com <me@example.com>\n"));
+        assert!(plain.contains("\nBetreff: Hello\n\noriginal text"));
+        assert!(!plain.contains("> original"), "no > prefixes: {plain}");
+        assert!(!plain.contains("schrieb"), "no legacy intro line: {plain}");
+        // HTML part still carries the signature block.
+        assert!(html.contains("id=\"Signature\""));
     }
 }

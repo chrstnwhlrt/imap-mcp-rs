@@ -28,7 +28,61 @@ use crate::imap_client::ImapClient;
 use super::{ImapMcpServer, error_json};
 
 mod render;
-use render::{Locale, apply_from, build_compose_html, build_forward_bodies, build_reply_bodies};
+use render::{
+    Locale, Signatures, apply_from, build_compose_bodies, build_forward_bodies, build_reply_bodies,
+};
+
+/// Account-derived values shared by all three draft flows, resolved once per
+/// call so the flows stay below clippy's function-length lint and cannot
+/// drift apart in how they read the config.
+struct DraftAccount {
+    from: String,
+    name: String,
+    display_name: Option<String>,
+    message_id_domain: String,
+    signatures: Signatures,
+    locale: Locale,
+}
+
+impl DraftAccount {
+    fn from_config(config: &crate::config::AccountConfig) -> Self {
+        Self {
+            from: config.sender_address().to_string(),
+            name: config.name.clone(),
+            display_name: config.display_name.clone(),
+            message_id_domain: config.message_id_domain().to_string(),
+            signatures: Signatures::resolve(
+                config.signature_html.as_deref(),
+                config.signature_text.as_deref(),
+            ),
+            locale: Locale::from_config(config.locale.as_deref()),
+        }
+    }
+}
+
+/// Stamp explicit `Message-ID` and `Date` headers on the builder.
+///
+/// Without these, `mail-builder` generates both at write time — the
+/// Message-ID domain falling back to the **machine's hostname** (leaking the
+/// local machine name into every draft) and the Date to UTC, while desktop
+/// clients write their sending domain and the local UTC offset. Setting them
+/// explicitly makes the draft indistinguishable from a hand-written one.
+fn stamp_identity_headers<'a>(
+    builder: MessageBuilder<'a>,
+    message_id_domain: &str,
+) -> MessageBuilder<'a> {
+    let message_id = format!(
+        "{}@{}",
+        uuid::Uuid::new_v4().simple(),
+        sanitize_header_value(message_id_domain)
+    );
+    let date = jiff::Zoned::now()
+        .strftime("%a, %d %b %Y %H:%M:%S %z")
+        .to_string();
+    builder
+        .message_id(message_id)
+        .header("Date", mail_builder::headers::raw::Raw::new(date))
+}
 
 // ========== Request types ==========
 
@@ -41,7 +95,7 @@ pub struct DraftReplyRequest {
     #[schemars(description = "Email UID to reply to (from list_emails or search_emails results)")]
     pub uid: u32,
     #[schemars(
-        description = "Plain-text reply body. Rendered to HTML automatically; the original is quoted with a locale-aware intro below."
+        description = "Plain-text reply body. Rendered to HTML automatically; the original is quoted below an Outlook-style From/Sent/To/Subject header block in both MIME parts."
     )]
     pub body: String,
     #[schemars(
@@ -210,11 +264,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
     if req.body.len() > MAX_BODY_BYTES {
         return error_json(&format!("Reply body exceeds {MAX_BODY_BYTES}-byte cap"));
     }
-    let from = account_config.sender_address().to_string();
-    let account_name = account_config.name.clone();
-    let display_name = account_config.display_name.clone();
-    let signature_html = account_config.signature_html.as_deref().unwrap_or("");
-    let locale = Locale::from_config(account_config.locale.as_deref());
+    let acct = DraftAccount::from_config(account_config);
 
     // Lock only for the fetch — CPU work (HTML escape, quote building, MIME
     // serialization) happens outside the mutex so parallel tool calls on the
@@ -236,7 +286,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
 
     let reply_all = req.reply_all.unwrap_or(false);
     let (to_list, cc_list) =
-        match build_reply_recipients(&original, reply_all, &from, req.cc.as_deref()) {
+        match build_reply_recipients(&original, reply_all, &acct.from, req.cc.as_deref()) {
             Ok(pair) => pair,
             Err(e) => return error_json(e),
         };
@@ -244,28 +294,31 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
     let subject_raw = if has_reply_prefix(&original.subject) {
         original.subject.clone()
     } else {
-        format!("{}{}", locale.reply_prefix(), original.subject)
+        format!("{}{}", acct.locale.reply_prefix(), original.subject)
     };
     let subject = sanitize_header_value(&subject_raw);
 
-    let (plain_body, html_body) = build_reply_bodies(&original, &req.body, locale, signature_html);
+    let (plain_body, html_body) =
+        build_reply_bodies(&original, &req.body, acct.locale, &acct.signatures);
 
     let mut builder = MessageBuilder::new()
         .subject(&subject)
         .text_body(&plain_body)
         .html_body(&html_body);
-    builder = apply_from(builder, &from, display_name.as_deref());
+    builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
+    builder = stamp_identity_headers(builder, &acct.message_id_domain);
 
     // to_list / cc_list are already sanitized above at construction time.
     // CRITICAL: mail-builder's `.to()` / `.cc()` OVERWRITE on each call, so
     // the previous per-address loop silently dropped every recipient except
-    // the last. Pass a Vec at once — mail-builder converts it to
-    // `Address::List` which preserves every entry.
+    // the last. Pass a full list at once — mail-builder converts it to
+    // `Address::List` which preserves every entry. Display names from the
+    // original are carried along (desktop clients keep `Name <addr>` in To).
     if !to_list.is_empty() {
-        builder = builder.to(to_list.clone());
+        builder = builder.to(to_address_list(&to_list));
     }
     if !cc_list.is_empty() {
-        builder = builder.cc(cc_list.clone());
+        builder = builder.cc(to_address_list(&cc_list));
     }
 
     let has_threading;
@@ -300,10 +353,10 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
         Ok(new_uid) => {
             let mut response = serde_json::json!({
                 "status": "ok",
-                "account": account_name,
-                "from": from,
-                "to": to_list,
-                "cc": cc_list,
+                "account": acct.name,
+                "from": acct.from,
+                "to": addresses_only(&to_list),
+                "cc": addresses_only(&cc_list),
                 "subject": subject,
                 "body_preview": truncate(&plain_body, 500),
             });
@@ -334,11 +387,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     {
         return error_json(&format!("Forward body exceeds {MAX_BODY_BYTES}-byte cap"));
     }
-    let from = account_config.sender_address().to_string();
-    let account_name = account_config.name.clone();
-    let display_name = account_config.display_name.clone();
-    let signature_html = account_config.signature_html.as_deref().unwrap_or("");
-    let locale = Locale::from_config(account_config.locale.as_deref());
+    let acct = DraftAccount::from_config(account_config);
 
     let original = {
         let mut client = client_arc.lock().await;
@@ -358,19 +407,24 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     let subject_raw = if has_forward_prefix(&original.subject) {
         original.subject.clone()
     } else {
-        format!("{}{}", locale.forward_prefix(), original.subject)
+        format!("{}{}", acct.locale.forward_prefix(), original.subject)
     };
     // `original.subject` can contain `\r\n` header-injection payloads.
     let subject = sanitize_header_value(&subject_raw);
 
-    let (plain_body, html_body) =
-        build_forward_bodies(&original, req.body.as_deref(), locale, signature_html);
+    let (plain_body, html_body) = build_forward_bodies(
+        &original,
+        req.body.as_deref(),
+        acct.locale,
+        &acct.signatures,
+    );
 
     let mut builder = MessageBuilder::new()
         .subject(&subject)
         .text_body(&plain_body)
         .html_body(&html_body);
-    builder = apply_from(builder, &from, display_name.as_deref());
+    builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
+    builder = stamp_identity_headers(builder, &acct.message_id_domain);
 
     // Sanitize LLM-provided recipient addresses — `\r\n` in any of them would
     // inject extra headers (e.g. a silent Bcc) into the saved draft.
@@ -420,8 +474,8 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
         Ok(new_uid) => {
             let response = serde_json::json!({
                 "status": "ok",
-                "account": account_name,
-                "from": from,
+                "account": acct.name,
+                "from": acct.from,
                 "to": req.to,
                 "cc": req.cc.as_deref().unwrap_or_default(),
                 "subject": subject,
@@ -444,21 +498,18 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
     if req.body.len() > MAX_BODY_BYTES {
         return error_json(&format!("Draft body exceeds {MAX_BODY_BYTES}-byte cap"));
     }
-    let from = account_config.sender_address().to_string();
-    let account_name = account_config.name.clone();
-    let display_name = account_config.display_name.clone();
-    let signature_html = account_config.signature_html.as_deref().unwrap_or("");
-    let locale = Locale::from_config(account_config.locale.as_deref());
+    let acct = DraftAccount::from_config(account_config);
 
-    let html_body = build_compose_html(&req.body, signature_html, locale);
+    let (plain_body, html_body) = build_compose_bodies(&req.body, acct.locale, &acct.signatures);
 
     // Sanitize subject + recipients against header injection from LLM input.
     let subject = sanitize_header_value(&req.subject);
     let mut builder = MessageBuilder::new()
         .subject(&subject)
-        .text_body(&req.body)
+        .text_body(&plain_body)
         .html_body(&html_body);
-    builder = apply_from(builder, &from, display_name.as_deref());
+    builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
+    builder = stamp_identity_headers(builder, &acct.message_id_domain);
 
     // Collect recipients into Vecs and pass once each — mail-builder's
     // `.to()` / `.cc()` / `.bcc()` OVERWRITE on repeat calls, so the per-
@@ -517,8 +568,8 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
         Ok(new_uid) => {
             let response = serde_json::json!({
                 "status": "ok",
-                "account": account_name,
-                "from": from,
+                "account": acct.name,
+                "from": acct.from,
                 "to": req.to,
                 "cc": req.cc.as_deref().unwrap_or_default(),
                 "bcc": req.bcc.as_deref().unwrap_or_default(),
@@ -576,31 +627,65 @@ fn build_reply_recipients(
     reply_all: bool,
     from: &str,
     extra_cc: Option<&[String]>,
-) -> Result<(Vec<String>, Vec<String>), &'static str> {
-    let to_addr = match original.from.as_ref() {
-        Some(a) if !a.address.is_empty() => sanitize_header_value(&a.address),
+) -> Result<(Vec<Recipient>, Vec<Recipient>), &'static str> {
+    let to_recipient = match original.from.as_ref() {
+        Some(a) if !a.address.is_empty() => recipient_from(a),
         _ => return Err("Cannot reply: original email has no sender address"),
     };
 
     // `eq_ignore_ascii_case` is allocation-free — preferred over `to_lowercase`.
-    let mut to_list = vec![to_addr];
-    let mut cc_list: Vec<String> = Vec::new();
+    let mut to_list = vec![to_recipient];
+    let mut cc_list: Vec<Recipient> = Vec::new();
     if reply_all {
         for addr in &original.to {
             if !addr.address.eq_ignore_ascii_case(from) {
-                to_list.push(sanitize_header_value(&addr.address));
+                to_list.push(recipient_from(addr));
             }
         }
         for addr in &original.cc {
             if !addr.address.eq_ignore_ascii_case(from) {
-                cc_list.push(sanitize_header_value(&addr.address));
+                cc_list.push(recipient_from(addr));
             }
         }
     }
     if let Some(cc) = extra_cc {
-        cc_list.extend(cc.iter().map(|s| sanitize_header_value(s)));
+        cc_list.extend(cc.iter().map(|s| (None, sanitize_header_value(s))));
     }
     Ok((to_list, cc_list))
+}
+
+/// A draft recipient: optional display name + address, both already
+/// sanitized against header injection.
+type Recipient = (Option<String>, String);
+
+/// Build a sanitized `Recipient` from a parsed address, keeping the display
+/// name — desktop clients write `Name <addr>` into To/Cc when the original
+/// carried a name, and a bare address where it did not.
+fn recipient_from(addr: &crate::email::EmailAddress) -> Recipient {
+    let name = addr
+        .name
+        .as_deref()
+        .map(sanitize_header_value)
+        .filter(|n| !n.is_empty());
+    (name, sanitize_header_value(&addr.address))
+}
+
+/// Convert recipients into a mail-builder address list, preserving names.
+fn to_address_list(list: &[Recipient]) -> mail_builder::headers::address::Address<'static> {
+    use mail_builder::headers::address::Address;
+    Address::new_list(
+        list.iter()
+            .map(|(name, addr)| {
+                Address::new_address(name.clone().map(std::borrow::Cow::from), addr.clone())
+            })
+            .collect(),
+    )
+}
+
+/// Extract the bare addresses for the JSON tool response (the response
+/// format predates display-name support and stays address-only).
+fn addresses_only(list: &[Recipient]) -> Vec<String> {
+    list.iter().map(|(_, addr)| addr.clone()).collect()
 }
 
 /// Apply In-Reply-To + References threading headers to the builder. Returns
@@ -951,7 +1036,7 @@ mod tests {
             vec![],
         );
         let (to, cc) = build_reply_recipients(&original, false, "me@example.com", None).unwrap();
-        assert_eq!(to, vec!["alice@example.com"]);
+        assert_eq!(addresses_only(&to), vec!["alice@example.com"]);
         assert!(cc.is_empty());
     }
 
@@ -971,8 +1056,11 @@ mod tests {
             vec!["carol@example.com", "ME@example.COM"],
         );
         let (to, cc) = build_reply_recipients(&original, true, "me@example.com", None).unwrap();
-        assert_eq!(to, vec!["alice@example.com", "bob@example.com"]);
-        assert_eq!(cc, vec!["carol@example.com"]);
+        assert_eq!(
+            addresses_only(&to),
+            vec!["alice@example.com", "bob@example.com"]
+        );
+        assert_eq!(addresses_only(&cc), vec!["carol@example.com"]);
     }
 
     #[test]
@@ -981,15 +1069,15 @@ mod tests {
         let extra = vec!["dave@example.com".to_string()];
         let (_to, cc) =
             build_reply_recipients(&original, false, "me@example.com", Some(&extra)).unwrap();
-        assert_eq!(cc, vec!["dave@example.com"]);
+        assert_eq!(addresses_only(&cc), vec!["dave@example.com"]);
     }
 
     #[test]
     fn build_reply_recipients_sanitizes_addresses() {
         let original = email("Test", Some("alice\r\nBcc: evil@evil.com"), vec![], vec![]);
         let (to, _) = build_reply_recipients(&original, false, "me@example.com", None).unwrap();
-        assert!(!to[0].contains('\r'));
-        assert!(!to[0].contains('\n'));
+        assert!(!to[0].1.contains('\r'));
+        assert!(!to[0].1.contains('\n'));
     }
 
     #[test]
