@@ -3,6 +3,19 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 1.5.1
+
+### Fixed
+
+- The text-part signature derived from `signature_html` carried raw newlines
+  from the HTML *source* into the rendered text, breaking lines mid-sentence
+  (`Telefon:` / number split apart) and inserting a stray blank line between
+  every signature line. Source whitespace now collapses the way a browser
+  renders it; line structure comes from tags alone. Found by diffing a live
+  1.5.0 draft against the hand-written client reference.
+- A signature-separator line renders as `-- ` (with the trailing space RFC
+  3676 defines and clients write) instead of a bare `--`.
+
 ## 1.5.0
 
 Draft fidelity release: a saved draft is now indistinguishable from one

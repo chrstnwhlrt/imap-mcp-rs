@@ -252,8 +252,15 @@ fn signature_text_from_html(html: &str) -> String {
     if html.is_empty() {
         return String::new();
     }
-    let mut out = String::with_capacity(html.len());
-    let mut rest = html;
+    // HTML source whitespace collapses the way a browser renders it: raw
+    // newlines inside the markup are formatting of the *source*, not line
+    // breaks. Without this, a signature whose markup wraps mid-sentence
+    // produced broken lines and stray blank lines in the text part. Line
+    // structure below comes exclusively from tags (`<br>`, closing blocks).
+    let collapsed = html.split_whitespace().collect::<Vec<_>>().join(" ");
+
+    let mut out = String::with_capacity(collapsed.len());
+    let mut rest = collapsed.as_str();
     while let Some(start) = rest.find('<') {
         out.push_str(&rest[..start]);
         let after = &rest[start + 1..];
@@ -266,7 +273,7 @@ fn signature_text_from_html(html: &str) -> String {
         let tag = after[..end].trim().to_ascii_lowercase();
         let name = tag
             .trim_start_matches('/')
-            .split([' ', '\t', '\n', '/'])
+            .split([' ', '\t', '/'])
             .next()
             .unwrap_or("");
         // Opening <br>, and closing block tags, produce line breaks.
@@ -286,11 +293,14 @@ fn signature_text_from_html(html: &str) -> String {
         .replace("&#39;", "'")
         .replace("&amp;", "&");
 
-    // Trim trailing whitespace per line and collapse blank-line runs.
+    // Trim each line and collapse blank-line runs. A line consisting of
+    // `--` is the RFC 3676 signature separator and is restored to `-- `
+    // (trailing space included) — that is how clients write it, and some
+    // treat the space as significant when detecting the signature start.
     let mut lines: Vec<&str> = Vec::new();
     let mut blank_run = 0usize;
     for line in decoded.lines() {
-        let trimmed = line.trim_end();
+        let trimmed = line.trim();
         if trimmed.is_empty() {
             blank_run += 1;
             if blank_run > 1 {
@@ -307,7 +317,11 @@ fn signature_text_from_html(html: &str) -> String {
     while lines.first().is_some_and(|l| l.is_empty()) {
         lines.remove(0);
     }
-    lines.join("\n")
+    lines
+        .iter()
+        .map(|l| if *l == "--" { "-- " } else { *l })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ========== HTML construction (Outlook Web style) ==========
@@ -783,7 +797,20 @@ mod tests {
         let html = "<p>--&nbsp;</p><p>Example Corp &amp; Co<br>Line two</p>";
         assert_eq!(
             signature_text_from_html(html),
-            "--\nExample Corp & Co\nLine two"
+            "-- \nExample Corp & Co\nLine two"
+        );
+    }
+
+    #[test]
+    fn signature_text_from_html_collapses_source_newlines() {
+        // Raw newlines inside the markup are source formatting, not line
+        // breaks — only tags create lines. This exact shape (a phone number
+        // wrapped mid-line in the HTML source) previously broke the text
+        // signature apart.
+        let html = "<p><span>Phone:\r\n +49 40 0000</span><span>&nbsp;<br></span><span>Line two \r\n</span></p>";
+        assert_eq!(
+            signature_text_from_html(html),
+            "Phone: +49 40 0000\nLine two"
         );
     }
 
@@ -834,7 +861,7 @@ mod tests {
 
         // Outlook text part: body, signature, blank line, Von/Gesendet/An/
         // Betreff block, blank line, unprefixed original text.
-        assert!(plain.starts_with("my reply\n--\nSig line\n\nVon: Alice <alice@example.com>\n"));
+        assert!(plain.starts_with("my reply\n-- \nSig line\n\nVon: Alice <alice@example.com>\n"));
         assert!(plain.contains("\nGesendet: Donnerstag, 30. Juli 2026 21:18\n"));
         assert!(plain.contains("\nAn: me@example.com <me@example.com>\n"));
         assert!(plain.contains("\nBetreff: Hello\n\noriginal text"));
