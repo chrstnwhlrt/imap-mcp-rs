@@ -36,6 +36,10 @@ the MCP tool surface and the config format are the public API.
   renders an `<img>` tag, so a PDF marked inline would arrive as a broken
   picture. SVG is refused because it can carry script and inline files often
   originate from a received message via `download_attachment`.
+- `draft_email` reports the rendered body in `body_preview`, the way
+  `draft_reply` and `draft_forward` already did. It previously echoed the raw
+  input, so with inline images the preview showed `![alt](cid:…)` markers that
+  no longer exist in the saved message.
 
 ## 1.5.1
 

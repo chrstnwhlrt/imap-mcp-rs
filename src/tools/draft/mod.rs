@@ -643,7 +643,12 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
                 "cc": req.cc.as_deref().unwrap_or_default(),
                 "bcc": req.bcc.as_deref().unwrap_or_default(),
                 "subject": req.subject,
-                "body_preview": truncate(&req.body, 500),
+                // The rendered text, not the raw input — matching reply and
+                // forward. With inline images the two differ: the input still
+                // carries `![alt](cid:…)` markers, the saved message carries
+                // the `[alt]` placeholders. A preview showing markers would
+                // claim the mail contains something it does not.
+                "body_preview": truncate(&plain_body, 500),
             });
             if let Some(notice) = inline_notice {
                 response["inline_warning"] = serde_json::Value::String(notice);
