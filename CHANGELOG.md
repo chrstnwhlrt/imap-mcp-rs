@@ -3,6 +3,36 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 1.6.1
+
+### Fixed
+
+- **Claude Code refused every tool of this server** with
+  `Failed to fetch tools: Invalid result for tools/list` naming two missing
+  fields, `ttlMs` and `cacheScope`. The server itself was healthy — it
+  started, connected both accounts and answered `initialize` — but none of
+  its tools were registered, while every other MCP server on the same client
+  kept working.
+
+  Cause: the client offers protocol version `2026-07-28`, and rmcp 3.0.0
+  accepts it. Under that version `tools/list` switches to the new discovery
+  shape (it does set `resultType`), but rmcp 3.0.0 omits the `ttlMs` and
+  `cacheScope` fields that shape requires, so the client rejects the whole
+  response. Servers negotiating an older version — everything else in this
+  setup — are validated against the old shape and stay unaffected, which is
+  why the fault looked server-specific.
+
+  Fixed by moving to rmcp 3.1.2, which emits both fields. Verified by
+  replaying the client's handshake: with `2026-07-28` the response now
+  carries `ttlMs: 0` and `cacheScope: "public"` alongside `resultType` and
+  `tools`.
+
+### Changed
+
+- All 24 dependencies updated to their latest compatible releases, among them
+  tokio 1.53.1, rustls 0.23.43, mail-parser 0.11.6 and schemars 1.2.2. No
+  major version is outstanding.
+
 ## 1.6.0
 
 ### Added
