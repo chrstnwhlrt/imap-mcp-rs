@@ -139,6 +139,7 @@ pub(super) fn build_reply_bodies(
     user_body: &str,
     locale: Locale,
     signatures: &Signatures,
+    inline: &[InlineRef],
 ) -> (String, String) {
     let from_display = format_sender(original.from.as_ref());
     let date_display = format_date_outlook(original.date.as_deref(), locale);
@@ -154,7 +155,7 @@ pub(super) fn build_reply_bodies(
     );
     let plain_body = format!(
         "{body}\n\n{quote_header}\n\n{original_text}",
-        body = signatures.apply_plain(user_body),
+        body = signatures.apply_plain(&apply_cid_markers_plain(user_body, inline)),
         original_text = original.body_text,
     );
 
@@ -170,7 +171,10 @@ pub(super) fn build_reply_bodies(
     );
     let html_body = wrap_html_document(&format!(
         "{body}{sig}{appendonsend}{metablock}",
-        body = body_div(&html_escape(user_body), locale),
+        body = body_div(
+            &apply_cid_markers_html(&html_escape(user_body), inline),
+            locale
+        ),
         sig = signature_block(&signatures.html, locale),
         appendonsend = APPEND_ON_SEND,
     ));
@@ -185,6 +189,7 @@ pub(super) fn build_forward_bodies(
     user_body: Option<&str>,
     locale: Locale,
     signatures: &Signatures,
+    inline: &[InlineRef],
 ) -> (String, String) {
     let from_display = format_sender(original.from.as_ref());
     let date_display = format_date_outlook(original.date.as_deref(), locale);
@@ -200,7 +205,7 @@ pub(super) fn build_forward_bodies(
     );
     let plain_body = format!(
         "{body}\n\n{quote_header}\n\n{original_text}",
-        body = signatures.apply_plain(user_body.unwrap_or("")),
+        body = signatures.apply_plain(&apply_cid_markers_plain(user_body.unwrap_or(""), inline)),
         original_text = original.body_text,
     );
 
@@ -215,7 +220,7 @@ pub(super) fn build_forward_bodies(
         locale,
     );
     let body_html_content = match user_body {
-        Some(msg) if !msg.is_empty() => html_escape(msg),
+        Some(msg) if !msg.is_empty() => apply_cid_markers_html(&html_escape(msg), inline),
         _ => "<br>".to_string(),
     };
     let html_body = wrap_html_document(&format!(
@@ -234,11 +239,12 @@ pub(super) fn build_compose_bodies(
     body: &str,
     locale: Locale,
     signatures: &Signatures,
+    inline: &[InlineRef],
 ) -> (String, String) {
-    let plain_body = signatures.apply_plain(body);
+    let plain_body = signatures.apply_plain(&apply_cid_markers_plain(body, inline));
     let html_body = wrap_html_document(&format!(
         "{body}{sig}",
-        body = body_div(&html_escape(body), locale),
+        body = body_div(&apply_cid_markers_html(&html_escape(body), inline), locale),
         sig = signature_block(&signatures.html, locale),
     ));
     (plain_body, html_body)
@@ -630,6 +636,178 @@ fn weekday_index(year: i32, month: u32, day: u32) -> usize {
     usize::try_from((y + y / 4 - y / 100 + y / 400 + T[month_idx] + day).rem_euclid(7)).unwrap_or(0)
 }
 
+// ========== Inline image markers ==========
+
+/// An inline image the body may reference as `![alt](cid:<id>)`.
+pub(super) struct InlineRef<'a> {
+    pub cid: &'a str,
+    pub filename: &'a str,
+}
+
+/// One `![alt](cid:<id>)` occurrence: its byte range plus the parsed parts.
+struct CidMarker {
+    start: usize,
+    end: usize,
+    alt: String,
+    cid: String,
+}
+
+/// Scan a body for `![alt](cid:<id>)` markers.
+///
+/// Hand-rolled rather than regex-based: the grammar is three fixed delimiters
+/// and the crate carries no regex dependency. Deliberately strict — an id may
+/// not be empty and may not contain whitespace, `<`, `>` or `)`. That way a
+/// stray `![](cid:` in prose cannot swallow the rest of the message, and an id
+/// can never break out of the `src="cid:…"` attribute it lands in.
+///
+/// Runs identically on the raw body and on the HTML-escaped one: escaping
+/// rewrites `& < > "` and newlines, none of which appear in the delimiters or
+/// in a valid id.
+fn scan_cid_markers(body: &str) -> Vec<CidMarker> {
+    const OPEN: &str = "![";
+    const MID: &str = "](cid:";
+
+    let mut out = Vec::new();
+    let mut cursor = 0usize;
+
+    while let Some(rel) = body[cursor..].find(OPEN) {
+        let start = cursor + rel;
+        let alt_start = start + OPEN.len();
+
+        // Alt text runs to the first `]`. No `]` left at all means no further
+        // marker can complete either, so stop rather than rescan.
+        let Some(alt_rel) = body[alt_start..].find(']') else {
+            break;
+        };
+        let alt_end = alt_start + alt_rel;
+
+        if !body[alt_end..].starts_with(MID) {
+            // `![…]` without the `(cid:` tail — ordinary text. Resume after the
+            // opener so an overlapping marker later in the line is still found.
+            cursor = alt_start;
+            continue;
+        }
+
+        let id_start = alt_end + MID.len();
+        let Some(id_rel) = body[id_start..].find(')') else {
+            break;
+        };
+        let id_end = id_start + id_rel;
+        let id = &body[id_start..id_end];
+
+        if id.is_empty()
+            || id
+                .chars()
+                .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '"'))
+        {
+            // Resume right after this opener, NOT after the `)` that ended the
+            // candidate: an unterminated `![](cid:` in prose reaches forward to
+            // the next `)` anywhere in the mail, and skipping that far would
+            // swallow every valid marker in between. Advancing past the opener
+            // still guarantees progress.
+            cursor = alt_start;
+            continue;
+        }
+
+        out.push(CidMarker {
+            start,
+            end: id_end + 1,
+            alt: body[alt_start..alt_end].to_string(),
+            cid: id.to_string(),
+        });
+        cursor = id_end + 1;
+    }
+
+    out
+}
+
+/// The content ids the body references, in order of first appearance and
+/// without duplicates. Used by the caller to verify that every marker has a
+/// matching inline attachment before a draft is built.
+pub(super) fn collect_cid_markers(body: &str) -> Vec<String> {
+    let mut seen = Vec::new();
+    for marker in scan_cid_markers(body) {
+        if !seen.contains(&marker.cid) {
+            seen.push(marker.cid);
+        }
+    }
+    seen
+}
+
+/// Replace markers with `<img src="cid:…">` tags.
+///
+/// The input must ALREADY be HTML-escaped — the alt text is copied through
+/// verbatim into the attribute, so escaping has to happen before this runs,
+/// never after (afterwards would escape the generated tag itself).
+///
+/// `max-width` keeps a phone screenshot from blowing up the mail layout;
+/// `alt` falls back to the file name so the image still announces itself in
+/// clients that block remote content or in screen readers.
+pub(super) fn apply_cid_markers_html(escaped: &str, refs: &[InlineRef]) -> String {
+    let markers = scan_cid_markers(escaped);
+    if markers.is_empty() {
+        return escaped.to_string();
+    }
+
+    let mut out = String::with_capacity(escaped.len() + markers.len() * 64);
+    let mut last = 0usize;
+    for marker in markers {
+        let Some(found) = refs.iter().find(|r| r.cid == marker.cid) else {
+            // Unknown id: leave the marker untouched. The caller rejects this
+            // case up front; keeping the text verbatim here means a future
+            // caller that skips validation degrades to visible text rather
+            // than to a broken image icon.
+            continue;
+        };
+        out.push_str(&escaped[last..marker.start]);
+        let alt = if marker.alt.is_empty() {
+            html_escape(found.filename)
+        } else {
+            marker.alt.clone()
+        };
+        // Built by pushes rather than `format!` into the buffer: the tag is
+        // assembled once per image and this avoids the intermediate String.
+        out.push_str("<img src=\"cid:");
+        out.push_str(found.cid);
+        out.push_str("\" alt=\"");
+        out.push_str(&alt);
+        out.push_str("\" style=\"max-width:100%; height:auto;\">");
+        last = marker.end;
+    }
+    out.push_str(&escaped[last..]);
+    out
+}
+
+/// Replace markers with a readable placeholder for the plaintext part, so a
+/// text-only reader learns that an image sits at this position instead of
+/// seeing raw markup.
+pub(super) fn apply_cid_markers_plain(body: &str, refs: &[InlineRef]) -> String {
+    let markers = scan_cid_markers(body);
+    if markers.is_empty() {
+        return body.to_string();
+    }
+
+    let mut out = String::with_capacity(body.len());
+    let mut last = 0usize;
+    for marker in markers {
+        let Some(found) = refs.iter().find(|r| r.cid == marker.cid) else {
+            continue;
+        };
+        out.push_str(&body[last..marker.start]);
+        let label = if marker.alt.is_empty() {
+            found.filename
+        } else {
+            marker.alt.as_str()
+        };
+        out.push('[');
+        out.push_str(label);
+        out.push(']');
+        last = marker.end;
+    }
+    out.push_str(&body[last..]);
+    out
+}
+
 /// Escape HTML special characters and convert newlines to `<br>`. Single-pass
 /// to avoid allocating 5× the input in intermediate `String`s the way
 /// chained `.replace()` does.
@@ -857,7 +1035,7 @@ mod tests {
         };
         original.subject = "Hello".to_string();
         let sigs = Signatures::resolve(Some("<p>-- </p><p>Sig line</p>"), None);
-        let (plain, html) = build_reply_bodies(&original, "my reply", Locale::De, &sigs);
+        let (plain, html) = build_reply_bodies(&original, "my reply", Locale::De, &sigs, &[]);
 
         // Outlook text part: body, signature, blank line, Von/Gesendet/An/
         // Betreff block, blank line, unprefixed original text.
@@ -869,5 +1047,137 @@ mod tests {
         assert!(!plain.contains("schrieb"), "no legacy intro line: {plain}");
         // HTML part still carries the signature block.
         assert!(html.contains("id=\"Signature\""));
+    }
+
+    // ===== inline image markers =====
+
+    #[test]
+    fn cid_markers_are_collected_in_order_without_duplicates() {
+        let body = "one ![](cid:a) two ![alt](cid:b) three ![](cid:a)";
+        assert_eq!(collect_cid_markers(body), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn cid_marker_scan_rejects_malformed_ids() {
+        // Empty id, whitespace, angle brackets and quotes would all let an id
+        // break out of `src="cid:…"`, so none of them may parse.
+        for body in [
+            "![](cid:)",
+            "![](cid:a b)",
+            "![](cid:a<b)",
+            "![](cid:a>b)",
+            "![](cid:a\"b)",
+        ] {
+            assert!(
+                collect_cid_markers(body).is_empty(),
+                "should not parse as a marker: {body}"
+            );
+        }
+    }
+
+    #[test]
+    fn cid_marker_scan_ignores_plain_markdown_and_prose() {
+        // A normal markdown image, a bare bracket pair, and an unterminated
+        // marker must all survive as text.
+        assert!(collect_cid_markers("![shot](https://example.com/a.png)").is_empty());
+        assert!(collect_cid_markers("costs ![] and more").is_empty());
+        assert!(collect_cid_markers("![](cid:unterminated").is_empty());
+        // Prose containing the opener must not swallow the rest of the mail.
+        let body = "see ![](cid: and then a real one ![](cid:real)";
+        assert_eq!(collect_cid_markers(body), vec!["real"]);
+    }
+
+    #[test]
+    fn markers_survive_html_escaping_unchanged() {
+        // The HTML pass runs on escaped text, so escaping must not disturb the
+        // delimiters — otherwise the marker would never be found there.
+        let escaped = html_escape("text ![](cid:shot) more");
+        assert_eq!(collect_cid_markers(&escaped), vec!["shot"]);
+    }
+
+    #[test]
+    fn html_marker_becomes_img_tag_with_filename_alt() {
+        let refs = [InlineRef {
+            cid: "shot",
+            filename: "screenshot.png",
+        }];
+        let out = apply_cid_markers_html(&html_escape("before ![](cid:shot) after"), &refs);
+        assert!(out.contains("<img src=\"cid:shot\""), "{out}");
+        assert!(out.contains("alt=\"screenshot.png\""), "{out}");
+        assert!(out.contains("max-width:100%"), "{out}");
+        assert!(out.starts_with("before "), "{out}");
+        assert!(out.ends_with(" after"), "{out}");
+    }
+
+    #[test]
+    fn html_marker_keeps_author_alt_text_escaped() {
+        let refs = [InlineRef {
+            cid: "x",
+            filename: "f.png",
+        }];
+        // The alt text is escaped by the earlier html_escape pass; the tag
+        // must carry that escaped form, never the raw one.
+        let out = apply_cid_markers_html(&html_escape("![a<b](cid:x)"), &refs);
+        assert!(out.contains("alt=\"a&lt;b\""), "{out}");
+        assert!(!out.contains("alt=\"a<b\""), "{out}");
+    }
+
+    #[test]
+    fn plain_marker_becomes_readable_placeholder() {
+        let refs = [InlineRef {
+            cid: "shot",
+            filename: "screenshot.png",
+        }];
+        assert_eq!(
+            apply_cid_markers_plain("before ![](cid:shot) after", &refs),
+            "before [screenshot.png] after"
+        );
+        // An author-supplied alt wins over the file name.
+        assert_eq!(
+            apply_cid_markers_plain("![Rollenübersicht](cid:shot)", &refs),
+            "[Rollenübersicht]"
+        );
+    }
+
+    #[test]
+    fn unknown_cid_is_left_verbatim_in_both_parts() {
+        // Callers reject this case up front; if one ever forgets, degrading to
+        // visible text beats shipping a broken image.
+        let refs = [InlineRef {
+            cid: "known",
+            filename: "k.png",
+        }];
+        assert_eq!(
+            apply_cid_markers_plain("x ![](cid:other) y", &refs),
+            "x ![](cid:other) y"
+        );
+        assert!(apply_cid_markers_html("x ![](cid:other) y", &refs).contains("![](cid:other)"));
+    }
+
+    #[test]
+    fn bodies_without_markers_are_untouched() {
+        let refs = [InlineRef {
+            cid: "a",
+            filename: "a.png",
+        }];
+        let body = "just text, no markers at all";
+        assert_eq!(apply_cid_markers_plain(body, &refs), body);
+        assert_eq!(apply_cid_markers_html(body, &refs), body);
+    }
+
+    #[test]
+    fn multiple_markers_all_replaced() {
+        let refs = [
+            InlineRef {
+                cid: "a",
+                filename: "a.png",
+            },
+            InlineRef {
+                cid: "b",
+                filename: "b.png",
+            },
+        ];
+        let out = apply_cid_markers_plain("![](cid:a) middle ![](cid:b)", &refs);
+        assert_eq!(out, "[a.png] middle [b.png]");
     }
 }

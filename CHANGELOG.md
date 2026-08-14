@@ -3,6 +3,40 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 1.6.0
+
+### Added
+
+- **Inline images in drafts.** An `attachments` entry may now be an object
+  instead of a path: `{"path": "…", "inline": true, "cid": "shot"}`. Reference
+  it from the body as `![alt](cid:shot)` and the image renders at that exact
+  spot instead of dangling at the end of the mail. `cid` is optional and
+  defaults to the file name without extension; setting it implies `inline`.
+  Bare path strings keep their meaning, and both spellings mix in one array,
+  so existing callers are unaffected.
+
+  The MIME tree follows RFC 2387: inline parts go into a `multipart/related`
+  beside the HTML that references them, regular attachments stay outside it in
+  a `multipart/mixed`. `mail-builder`'s own `.inline()` helper places the part
+  next to the `multipart/alternative` instead, which some clients render as a
+  detached attachment — so the tree is assembled by hand when inline images are
+  present, and left untouched when they are not.
+
+  The plaintext part receives a readable `[alt]` placeholder at the same
+  position, so a text-only reader still learns that an image belongs there.
+
+### Fixed
+
+- Mismatches between body markers and attachments are caught before the draft
+  is saved. A marker with no matching attachment is an error that lists the
+  available ids; an inline attachment that no marker references is saved but
+  reported back as `inline_warning`, because the recipient's client would
+  otherwise place it arbitrarily.
+- Only raster images (`image/*` except SVG) can be inlined. A marker always
+  renders an `<img>` tag, so a PDF marked inline would arrive as a broken
+  picture. SVG is refused because it can carry script and inline files often
+  originate from a received message via `download_attachment`.
+
 ## 1.5.1
 
 ### Fixed

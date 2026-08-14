@@ -17,6 +17,8 @@
 use std::sync::Arc;
 
 use mail_builder::MessageBuilder;
+use mail_builder::headers::content_type::ContentType;
+use mail_builder::mime::MimePart;
 use rmcp::schemars;
 use serde::Deserialize;
 
@@ -29,8 +31,70 @@ use super::{ImapMcpServer, error_json};
 
 mod render;
 use render::{
-    Locale, Signatures, apply_from, build_compose_bodies, build_forward_bodies, build_reply_bodies,
+    InlineRef, Locale, Signatures, apply_from, build_compose_bodies, build_forward_bodies,
+    build_reply_bodies, collect_cid_markers,
 };
+
+/// One entry of a draft's `attachments` list.
+///
+/// Accepts either a bare path — the original and still most common form — or
+/// an object that additionally marks the file as an inline image the body
+/// refers to. Untagged, so both spellings coexist in the same array and every
+/// existing caller keeps working unchanged:
+///
+/// ```json
+/// ["/path/report.pdf", {"path": "/path/shot.png", "inline": true, "cid": "shot"}]
+/// ```
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+#[serde(untagged)]
+pub enum AttachmentSpec {
+    /// Bare absolute path — a regular attachment.
+    Path(String),
+    /// Path plus placement metadata.
+    Detailed {
+        #[schemars(description = "Absolute file path, same rules as the bare-string form.")]
+        path: String,
+        #[schemars(
+            description = "Embed in the body instead of appending as a file. Implied when `cid` is set."
+        )]
+        inline: Option<bool>,
+        #[schemars(
+            description = "Content id referenced from the body as `![alt](cid:<id>)`. Defaults to a value derived from the file name."
+        )]
+        cid: Option<String>,
+    },
+}
+
+impl AttachmentSpec {
+    fn path(&self) -> &str {
+        match self {
+            Self::Path(p) => p,
+            Self::Detailed { path, .. } => path,
+        }
+    }
+
+    /// A `cid` alone is enough to mean "inline" — requiring `inline: true`
+    /// next to it would be a redundant second switch that callers forget.
+    ///
+    /// An explicit `inline` still wins over that inference: `{"cid": "x",
+    /// "inline": false}` yields a regular attachment. Silently overriding a
+    /// stated `false` would be the more surprising behaviour, and a body that
+    /// then references `cid:x` is caught by [`check_cid_markers`] with a clear
+    /// message rather than shipping a broken image.
+    fn is_inline(&self) -> bool {
+        match self {
+            Self::Path(_) => false,
+            Self::Detailed { inline, cid, .. } => inline.unwrap_or_else(|| cid.is_some()),
+        }
+    }
+
+    fn explicit_cid(&self) -> Option<&str> {
+        match self {
+            Self::Path(_) => None,
+            Self::Detailed { cid, .. } => cid.as_deref(),
+        }
+    }
+}
 
 /// Account-derived values shared by all three draft flows, resolved once per
 /// call so the flows stay below clippy's function-length lint and cannot
@@ -107,9 +171,9 @@ pub struct DraftReplyRequest {
     )]
     pub cc: Option<Vec<String>>,
     #[schemars(
-        description = "Absolute file paths to attach (e.g. from download_attachment's `saved_to`). Must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
+        description = "Files to attach. Each entry is either an absolute path (e.g. from download_attachment's `saved_to`) or an object `{path, inline, cid}`. With `inline: true` the file is embedded in the body instead of appended: reference it from `body` as `![alt](cid:<id>)` and it appears exactly there. Paths must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
     )]
-    pub attachments: Option<Vec<String>>,
+    pub attachments: Option<Vec<AttachmentSpec>>,
     #[schemars(
         description = "UID of a draft this one replaces — this tool returns `uid` on every save, so a revision loop can pass the previous one straight back without calling list_drafts. The new draft is saved first, the old one deleted only afterwards — use this instead of delete_draft + draft_* so a failure can never leave you with neither version."
     )]
@@ -135,9 +199,9 @@ pub struct DraftForwardRequest {
     #[schemars(description = "Optional CC email addresses, e.g. [\"alice@example.com\"]")]
     pub cc: Option<Vec<String>>,
     #[schemars(
-        description = "Absolute file paths to attach (e.g. from download_attachment's `saved_to`). Must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
+        description = "Files to attach. Each entry is either an absolute path (e.g. from download_attachment's `saved_to`) or an object `{path, inline, cid}`. With `inline: true` the file is embedded in the body instead of appended: reference it from `body` as `![alt](cid:<id>)` and it appears exactly there. Paths must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
     )]
-    pub attachments: Option<Vec<String>>,
+    pub attachments: Option<Vec<AttachmentSpec>>,
     #[schemars(
         description = "UID of a draft this one replaces — this tool returns `uid` on every save, so a revision loop can pass the previous one straight back without calling list_drafts. The new draft is saved first, the old one deleted only afterwards — use this instead of delete_draft + draft_* so a failure can never leave you with neither version."
     )]
@@ -171,9 +235,9 @@ pub struct DraftEmailRequest {
     )]
     pub bcc: Option<Vec<String>>,
     #[schemars(
-        description = "Absolute file paths to attach (e.g. from download_attachment's `saved_to`). Must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
+        description = "Files to attach. Each entry is either an absolute path (e.g. from download_attachment's `saved_to`) or an object `{path, inline, cid}`. With `inline: true` the file is embedded in the body instead of appended: reference it from `body` as `![alt](cid:<id>)` and it appears exactly there. Paths must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
     )]
-    pub attachments: Option<Vec<String>>,
+    pub attachments: Option<Vec<AttachmentSpec>>,
     #[schemars(
         description = "UID of a draft this one replaces — this tool returns `uid` on every save, so a revision loop can pass the previous one straight back without calling list_drafts. The new draft is saved first, the old one deleted only afterwards — use this instead of delete_draft + draft_* so a failure can never leave you with neither version."
     )]
@@ -298,13 +362,28 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
     };
     let subject = sanitize_header_value(&subject_raw);
 
-    let (plain_body, html_body) =
-        build_reply_bodies(&original, &req.body, acct.locale, &acct.signatures);
+    // Attachments are read BEFORE the bodies: inline images have to be known
+    // while rendering, because their markers are resolved inside the body
+    // text rather than patched in afterwards.
+    let (prepared, inline_notice) = match prepare_attachments(
+        req.attachments.as_deref(),
+        &server.config.allowed_attachment_dirs,
+        &req.body,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return error_json(&e),
+    };
 
-    let mut builder = MessageBuilder::new()
-        .subject(&subject)
-        .text_body(&plain_body)
-        .html_body(&html_body);
+    // Scoped so the borrows of `prepared` end before it is moved into the
+    // MIME assembly below.
+    let (plain_body, html_body) = {
+        let refs = inline_refs(&prepared.inline);
+        build_reply_bodies(&original, &req.body, acct.locale, &acct.signatures, &refs)
+    };
+
+    let mut builder = MessageBuilder::new().subject(&subject);
     builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
     builder = stamp_identity_headers(builder, &acct.message_id_domain);
 
@@ -324,18 +403,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
     let has_threading;
     (builder, has_threading) = apply_threading_headers(builder, &original);
 
-    let attachment_data = match read_attachments(
-        req.attachments.as_deref(),
-        &server.config.allowed_attachment_dirs,
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(e) => return error_json(&e),
-    };
-    for (content_type, filename, bytes) in attachment_data {
-        builder = builder.attachment(content_type, filename, bytes);
-    }
+    builder = apply_bodies_and_attachments(builder, &plain_body, &html_body, prepared);
 
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
@@ -367,6 +435,9 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
                 response["threading_warning"] = serde_json::json!(
                     "Original email has no Message-ID. Reply was created without threading headers (In-Reply-To/References) — it may not appear in the same thread in the recipient's mail client."
                 );
+            }
+            if let Some(notice) = inline_notice {
+                response["inline_warning"] = serde_json::Value::String(notice);
             }
             finish_draft(&client_arc, new_uid, req.replaces_uid, response).await
         }
@@ -412,51 +483,45 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     // `original.subject` can contain `\r\n` header-injection payloads.
     let subject = sanitize_header_value(&subject_raw);
 
-    let (plain_body, html_body) = build_forward_bodies(
-        &original,
-        req.body.as_deref(),
-        acct.locale,
-        &acct.signatures,
-    );
+    // Read before rendering — see the note in draft_reply.
+    let (prepared, inline_notice) = match prepare_attachments(
+        req.attachments.as_deref(),
+        &server.config.allowed_attachment_dirs,
+        req.body.as_deref().unwrap_or(""),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return error_json(&e),
+    };
 
-    let mut builder = MessageBuilder::new()
-        .subject(&subject)
-        .text_body(&plain_body)
-        .html_body(&html_body);
+    let (plain_body, html_body) = {
+        let refs = inline_refs(&prepared.inline);
+        build_forward_bodies(
+            &original,
+            req.body.as_deref(),
+            acct.locale,
+            &acct.signatures,
+            &refs,
+        )
+    };
+
+    let mut builder = MessageBuilder::new().subject(&subject);
     builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
     builder = stamp_identity_headers(builder, &acct.message_id_domain);
 
-    // Sanitize LLM-provided recipient addresses — `\r\n` in any of them would
-    // inject extra headers (e.g. a silent Bcc) into the saved draft.
     // Collect into a Vec and pass once; `.to()` / `.cc()` overwrite on repeat
     // calls (same bug that affected draft_reply before the fix).
-    let to_clean: Vec<String> = req.to.iter().map(|a| sanitize_header_value(a)).collect();
+    let to_clean = clean_recipients(Some(&req.to));
     if !to_clean.is_empty() {
         builder = builder.to(to_clean);
     }
-    let cc_clean: Vec<String> = req
-        .cc
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .map(|a| sanitize_header_value(a))
-        .collect();
+    let cc_clean = clean_recipients(req.cc.as_deref());
     if !cc_clean.is_empty() {
         builder = builder.cc(cc_clean);
     }
 
-    let attachment_data = match read_attachments(
-        req.attachments.as_deref(),
-        &server.config.allowed_attachment_dirs,
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(e) => return error_json(&e),
-    };
-    for (content_type, filename, bytes) in attachment_data {
-        builder = builder.attachment(content_type, filename, bytes);
-    }
+    builder = apply_bodies_and_attachments(builder, &plain_body, &html_body, prepared);
 
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
@@ -472,7 +537,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     };
     match save_result {
         Ok(new_uid) => {
-            let response = serde_json::json!({
+            let mut response = serde_json::json!({
                 "status": "ok",
                 "account": acct.name,
                 "from": acct.from,
@@ -481,6 +546,9 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
                 "subject": subject,
                 "body_preview": truncate(&plain_body, 500),
             });
+            if let Some(notice) = inline_notice {
+                response["inline_warning"] = serde_json::Value::String(notice);
+            }
             finish_draft(&client_arc, new_uid, req.replaces_uid, response).await
         }
         Err(e) => error_json(&format!("Failed to save draft: {e}")),
@@ -500,14 +568,26 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
     }
     let acct = DraftAccount::from_config(account_config);
 
-    let (plain_body, html_body) = build_compose_bodies(&req.body, acct.locale, &acct.signatures);
+    // Read before rendering — see the note in draft_reply.
+    let (prepared, inline_notice) = match prepare_attachments(
+        req.attachments.as_deref(),
+        &server.config.allowed_attachment_dirs,
+        &req.body,
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => return error_json(&e),
+    };
+
+    let (plain_body, html_body) = {
+        let refs = inline_refs(&prepared.inline);
+        build_compose_bodies(&req.body, acct.locale, &acct.signatures, &refs)
+    };
 
     // Sanitize subject + recipients against header injection from LLM input.
     let subject = sanitize_header_value(&req.subject);
-    let mut builder = MessageBuilder::new()
-        .subject(&subject)
-        .text_body(&plain_body)
-        .html_body(&html_body);
+    let mut builder = MessageBuilder::new().subject(&subject);
     builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
     builder = stamp_identity_headers(builder, &acct.message_id_domain);
 
@@ -539,18 +619,7 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
         builder = builder.bcc(bcc_clean);
     }
 
-    let attachment_data = match read_attachments(
-        req.attachments.as_deref(),
-        &server.config.allowed_attachment_dirs,
-    )
-    .await
-    {
-        Ok(a) => a,
-        Err(e) => return error_json(&e),
-    };
-    for (content_type, filename, bytes) in attachment_data {
-        builder = builder.attachment(content_type, filename, bytes);
-    }
+    builder = apply_bodies_and_attachments(builder, &plain_body, &html_body, prepared);
 
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
@@ -566,7 +635,7 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
     };
     match save_result {
         Ok(new_uid) => {
-            let response = serde_json::json!({
+            let mut response = serde_json::json!({
                 "status": "ok",
                 "account": acct.name,
                 "from": acct.from,
@@ -576,6 +645,9 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
                 "subject": req.subject,
                 "body_preview": truncate(&req.body, 500),
             });
+            if let Some(notice) = inline_notice {
+                response["inline_warning"] = serde_json::Value::String(notice);
+            }
             finish_draft(&client_arc, new_uid, req.replaces_uid, response).await
         }
         Err(e) => error_json(&format!("Failed to save draft: {e}")),
@@ -771,13 +843,94 @@ fn truncate(s: &str, max_len: usize) -> String {
 
 // ========== Attachment helpers ==========
 
-/// Read attachment files from disk. Returns `(content_type, filename, bytes)` tuples.
+/// Regular (appended) attachments as `(content_type, filename, bytes)`.
 type AttachmentData = Vec<(&'static str, String, Vec<u8>)>;
 
+/// An attachment that is embedded in the body rather than appended to it.
+pub(super) struct InlineImage {
+    pub cid: String,
+    pub filename: String,
+    pub content_type: &'static str,
+    pub bytes: Vec<u8>,
+}
+
+/// Attachments split by how they are placed in the message. Kept apart
+/// because they end up in different MIME subtrees: inline parts belong next
+/// to the HTML inside `multipart/related`, appended files next to it inside
+/// `multipart/mixed`.
+///
+/// `Debug` omits the payloads via the manual impl below — a derived one would
+/// dump megabytes of image bytes into a failing test's output.
+pub(super) struct PreparedAttachments {
+    pub regular: AttachmentData,
+    pub inline: Vec<InlineImage>,
+}
+
+impl std::fmt::Debug for PreparedAttachments {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PreparedAttachments")
+            .field(
+                "regular",
+                &self
+                    .regular
+                    .iter()
+                    .map(|(ct, name, bytes)| format!("{name} ({ct}, {} bytes)", bytes.len()))
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "inline",
+                &self
+                    .inline
+                    .iter()
+                    .map(|i| {
+                        format!(
+                            "{} -> cid:{} ({}, {} bytes)",
+                            i.filename,
+                            i.cid,
+                            i.content_type,
+                            i.bytes.len()
+                        )
+                    })
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
+    }
+}
+
+/// Characters safe to carry inside `src="cid:…"` and a `Content-ID` header
+/// without quoting. A deliberately narrow subset of what RFC 2392 permits.
+const fn is_cid_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')
+}
+
+/// Turn a file name into a content id: drop the extension, map everything
+/// outside [`is_cid_char`] to `-`, collapse repeats. Falls back to `image`
+/// for names that reduce to nothing (e.g. purely non-ASCII).
+fn derive_cid(filename: &str) -> String {
+    let stem = filename.rsplit_once('.').map_or(filename, |(s, _)| s);
+    let mut out = String::with_capacity(stem.len());
+    let mut last_dash = false;
+    for c in stem.chars() {
+        if is_cid_char(c) {
+            out.push(c);
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    let trimmed = out.trim_matches('-').to_string();
+    if trimmed.is_empty() {
+        "image".to_string()
+    } else {
+        trimmed
+    }
+}
+
 async fn read_attachments(
-    attachments: Option<&[String]>,
+    attachments: Option<&[AttachmentSpec]>,
     allowed_dirs: &[String],
-) -> Result<AttachmentData, String> {
+) -> Result<PreparedAttachments, String> {
     // Per-file cap prevents a single huge file from OOMing. Aggregate cap
     // prevents the "many medium files" path: 50 files × 50 MiB = 2.5 GiB of
     // RAM before the MIME builder even runs. 100 MiB total covers every
@@ -785,8 +938,11 @@ async fn read_attachments(
     const MAX_ATTACHMENT_SIZE: usize = 50 * 1024 * 1024;
     const MAX_TOTAL_ATTACHMENTS_SIZE: usize = 100 * 1024 * 1024;
 
-    let Some(paths) = attachments else {
-        return Ok(vec![]);
+    let Some(specs) = attachments else {
+        return Ok(PreparedAttachments {
+            regular: vec![],
+            inline: vec![],
+        });
     };
 
     // Canonicalize the whitelist ONCE, not per-attachment. For a draft with 5
@@ -800,9 +956,11 @@ async fn read_attachments(
         }
     }
 
-    let mut result = Vec::new();
+    let mut regular = Vec::new();
+    let mut inline: Vec<InlineImage> = Vec::new();
     let mut total_bytes: usize = 0;
-    for path_str in paths {
+    for spec in specs {
+        let path_str = spec.path();
         let path = std::path::Path::new(path_str);
         // Validate returns the canonical path; we read FROM that (not the raw
         // input) to close the TOCTOU gap: if the user-supplied path pointed
@@ -842,9 +1000,221 @@ async fn read_attachments(
             .collect();
         let content_type =
             mime_type_from_extension(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
-        result.push((content_type, filename, bytes));
+
+        if !spec.is_inline() {
+            regular.push((content_type, filename, bytes));
+            continue;
+        }
+
+        // A body marker always renders an `<img>` tag, so anything that is not
+        // an image would produce a broken picture at the recipient's end. Type
+        // detection is extension-based, so a correctly named file is required
+        // — saying so beats letting the draft go out looking wrong.
+        //
+        // SVG is excluded on purpose although it is an image type: it can
+        // carry script, and inline images may well originate from a received
+        // mail via `download_attachment`. Embedding one would forward that
+        // payload under our own name, for a format nobody needs for
+        // screenshots.
+        if !content_type.starts_with("image/") || content_type == "image/svg+xml" {
+            return Err(format!(
+                "Attachment \"{path_str}\" is marked inline but its type is {content_type}. Only \
+                 raster images can be embedded in the body (a marker renders an <img> tag); SVG is \
+                 excluded because it can carry script. Drop `inline` to send it as a regular \
+                 attachment."
+            ));
+        }
+
+        // An explicit id is rejected rather than silently cleaned: the caller
+        // wrote the same string into the body marker, so quietly changing it
+        // here would produce a draft whose image never resolves — the exact
+        // failure this feature exists to avoid.
+        let cid = match spec.explicit_cid() {
+            Some(raw) => {
+                if raw.is_empty() || !raw.chars().all(is_cid_char) {
+                    return Err(format!(
+                        "Invalid cid \"{raw}\" for attachment \"{path_str}\": use letters, digits, \
+                         '.', '_' or '-' only (the id also appears in the body marker)"
+                    ));
+                }
+                raw.to_string()
+            }
+            None => derive_cid(&filename),
+        };
+
+        if inline.iter().any(|i| i.cid == cid) {
+            return Err(format!(
+                "Duplicate cid \"{cid}\" (attachment \"{path_str}\"): each inline image needs its \
+                 own id, otherwise a body marker cannot say which one it means"
+            ));
+        }
+
+        inline.push(InlineImage {
+            cid,
+            filename,
+            content_type,
+            bytes,
+        });
     }
-    Ok(result)
+    Ok(PreparedAttachments { regular, inline })
+}
+
+/// Sanitize an LLM-supplied recipient list: `\r\n` in any address would inject
+/// extra headers (a silent `Bcc:`, for instance) into the saved draft.
+fn clean_recipients(addrs: Option<&[String]>) -> Vec<String> {
+    addrs
+        .unwrap_or_default()
+        .iter()
+        .map(|a| sanitize_header_value(a))
+        .collect()
+}
+
+/// Read the attachments and cross-check the body's inline markers in one step.
+///
+/// Bundled because all three draft flows need exactly this pair before they
+/// can render, and the pair has an order that must not be swapped: markers can
+/// only be validated once the attachment list is known.
+async fn prepare_attachments(
+    attachments: Option<&[AttachmentSpec]>,
+    allowed_dirs: &[String],
+    body: &str,
+) -> Result<(PreparedAttachments, Option<String>), String> {
+    let prepared = read_attachments(attachments, allowed_dirs).await?;
+    let notice = check_cid_markers(body, &prepared.inline)?;
+    Ok((prepared, notice))
+}
+
+/// Borrowed view of the inline images, for the body renderer.
+fn inline_refs(inline: &[InlineImage]) -> Vec<InlineRef<'_>> {
+    inline
+        .iter()
+        .map(|i| InlineRef {
+            cid: &i.cid,
+            filename: &i.filename,
+        })
+        .collect()
+}
+
+/// Cross-check the body's `cid:` markers against the inline attachments.
+///
+/// The two directions are treated differently on purpose:
+///
+/// * A **marker without an attachment** is an error. The draft would be saved
+///   with an image that resolves to nothing, and neither the caller nor the
+///   recipient sees why — exactly the silent failure this feature is meant to
+///   prevent. Better to refuse and say which ids exist.
+/// * An **attachment nobody references** is only a warning. The file still
+///   reaches the recipient; it simply lands wherever their client puts
+///   unreferenced parts instead of at the intended spot. Returning it as
+///   `inline_warning` lets the caller notice and fix the body without losing
+///   the draft they just wrote.
+fn check_cid_markers(body: &str, inline: &[InlineImage]) -> Result<Option<String>, String> {
+    let markers = collect_cid_markers(body);
+
+    for cid in &markers {
+        if !inline.iter().any(|i| &i.cid == cid) {
+            let available: Vec<&str> = inline.iter().map(|i| i.cid.as_str()).collect();
+            return Err(if available.is_empty() {
+                format!(
+                    "Body references `(cid:{cid})` but no attachment is marked inline. Pass the \
+                     image as {{\"path\": \"…\", \"inline\": true, \"cid\": \"{cid}\"}}."
+                )
+            } else {
+                format!(
+                    "Body references `(cid:{cid})` but no attachment carries that id. Available: {}",
+                    available.join(", ")
+                )
+            });
+        }
+    }
+
+    let unused: Vec<&str> = inline
+        .iter()
+        .filter(|i| !markers.contains(&i.cid))
+        .map(|i| i.cid.as_str())
+        .collect();
+    if unused.is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(format!(
+            "Inline attachment(s) not referenced from the body: {}. They are still sent, but the \
+             recipient's client decides where to place them — add `![](cid:<id>)` where each belongs.",
+            unused.join(", ")
+        )))
+    }
+}
+
+/// Put bodies and attachments on the builder, choosing the MIME shape that
+/// matches what the message actually contains.
+///
+/// **Without inline images** this is mail-builder's own path: `text_body` +
+/// `html_body` + attachments, which it assembles into
+/// `multipart/mixed[ multipart/alternative[text, html], files… ]`.
+///
+/// **With inline images** that shape is wrong. A `cid:` reference is only
+/// guaranteed to resolve when the image sits in the same `multipart/related`
+/// as the HTML pointing at it (RFC 2387). mail-builder's own `.inline()`
+/// helper appends the part *beside* the alternative instead, which most
+/// clients tolerate but some render as a detached attachment. So the tree is
+/// assembled by hand:
+///
+/// ```text
+/// multipart/mixed              (only when regular attachments exist)
+/// ├── multipart/related
+/// │   ├── multipart/alternative
+/// │   │   ├── text/plain
+/// │   │   └── text/html
+/// │   └── image/…              (Content-ID + inline disposition)
+/// └── report.pdf               (regular attachments)
+/// ```
+///
+/// The inline parts carry `Content-Disposition: inline; filename="…"` in one
+/// header rather than `.inline()` plus `.attachment()`, because both helpers
+/// push their own `Content-Disposition` and a part would end up with two.
+fn apply_bodies_and_attachments<'a>(
+    builder: MessageBuilder<'a>,
+    plain_body: &'a str,
+    html_body: &'a str,
+    prepared: PreparedAttachments,
+) -> MessageBuilder<'a> {
+    if prepared.inline.is_empty() {
+        let mut builder = builder.text_body(plain_body).html_body(html_body);
+        for (content_type, filename, bytes) in prepared.regular {
+            builder = builder.attachment(content_type, filename, bytes);
+        }
+        return builder;
+    }
+
+    let mut related = Vec::with_capacity(prepared.inline.len() + 1);
+    related.push(MimePart::new(
+        "multipart/alternative",
+        vec![
+            MimePart::new("text/plain", plain_body),
+            MimePart::new("text/html", html_body),
+        ],
+    ));
+    for img in prepared.inline {
+        related.push(
+            MimePart::new(img.content_type, img.bytes)
+                .cid(img.cid)
+                .header(
+                    "Content-Disposition",
+                    ContentType::new("inline").attribute("filename", img.filename),
+                ),
+        );
+    }
+    let related = MimePart::new("multipart/related", related);
+
+    if prepared.regular.is_empty() {
+        return builder.body(related);
+    }
+
+    let mut mixed = Vec::with_capacity(prepared.regular.len() + 1);
+    mixed.push(related);
+    for (content_type, filename, bytes) in prepared.regular {
+        mixed.push(MimePart::new(content_type, bytes).attachment(filename));
+    }
+    builder.body(MimePart::new("multipart/mixed", mixed))
 }
 
 /// Reject attachment paths outside the configured whitelist. Returns the
@@ -1113,5 +1483,329 @@ mod tests {
             "application/octet-stream"
         );
         assert_eq!(mime_type_from_extension(""), "application/octet-stream");
+    }
+
+    // ===== inline attachments =====
+
+    fn img(cid: &str) -> InlineImage {
+        InlineImage {
+            cid: cid.to_string(),
+            filename: format!("{cid}.png"),
+            content_type: "image/png",
+            bytes: vec![1, 2, 3],
+        }
+    }
+
+    #[test]
+    fn attachment_spec_accepts_both_spellings() {
+        // Backwards compatibility: every existing caller passes bare strings,
+        // and they must keep deserializing into the same list as the new
+        // object form.
+        let specs: Vec<AttachmentSpec> = serde_json::from_str(
+            r#"["/tmp/a.pdf", {"path": "/tmp/b.png", "inline": true}, {"path": "/tmp/c.png", "cid": "shot"}]"#,
+        )
+        .expect("both spellings parse");
+
+        assert_eq!(specs[0].path(), "/tmp/a.pdf");
+        assert!(!specs[0].is_inline());
+        assert_eq!(specs[0].explicit_cid(), None);
+
+        assert!(specs[1].is_inline());
+        assert_eq!(specs[1].explicit_cid(), None);
+
+        // A cid alone implies inline — no second switch required.
+        assert!(specs[2].is_inline());
+        assert_eq!(specs[2].explicit_cid(), Some("shot"));
+    }
+
+    #[test]
+    fn explicit_inline_false_wins_over_cid_inference() {
+        // Stating `inline: false` next to a cid is contradictory input. The
+        // explicit value decides, rather than the inference silently
+        // overruling what the caller wrote.
+        let specs: Vec<AttachmentSpec> =
+            serde_json::from_str(r#"[{"path": "/tmp/a.png", "inline": false, "cid": "shot"}]"#)
+                .expect("parses");
+        assert!(!specs[0].is_inline());
+    }
+
+    #[test]
+    fn derive_cid_strips_extension_and_unsafe_chars() {
+        assert_eq!(derive_cid("screenshot.png"), "screenshot");
+        assert_eq!(derive_cid("Rollen und Rechte.png"), "Rollen-und-Rechte");
+        assert_eq!(derive_cid("a  b.png"), "a-b");
+        assert_eq!(derive_cid("-weird-.png"), "weird");
+        assert_eq!(derive_cid("übersicht.png"), "bersicht");
+        // Nothing usable left over: must still yield a valid id.
+        assert_eq!(derive_cid("äöü.png"), "image");
+        assert_eq!(derive_cid(".png"), "image");
+        // Every derived id has to satisfy the same rule an explicit one does.
+        for name in ["a b.png", "ä.png", "x!y.png", "no-extension"] {
+            assert!(
+                derive_cid(name).chars().all(is_cid_char),
+                "derived id for {name} must be safe"
+            );
+        }
+    }
+
+    #[test]
+    fn marker_without_attachment_is_rejected() {
+        // No inline attachments at all: the message should tell the caller how
+        // to pass one, not just that something is missing.
+        let err = check_cid_markers("see ![](cid:shot)", &[]).unwrap_err();
+        assert!(err.contains("shot"), "{err}");
+        assert!(err.contains("inline"), "{err}");
+
+        // Some exist, but not this one: list what is available.
+        let err = check_cid_markers("see ![](cid:typo)", &[img("shot")]).unwrap_err();
+        assert!(err.contains("typo"), "{err}");
+        assert!(err.contains("shot"), "{err}");
+    }
+
+    #[test]
+    fn unreferenced_inline_attachment_only_warns() {
+        let notice = check_cid_markers("no marker here", &[img("shot")])
+            .expect("must not be an error")
+            .expect("should warn");
+        assert!(notice.contains("shot"), "{notice}");
+
+        // Matching marker and attachment: silence.
+        assert!(
+            check_cid_markers("![](cid:shot)", &[img("shot")])
+                .unwrap()
+                .is_none()
+        );
+        // Nothing inline and no markers: also silence.
+        assert!(check_cid_markers("plain body", &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn inline_images_produce_a_related_tree_with_content_ids() {
+        let prepared = PreparedAttachments {
+            regular: vec![],
+            inline: vec![img("shot")],
+        };
+        let builder = apply_bodies_and_attachments(
+            MessageBuilder::new().subject("t"),
+            "plain",
+            "<html><body><img src=\"cid:shot\"></body></html>",
+            prepared,
+        );
+        let mime = String::from_utf8(builder.write_to_vec().expect("builds")).expect("utf8");
+
+        assert!(mime.contains("multipart/related"), "{mime}");
+        assert!(mime.contains("multipart/alternative"), "{mime}");
+        // The Content-ID must be angle-bracketed, otherwise `cid:` lookups
+        // fail in strict clients.
+        assert!(mime.contains("Content-ID: <shot>"), "{mime}");
+        assert!(mime.contains("Content-Disposition: inline"), "{mime}");
+        assert!(mime.contains("filename=\"shot.png\""), "{mime}");
+        // Exactly one disposition header on the image part — `.inline()` plus
+        // `.attachment()` would have produced two.
+        assert_eq!(
+            mime.matches("Content-Disposition:").count(),
+            1,
+            "one disposition header expected: {mime}"
+        );
+    }
+
+    #[test]
+    fn inline_and_regular_attachments_nest_correctly() {
+        let prepared = PreparedAttachments {
+            regular: vec![("application/pdf", "report.pdf".to_string(), vec![9, 9])],
+            inline: vec![img("shot")],
+        };
+        let builder = apply_bodies_and_attachments(
+            MessageBuilder::new().subject("t"),
+            "plain",
+            "<html><body>x</body></html>",
+            prepared,
+        );
+        let mime = String::from_utf8(builder.write_to_vec().expect("builds")).expect("utf8");
+
+        assert!(mime.contains("multipart/mixed"), "{mime}");
+        assert!(mime.contains("multipart/related"), "{mime}");
+        assert!(mime.contains("Content-ID: <shot>"), "{mime}");
+        assert!(mime.contains("filename=\"report.pdf\""), "{mime}");
+        // The related subtree has to come before the appended file, otherwise
+        // the image is no longer "related" to the HTML that references it.
+        let related_at = mime.find("multipart/related").expect("related present");
+        let pdf_at = mime.find("report.pdf").expect("pdf present");
+        assert!(related_at < pdf_at, "related must precede the attachment");
+    }
+
+    #[test]
+    fn without_inline_images_the_classic_structure_is_kept() {
+        // Regression guard: the common path must not change shape just because
+        // the inline feature exists.
+        let prepared = PreparedAttachments {
+            regular: vec![("application/pdf", "report.pdf".to_string(), vec![9])],
+            inline: vec![],
+        };
+        let builder = apply_bodies_and_attachments(
+            MessageBuilder::new().subject("t"),
+            "plain",
+            "<html><body>x</body></html>",
+            prepared,
+        );
+        let mime = String::from_utf8(builder.write_to_vec().expect("builds")).expect("utf8");
+
+        assert!(mime.contains("multipart/mixed"), "{mime}");
+        assert!(mime.contains("multipart/alternative"), "{mime}");
+        assert!(!mime.contains("multipart/related"), "{mime}");
+        assert!(!mime.contains("Content-ID"), "{mime}");
+    }
+
+    /// Scratch directory for the filesystem-backed attachment tests. Named per
+    /// test so parallel runs cannot collide.
+    fn scratch_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("imap-mcp-rs-test-{tag}-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch dir");
+        dir
+    }
+
+    #[tokio::test]
+    async fn inline_rejects_types_that_cannot_render_as_an_image() {
+        let dir = scratch_dir("inline-type");
+        let pdf = dir.join("report.pdf");
+        std::fs::write(&pdf, b"%PDF-1.4").expect("write");
+        let svg = dir.join("logo.svg");
+        std::fs::write(&svg, b"<svg/>").expect("write");
+        let allowed = vec![dir.to_string_lossy().into_owned()];
+
+        for (path, expected) in [(&pdf, "application/pdf"), (&svg, "image/svg+xml")] {
+            let specs = vec![AttachmentSpec::Detailed {
+                path: path.to_string_lossy().into_owned(),
+                inline: Some(true),
+                cid: None,
+            }];
+            let err = read_attachments(Some(&specs), &allowed)
+                .await
+                .expect_err("must be rejected");
+            assert!(err.contains(expected), "{err}");
+        }
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn inline_png_is_split_out_with_a_derived_cid() {
+        let dir = scratch_dir("inline-png");
+        let png = dir.join("Rollen und Rechte.png");
+        std::fs::write(&png, b"\x89PNG").expect("write");
+        let pdf = dir.join("report.pdf");
+        std::fs::write(&pdf, b"%PDF").expect("write");
+        let allowed = vec![dir.to_string_lossy().into_owned()];
+
+        let specs = vec![
+            AttachmentSpec::Path(pdf.to_string_lossy().into_owned()),
+            AttachmentSpec::Detailed {
+                path: png.to_string_lossy().into_owned(),
+                inline: Some(true),
+                cid: None,
+            },
+        ];
+        let prepared = read_attachments(Some(&specs), &allowed)
+            .await
+            .expect("accepted");
+
+        assert_eq!(prepared.regular.len(), 1, "the pdf stays a regular file");
+        assert_eq!(prepared.regular[0].1, "report.pdf");
+        assert_eq!(prepared.inline.len(), 1);
+        assert_eq!(prepared.inline[0].cid, "Rollen-und-Rechte");
+        assert_eq!(prepared.inline[0].content_type, "image/png");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn duplicate_cids_are_rejected() {
+        // Two files with the same stem in different folders derive the same
+        // id; a marker could then no longer say which one it means.
+        let dir = scratch_dir("dup-cid");
+        let sub = dir.join("sub");
+        std::fs::create_dir_all(&sub).expect("subdir");
+        std::fs::write(dir.join("shot.png"), b"a").expect("write");
+        std::fs::write(sub.join("shot.png"), b"b").expect("write");
+        let allowed = vec![dir.to_string_lossy().into_owned()];
+
+        let specs = vec![
+            AttachmentSpec::Detailed {
+                path: dir.join("shot.png").to_string_lossy().into_owned(),
+                inline: Some(true),
+                cid: None,
+            },
+            AttachmentSpec::Detailed {
+                path: sub.join("shot.png").to_string_lossy().into_owned(),
+                inline: Some(true),
+                cid: None,
+            },
+        ];
+        let err = read_attachments(Some(&specs), &allowed)
+            .await
+            .expect_err("duplicate must be rejected");
+        assert!(err.contains("Duplicate cid"), "{err}");
+        assert!(err.contains("shot"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn explicit_cid_with_unsafe_characters_is_rejected() {
+        let dir = scratch_dir("bad-cid");
+        let png = dir.join("shot.png");
+        std::fs::write(&png, b"x").expect("write");
+        let allowed = vec![dir.to_string_lossy().into_owned()];
+
+        let specs = vec![AttachmentSpec::Detailed {
+            path: png.to_string_lossy().into_owned(),
+            inline: Some(true),
+            cid: Some("a b\"c".to_string()),
+        }];
+        let err = read_attachments(Some(&specs), &allowed)
+            .await
+            .expect_err("must be rejected");
+        assert!(err.contains("Invalid cid"), "{err}");
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn inline_image_bytes_are_base64_and_umlaut_filenames_encoded() {
+        // Guards the two things a hand-built MIME tree gets wrong most easily:
+        // binary data written verbatim (corrupting the image), and a non-ASCII
+        // filename dropped raw into a header (an 8-bit header is invalid and
+        // some servers reject the APPEND).
+        let png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xFF, 0xFE];
+        let prepared = PreparedAttachments {
+            regular: vec![],
+            inline: vec![InlineImage {
+                cid: "rollen".to_string(),
+                filename: "Rollenübersicht.png".to_string(),
+                content_type: "image/png",
+                bytes: png,
+            }],
+        };
+        let builder = apply_bodies_and_attachments(
+            MessageBuilder::new().subject("t"),
+            "plain",
+            "<html><body><img src=\"cid:rollen\"></body></html>",
+            prepared,
+        );
+        let mime = String::from_utf8_lossy(&builder.write_to_vec().expect("builds")).to_string();
+
+        assert!(
+            mime.contains("Content-Transfer-Encoding: base64"),
+            "image must be base64, not raw: {mime}"
+        );
+        // The raw PNG signature must not appear literally anywhere.
+        assert!(
+            !mime.contains("\u{89}PNG"),
+            "binary leaked into the message unencoded: {mime}"
+        );
+        // Header stays 7-bit clean: the umlaut is encoded, not passed through.
+        assert!(!mime.contains("Rollenübersicht.png"), "{mime}");
+        assert!(mime.contains("Rollen=C3=BCbersicht.png"), "{mime}");
     }
 }

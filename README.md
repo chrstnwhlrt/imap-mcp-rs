@@ -17,6 +17,7 @@ Built in Rust. Packaged with Nix.
 - **Thread reconstruction** — `get_thread` follows References/In-Reply-To headers across primary and Sent folders; `list_emails(group_by_thread: true)` collapses inboxes into one row per conversation
 - **Destructive-op dry-run** — `move_email` / `delete_email` accept `dry_run: true` to preview without touching IMAP, so the LLM can confirm with the user before committing
 - **Safe draft revision** — `replaces_uid` on any `draft_*` writes the new version before removing the old one; IMAP cannot update in place, and doing it by hand loses the text if the second step fails. Each save returns the new `uid`, so revising again needs no lookup
+- **Inline images** — mark an attachment `inline` and place it in the body with `![alt](cid:<id>)`; the image renders at that spot instead of dangling at the end, in an RFC 2387 `multipart/related` tree, with a readable placeholder in the plaintext part
 - **Prompt-injection hardening** — no send path at all, attachment whitelist, per-account write gates, an untrusted-content marker inline in every body-carrying response, and a flag for messages whose plain-text part hides content from the HTML the user sees
 - **Nix flake** for reproducible builds; CI runs fmt + clippy pedantic + nursery + tests on Linux + macOS + nix flake check
 
@@ -103,7 +104,7 @@ All organizing tools support **batch operations** — pass an array of UIDs to o
 
 | Tool | Description |
 |------|-------------|
-| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, Outlook-style quoting). Supports `reply_all` (excludes your own address automatically), `cc`, `attachments`, and `replaces_uid` (revise an existing draft). |
+| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, Outlook-style quoting). Supports `reply_all` (excludes your own address automatically), `cc`, `attachments` (incl. inline images via `{path, inline, cid}` + `![alt](cid:<id>)` in the body), and `replaces_uid` (revise an existing draft). |
 | `draft_forward` | Forward an email with the original content included. **Requires `to`** — forwarding never auto-selects recipients the way `draft_reply` does. Optionally add message body, `cc`, `attachments`, and `replaces_uid`. |
 | `draft_email` | Compose a new email from scratch with `to`, `subject`, `body`, `cc`, `bcc`, `attachments`, and `replaces_uid`. |
 | `list_drafts` | List pending drafts in the account's Drafts folder (newest first). Supports `limit` / `offset` pagination and returns `total` (all drafts) alongside `returned`. `compact: true` trims each row as in `list_emails`. Useful for tracking drafts awaiting manual send. |
@@ -120,6 +121,26 @@ Drafts are rendered as **Outlook Web–style HTML** with proper structure: `<htm
 - **`locale = "en"` / `"de"`** — Controls reply prefix (`Re:` / `AW:`), forward prefix (`Fwd:` / `WG:`), quote labels (`From/Sent/To/Subject` / `Von/Gesendet/An/Betreff`), date format, and body font (Aptos for EN, Tahoma for DE)
 
 **Attachments** — all draft tools accept an optional `attachments` parameter (array of local file paths). Attachment paths must be within `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs` on systemd Linux, otherwise `$XDG_CACHE_HOME/imap-mcp-rs`, with a per-user `/tmp/imap-mcp-rs-$USER` fallback — `download_attachment` saves here). Paths outside the whitelist are rejected, and symlink/`..` escapes are blocked via `canonicalize`. Per-file cap: 50 MiB, aggregate cap per draft: 100 MiB. See [Security](#security) for the threat model.
+
+**Inline images** — an attachment entry can also be an object, which places the file *inside* the body instead of appending it:
+
+```json
+{
+  "body": "Here is the problem:\n\n![Role assignment](cid:roles)\n\nThe fourth entry has no user type.",
+  "attachments": [
+    "/run/user/1000/imap-mcp-rs/<uuid>/report.pdf",
+    {"path": "/run/user/1000/imap-mcp-rs/<uuid>/roles.png", "inline": true, "cid": "roles"}
+  ]
+}
+```
+
+Reference the image from the body as `![alt](cid:<id>)` and it renders exactly there. `cid` is optional — it defaults to the file name without extension (`roles.png` → `roles`) — and setting it implies `inline: true`. The plaintext part gets a readable `[alt]` placeholder in the same position, so text-only readers still know an image belongs there.
+
+Both spellings mix freely in one array, and a plain string keeps its current meaning, so existing callers are unaffected.
+
+The MIME tree follows RFC 2387: inline parts sit in a `multipart/related` next to the HTML that references them, with regular attachments outside it in a `multipart/mixed`. Mismatches are caught before the draft is saved — a marker with no matching attachment is an error listing the available ids, while an inline attachment that no marker references is saved but reported back as `inline_warning`, since the recipient's client would place it arbitrarily.
+
+Only raster images can be inlined (`image/*` minus SVG). A marker always renders an `<img>` tag, so a PDF marked `inline` would arrive as a broken picture; SVG is refused because it can carry script and inline files often originate from a received message via `download_attachment`. Type detection is extension-based, so the file needs a correct suffix.
 
 **Revising a draft** — IMAP has no update-in-place: replacing a draft means writing a new message and removing the old one. Pass `replaces_uid` to `draft_reply` / `draft_forward` / `draft_email` and the server does exactly that, in the safe order — the new version is appended first, the old one deleted only after it succeeded, so a failure can never leave you with neither. The response then carries `replaced_uid`, or `replace_warning` if the new draft was saved but the old one could not be removed. Doing it by hand (`delete_draft` then `draft_*`) risks losing the text if the second call fails.
 
@@ -665,7 +686,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --lib               # Run the 217 unit tests
+cargo test --lib               # Run the 240 unit tests
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
