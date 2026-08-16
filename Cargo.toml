@@ -1,6 +1,6 @@
 [package]
 name = "imap-mcp-rs"
-version = "1.6.1"
+version = "2.0.0"
 edition = "2024"
 # Determined empirically (1.91 compiles, 1.90 fails on then-unstable APIs:
 # Duration::from_mins, str::floor_char_boundary; File::lock needs 1.89).
