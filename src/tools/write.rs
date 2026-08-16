@@ -12,7 +12,9 @@ use super::{ImapMcpServer, error_json};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MoveEmailRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Source folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -30,7 +32,9 @@ pub struct MoveEmailRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkReadRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -38,11 +42,17 @@ pub struct MarkReadRequest {
         description = "Email UIDs to mark as read (from list_emails or search_emails results)"
     )]
     pub uids: Vec<u32>,
+    #[schemars(
+        description = "If true, validate permissions + inputs but don't touch IMAP; returns a preview payload. Default: false."
+    )]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkUnreadRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -50,31 +60,49 @@ pub struct MarkUnreadRequest {
         description = "Email UIDs to mark as unread (from list_emails or search_emails results)"
     )]
     pub uids: Vec<u32>,
+    #[schemars(
+        description = "If true, validate permissions + inputs but don't touch IMAP; returns a preview payload. Default: false."
+    )]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlagEmailRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UIDs to flag (from list_emails or search_emails results)")]
     pub uids: Vec<u32>,
+    #[schemars(
+        description = "If true, validate permissions + inputs but don't touch IMAP; returns a preview payload. Default: false."
+    )]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UnflagEmailRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UIDs to unflag (from list_emails or search_emails results)")]
     pub uids: Vec<u32>,
+    #[schemars(
+        description = "If true, validate permissions + inputs but don't touch IMAP; returns a preview payload. Default: false."
+    )]
+    pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteEmailRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -93,12 +121,39 @@ pub struct DeleteEmailRequest {
 /// Build the standard write-response. `account` is always included so the LLM
 /// can disambiguate when calling tools on multiple accounts in parallel.
 /// IMAP STORE/COPY/EXPUNGE are atomic at the server — operations either
-/// fully succeed or return an error. There is no partial-failure case, so
-/// we don't surface a `failed` field.
+/// fully succeed or return an error, so there is no `failed` field. What
+/// `succeeded` CAN legitimately be is a subset of the input: UIDs the server
+/// did not acknowledge (stale after UIDVALIDITY rotation, externally
+/// expunged, typos) are omitted rather than echoed — see
+/// `imap_client::acknowledged_uids`.
 fn write_ok(account: &str, succeeded: &[u32]) -> String {
     serde_json::to_string(&serde_json::json!({
         "account": account,
         "succeeded": succeeded,
+    }))
+    .unwrap()
+}
+
+/// Result shape for the existence-verified destructive tools (move/delete):
+/// `failed` spells out `input − succeeded`, because a caller checking only
+/// "no error came back" reads a partial success as a full one — an empty
+/// array is a statement, a gap in `succeeded` is not. The flag tools keep
+/// the two-field shape: for them the difference means "already in the
+/// target state OR unknown", and calling that `failed` would be the next
+/// misdirection.
+fn write_result(account: &str, succeeded: &[u32], input: &[u32]) -> String {
+    let done: std::collections::HashSet<u32> = succeeded.iter().copied().collect();
+    let mut failed: Vec<u32> = input
+        .iter()
+        .copied()
+        .filter(|u| !done.contains(u))
+        .collect();
+    failed.sort_unstable();
+    failed.dedup();
+    serde_json::to_string(&serde_json::json!({
+        "account": account,
+        "succeeded": succeeded,
+        "failed": failed,
     }))
     .unwrap()
 }
@@ -117,6 +172,10 @@ fn uid_cap_error() -> String {
     ))
 }
 
+// Shared head of the four flag tools (mark read/unread, flag/unflag):
+// cap, account resolution, read_only, and the `allow_flag_change` gate —
+// the unread state is often a human's work queue, so flag writes get the
+// same per-account switch move and delete always had.
 macro_rules! resolve_write {
     ($server:expr, $req:expr) => {{
         if $req.uids.len() > MAX_UIDS_PER_CALL {
@@ -128,6 +187,11 @@ macro_rules! resolve_write {
         };
         if config.read_only {
             return error_json("Account is configured as read-only");
+        }
+        if !config.allow_flag_change {
+            return error_json(
+                "Flag changes are disabled for this account (allow_flag_change = false)",
+            );
         }
         (config.name.clone(), client_arc)
     }};
@@ -167,13 +231,25 @@ pub async fn move_email(server: &ImapMcpServer, req: MoveEmailRequest) -> String
         .move_emails(&req.folder, &req.uids, &req.target_folder)
         .await
     {
-        Ok(succeeded) => write_ok(&account_name, &succeeded),
+        Ok(succeeded) => write_result(&account_name, &succeeded, &req.uids),
         Err(e) => error_json(&client.check_error(e).to_string()),
     }
 }
 
 pub async fn mark_as_read(server: &ImapMcpServer, req: MarkReadRequest) -> String {
     let (account_name, client_arc) = resolve_write!(server, req);
+    if req.dry_run.unwrap_or(false) {
+        // No IMAP roundtrip; the gates above still fired, so the preview
+        // also confirms the action would be allowed.
+        return serde_json::to_string(&serde_json::json!({
+            "account": account_name,
+            "dry_run": true,
+            "folder": req.folder,
+            "uids": req.uids,
+            "would_mark_read": req.uids.len(),
+        }))
+        .unwrap_or_else(|e| error_json(&e.to_string()));
+    }
     let mut client = client_arc.lock().await;
     match client
         .mark_flags(&req.folder, &req.uids, "\\Seen", true)
@@ -186,6 +262,18 @@ pub async fn mark_as_read(server: &ImapMcpServer, req: MarkReadRequest) -> Strin
 
 pub async fn mark_as_unread(server: &ImapMcpServer, req: MarkUnreadRequest) -> String {
     let (account_name, client_arc) = resolve_write!(server, req);
+    if req.dry_run.unwrap_or(false) {
+        // No IMAP roundtrip; the gates above still fired, so the preview
+        // also confirms the action would be allowed.
+        return serde_json::to_string(&serde_json::json!({
+            "account": account_name,
+            "dry_run": true,
+            "folder": req.folder,
+            "uids": req.uids,
+            "would_mark_unread": req.uids.len(),
+        }))
+        .unwrap_or_else(|e| error_json(&e.to_string()));
+    }
     let mut client = client_arc.lock().await;
     match client
         .mark_flags(&req.folder, &req.uids, "\\Seen", false)
@@ -198,6 +286,18 @@ pub async fn mark_as_unread(server: &ImapMcpServer, req: MarkUnreadRequest) -> S
 
 pub async fn flag_email(server: &ImapMcpServer, req: FlagEmailRequest) -> String {
     let (account_name, client_arc) = resolve_write!(server, req);
+    if req.dry_run.unwrap_or(false) {
+        // No IMAP roundtrip; the gates above still fired, so the preview
+        // also confirms the action would be allowed.
+        return serde_json::to_string(&serde_json::json!({
+            "account": account_name,
+            "dry_run": true,
+            "folder": req.folder,
+            "uids": req.uids,
+            "would_flag": req.uids.len(),
+        }))
+        .unwrap_or_else(|e| error_json(&e.to_string()));
+    }
     let mut client = client_arc.lock().await;
     match client
         .mark_flags(&req.folder, &req.uids, "\\Flagged", true)
@@ -210,6 +310,18 @@ pub async fn flag_email(server: &ImapMcpServer, req: FlagEmailRequest) -> String
 
 pub async fn unflag_email(server: &ImapMcpServer, req: UnflagEmailRequest) -> String {
     let (account_name, client_arc) = resolve_write!(server, req);
+    if req.dry_run.unwrap_or(false) {
+        // No IMAP roundtrip; the gates above still fired, so the preview
+        // also confirms the action would be allowed.
+        return serde_json::to_string(&serde_json::json!({
+            "account": account_name,
+            "dry_run": true,
+            "folder": req.folder,
+            "uids": req.uids,
+            "would_unflag": req.uids.len(),
+        }))
+        .unwrap_or_else(|e| error_json(&e.to_string()));
+    }
     let mut client = client_arc.lock().await;
     match client
         .mark_flags(&req.folder, &req.uids, "\\Flagged", false)
@@ -259,7 +371,7 @@ pub async fn delete_email(server: &ImapMcpServer, req: DeleteEmailRequest) -> St
         .delete_emails(&req.folder, &req.uids, permanent)
         .await
     {
-        Ok(succeeded) => write_ok(&account_name, &succeeded),
+        Ok(succeeded) => write_result(&account_name, &succeeded, &req.uids),
         Err(e) => error_json(&client.check_error(e).to_string()),
     }
 }
@@ -332,6 +444,7 @@ mod tests {
             account: None,
             folder: "INBOX".into(),
             uids,
+            dry_run: None,
         }
     }
     fn mark_unread_req(uids: Vec<u32>) -> MarkUnreadRequest {
@@ -339,6 +452,7 @@ mod tests {
             account: None,
             folder: "INBOX".into(),
             uids,
+            dry_run: None,
         }
     }
     fn flag_req(uids: Vec<u32>) -> FlagEmailRequest {
@@ -346,6 +460,7 @@ mod tests {
             account: None,
             folder: "INBOX".into(),
             uids,
+            dry_run: None,
         }
     }
     fn unflag_req(uids: Vec<u32>) -> UnflagEmailRequest {
@@ -353,6 +468,7 @@ mod tests {
             account: None,
             folder: "INBOX".into(),
             uids,
+            dry_run: None,
         }
     }
 
@@ -457,5 +573,98 @@ mod tests {
         let mut req = delete_req(vec![1], false);
         req.dry_run = Some(true);
         assert!(delete_email(&s, req).await.contains("allow_delete"));
+
+        let s = server_with("allow_flag_change = false");
+        let mut req = mark_read_req(vec![1]);
+        req.dry_run = Some(true);
+        assert!(mark_as_read(&s, req).await.contains("allow_flag_change"));
+    }
+
+    /// The unread state is often a human's work queue: a bulk `mark_as_read`
+    /// erases it with no trash and no record of which messages it hit. The
+    /// flag tools therefore get the same per-account gate move and delete
+    /// always had — and it must cover all four, in both directions.
+    #[tokio::test]
+    async fn allow_flag_change_gates_all_four_flag_tools() {
+        let s = server_with("allow_flag_change = false");
+        for out in [
+            mark_as_read(&s, mark_read_req(vec![1])).await,
+            mark_as_unread(&s, mark_unread_req(vec![1])).await,
+            flag_email(&s, flag_req(vec![1])).await,
+            unflag_email(&s, unflag_req(vec![1])).await,
+        ] {
+            assert!(out.contains("allow_flag_change"), "{out}");
+        }
+        // …and it must not block the unrelated tools.
+        let out = move_email(&s, move_req(vec![1])).await;
+        assert!(!out.contains("allow_flag_change"), "{out}");
+
+        // Enabled (the default): the refusal must be gone.
+        let s = server_with("");
+        let out = mark_as_read(&s, mark_read_req(vec![1])).await;
+        assert!(!out.contains("allow_flag_change"), "{out}");
+    }
+
+    /// Every flag tool previews without touching IMAP — against a closed
+    /// port a real attempt could not succeed, so a well-formed preview
+    /// proves nothing reached the network.
+    #[tokio::test]
+    async fn flag_tools_preview_with_dry_run() {
+        let s = server_with("");
+        for (out, field) in [
+            (
+                {
+                    let mut r = mark_read_req(vec![7, 8]);
+                    r.dry_run = Some(true);
+                    mark_as_read(&s, r).await
+                },
+                "would_mark_read",
+            ),
+            (
+                {
+                    let mut r = mark_unread_req(vec![7]);
+                    r.dry_run = Some(true);
+                    mark_as_unread(&s, r).await
+                },
+                "would_mark_unread",
+            ),
+            (
+                {
+                    let mut r = flag_req(vec![7]);
+                    r.dry_run = Some(true);
+                    flag_email(&s, r).await
+                },
+                "would_flag",
+            ),
+            (
+                {
+                    let mut r = unflag_req(vec![7]);
+                    r.dry_run = Some(true);
+                    unflag_email(&s, r).await
+                },
+                "would_unflag",
+            ),
+        ] {
+            let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
+            assert_eq!(v["dry_run"], true, "{out}");
+            assert!(v.get(field).is_some(), "{field} missing: {out}");
+            assert!(v.get("error").is_none(), "preview must not error: {out}");
+        }
+    }
+
+    /// `failed` spells out the difference so a partial success can never be
+    /// read as a full one by a caller that only checks for an error.
+    #[test]
+    fn write_result_reports_the_failed_difference() {
+        let v: serde_json::Value =
+            serde_json::from_str(&write_result("A", &[1, 3], &[1, 2, 3, 4])).unwrap();
+        assert_eq!(v["succeeded"], serde_json::json!([1, 3]));
+        assert_eq!(v["failed"], serde_json::json!([2, 4]));
+
+        // Full success: failed is PRESENT and empty — an empty array is a
+        // statement, an absent field is not.
+        let v: serde_json::Value =
+            serde_json::from_str(&write_result("A", &[1, 2], &[1, 2])).unwrap();
+        assert_eq!(v["failed"], serde_json::json!([]));
     }
 }

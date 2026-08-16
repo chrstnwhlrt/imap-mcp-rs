@@ -17,10 +17,12 @@ use serde::Deserialize;
 pub struct ServerConfig {
     pub accounts: Vec<AccountConfig>,
     /// Filesystem directories from which attachment files may be read.
-    /// Defaults to `["/tmp/imap-mcp-rs"]` (where `download_attachment` saves
-    /// files). Paths outside these directories are rejected — this prevents
-    /// a prompt-injected LLM from attaching arbitrary local files like SSH
-    /// keys or /etc/passwd. Symlinks are resolved via `canonicalize`.
+    /// Defaults to the directory `download_attachment` saves into (see
+    /// [`default_attachment_dir`]: `$XDG_RUNTIME_DIR`, then the user cache
+    /// dir, then `/tmp/imap-mcp-rs-$USER`). Paths outside these directories
+    /// are rejected — this prevents a prompt-injected LLM from attaching
+    /// arbitrary local files like SSH keys or /etc/passwd. Symlinks are
+    /// resolved via `canonicalize`.
     #[serde(default = "default_attachment_dirs")]
     pub allowed_attachment_dirs: Vec<String>,
 }
@@ -80,6 +82,14 @@ pub struct AccountConfig {
     pub allow_delete: bool,
     #[serde(default = "default_true")]
     pub allow_move: bool,
+    /// `false` blocks `mark_as_read` / `mark_as_unread` / `flag_email` /
+    /// `unflag_email`. The unread state is often a human's work queue: an
+    /// accidental bulk `mark_as_read` erases it with no trash to recover from
+    /// and no record of which messages it hit — for such setups this is the
+    /// most destructive operation that stays enabled, so it gets the same
+    /// per-account gate the others have.
+    #[serde(default = "default_true")]
+    pub allow_flag_change: bool,
     #[serde(default)]
     pub accept_invalid_certs: bool,
     /// Opt-in: allow plain IMAP `EXPUNGE` when the server doesn't advertise
@@ -107,8 +117,12 @@ impl AccountConfig {
     /// Domain for generated `Message-ID` headers: the configured
     /// `message_id_domain`, otherwise the domain of the sender address,
     /// otherwise the RFC 2606 reserved `.invalid` TLD (never a real host).
+    /// An empty config value counts as unset — honouring it would mint
+    /// malformed ids like `<uuid@>` in Message-ID and Content-ID headers.
     pub fn message_id_domain(&self) -> &str {
-        if let Some(domain) = self.message_id_domain.as_deref() {
+        if let Some(domain) = self.message_id_domain.as_deref()
+            && !domain.is_empty()
+        {
             return domain;
         }
         match self.sender_address().rsplit_once('@') {
@@ -445,6 +459,14 @@ mod tests {
     fn message_id_domain_explicit_config_wins() {
         let account = account_toml("message_id_domain = \"mail.example.net\"\n");
         assert_eq!(account.message_id_domain(), "mail.example.net");
+    }
+
+    #[test]
+    fn message_id_domain_treats_empty_config_value_as_unset() {
+        // Honouring `message_id_domain = ""` would mint malformed ids like
+        // `<uuid@>` in every Message-ID and Content-ID header.
+        let account = account_toml("message_id_domain = \"\"\n");
+        assert_eq!(account.message_id_domain(), "example.com");
     }
 
     #[test]

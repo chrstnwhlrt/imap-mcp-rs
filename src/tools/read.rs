@@ -12,7 +12,8 @@ use serde::Deserialize;
 
 use crate::email::EmailSummary;
 use crate::imap_client::{
-    build_or_criteria, host_supports_unicode_search, imap_astring, iso_to_imap_date,
+    PostFetchFilter, build_or_criteria, host_supports_unicode_search, imap_astring,
+    iso_to_imap_date,
 };
 
 use super::{ImapMcpServer, error_json};
@@ -56,7 +57,9 @@ fn add_untrusted_marker(payload: &mut serde_json::Value, diverging: &[u32]) {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListFoldersRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(
         description = "Only folders whose name starts with this prefix, case-insensitive (e.g. \"Clients/\" for one customer tree). Mailboxes routinely carry a hundred folders while a task concerns a handful; `total` still reports the unfiltered count."
@@ -70,7 +73,9 @@ pub struct ListFoldersRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListEmailsRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -85,14 +90,16 @@ pub struct ListEmailsRequest {
     )]
     pub group_by_thread: Option<bool>,
     #[schemars(
-        description = "Return only uid, folder, date, from, subject, flags and has_attachments per row, dropping the snippet, Message-ID, References chain and recipient preview (default: false). Cuts the response by roughly 80% — use it when scanning a large window (e.g. everything since a date) where full rows would exceed the response budget and force needless paging. `get_email` still has the full data."
+        description = "Return only uid, folder, date, from, subject, flags and has_attachments per row (plus thread_message_count when grouping), dropping the snippet, Message-ID, References chain and recipient preview (default: false). Cuts the response by roughly 80% — use it when scanning a large window (e.g. everything since a date) where full rows would exceed the response budget and force needless paging. `get_email` still has the full data."
     )]
     pub compact: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetEmailRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -106,7 +113,9 @@ pub struct GetEmailRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetThreadRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -134,7 +143,9 @@ pub struct GetThreadRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct SearchEmailsRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(
         description = "Folder name to search (e.g. \"INBOX\"). Omit to search all folders; Gmail duplicates across labels are deduped by Message-ID."
@@ -172,12 +183,24 @@ pub struct SearchEmailsRequest {
         description = "Filter by subject matching ALL of these terms (AND-combined, substring, case-insensitive). E.g. [\"invoice\", \"Q4\"]."
     )]
     pub subject_all: Option<Vec<String>>,
-    #[schemars(description = "Emails on or after this date (format: YYYY-MM-DD)")]
+    #[schemars(
+        description = "Emails on or after this bound. YYYY-MM-DD (day-granular), or with a time of day: YYYY-MM-DDTHH:MM[:SS], optionally suffixed Z or ±HH:MM — a zoneless time is the machine's local time. Sub-day precision cuts on INTERNALDATE (arrival time, not the sender's Date header) and is already reflected in `matched`; result rows then carry the arrival time as `internal_date`, and their `date` (the sender's header) may legitimately sit outside the bound — that is not a filter bug."
+    )]
     pub since: Option<String>,
-    #[schemars(description = "Emails strictly before this date (format: YYYY-MM-DD)")]
+    #[schemars(
+        description = "Emails strictly before this bound; same formats and semantics as `since`."
+    )]
     pub before: Option<String>,
     #[schemars(description = "Filter by read state: true = read, false = unread")]
     pub is_read: Option<bool>,
+    #[schemars(
+        description = "Alias for is_read with list_emails' spelling: true = only unread (same as is_read: false). Pass only one of the two."
+    )]
+    pub unread_only: Option<bool>,
+    #[schemars(
+        description = "Collapse results into conversation threads by Message-ID / References (default: false), exactly as in list_emails: one row per thread (newest message wins), `thread_message_count` counts members within this result window, `threads_truncated_from` reports a cut. Fetches ~3× the limit per folder internally. Combine with since/before + is_read for \"what is new and unanswered, grouped\" in one call."
+    )]
+    pub group_by_thread: Option<bool>,
     #[schemars(description = "Filter by flag state: true = flagged/starred, false = unflagged")]
     pub is_flagged: Option<bool>,
     #[schemars(
@@ -203,28 +226,36 @@ pub struct SearchEmailsRequest {
     )]
     pub offset: Option<u32>,
     #[schemars(
-        description = "Return only uid, folder, date, from, subject, flags and has_attachments per row, dropping the snippet, Message-ID, References chain and recipient preview (default: false). Cuts the response by roughly 80% — use it when scanning a large window (e.g. everything since a date) where full rows would exceed the response budget and force needless paging. `get_email` still has the full data."
+        description = "Return only uid, folder, date, from, subject, flags and has_attachments per row (plus thread_message_count when grouping, internal_date under a sub-day since/before), dropping the snippet, Message-ID, References chain and recipient preview (default: false). Cuts the response by roughly 80% — use it when scanning a large window (e.g. everything since a date) where full rows would exceed the response budget and force needless paging. `get_email` still has the full data."
     )]
     pub compact: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DownloadAttachmentRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UID (from list_emails, search_emails, or get_email results)")]
     pub uid: u32,
     #[schemars(
-        description = "Attachment filename as reported by get_email (`attachments[].filename`)"
+        description = "Attachment filename as reported by get_email (`attachments[].filename`). Ambiguous when several attachments share a name (nameless parts all render as \"attachment\") — the error then lists the indices; prefer `index` in that case."
     )]
-    pub filename: String,
+    pub filename: Option<String>,
+    #[schemars(
+        description = "Attachment position as reported by get_email (`attachments[].index`, 0-based). The unambiguous handle; wins over `filename` when both are given."
+    )]
+    pub index: Option<usize>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct ListDraftsRequest {
-    #[schemars(description = "Account name (from list_accounts); default: first configured.")]
+    #[schemars(
+        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+    )]
     pub account: Option<String>,
     #[schemars(description = "Maximum number of results (default: 20, hard cap: 500).")]
     pub limit: Option<u32>,
@@ -325,6 +356,7 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Stri
     let mut client = client_arc.lock().await;
     // Clamp to a hard ceiling so a prompt-injected limit can't ask for 100k
     // emails and OOM the host. Users needing more should paginate via offset.
+    let limit_capped = req.limit.is_some_and(|l| l > 500);
     let limit = req.limit.unwrap_or(20).clamp(1, 500);
     let offset = req.offset.unwrap_or(0);
     let unread_only = req.unread_only.unwrap_or(false);
@@ -347,11 +379,17 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Stri
             // `matched` was already fixed. Without saying so, a caller sees a
             // thread count next to a message count and cannot tell that rows
             // were dropped — record how many threads existed before the cap.
+            let rows_from_server = emails.len();
             let (emails, threads_before_cap) = if group_by_thread {
                 cap_threads(group_summaries_by_thread(emails), limit)
             } else {
                 (emails, None)
             };
+            // Spelled out so nobody derives the paging condition by hand —
+            // the three listing tools used to each require different
+            // arithmetic for "is there more".
+            let has_more = matched as usize > offset as usize + rows_from_server
+                || threads_before_cap.is_some();
             let rows = summary_rows(&emails, req.compact.unwrap_or(false));
             let mut payload = serde_json::json!({
                 "account": account_name,
@@ -360,8 +398,13 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Stri
                 "matched": matched,
                 "offset": offset,
                 "limit": limit,
+                "returned": emails.len(),
+                "has_more": has_more,
                 "emails": rows,
             });
+            if limit_capped {
+                payload["limit_capped"] = serde_json::json!(true);
+            }
             if let Some(count) = threads_before_cap {
                 payload["threads_truncated_from"] = serde_json::json!(count);
             }
@@ -463,10 +506,13 @@ fn group_summaries_by_thread(mut summaries: Vec<EmailSummary>) -> Vec<EmailSumma
         groups.entry(root).or_default().push(idx);
     }
 
-    // Pick the newest (by ISO date — lexicographic order is correct for
-    // the `YYYY-MM-DDTHH:MM:SS+TZ` format `format_datetime` produces) per
-    // group, annotate with count, then restore newest-first ordering by
-    // original index (the caller already sorted that way pre-group).
+    // Pick the newest per group by ISO date. Lexicographic order is the
+    // true order because `format_datetime` normalizes every date to UTC —
+    // with sender offsets passed through (the previous behaviour) a
+    // `-07:00` morning ranked below an earlier `Z` afternoon and the wrong
+    // representative won. Annotate with the count, then restore
+    // newest-first ordering by original index (the caller already sorted
+    // that way pre-group).
     let mut representatives: Vec<(usize, EmailSummary)> = Vec::with_capacity(groups.len());
     for (_root, mut members) in groups {
         if members.is_empty() {
@@ -595,17 +641,29 @@ pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> String
 /// All matching is case-insensitive. AND-combined within a category; OR-combined
 /// within a single `*_any` group. Empty filter matches every email.
 ///
+/// Full-text (`text*`) criteria do NOT live here: a summary only carries a
+/// 200-character snippet, and matching against that silently dropped every
+/// mail whose term appeared later in the body. They travel in `body` and are
+/// applied inside the IMAP client against the complete `body_text` before
+/// summarization — see [`BodyTextFilter`].
+///
 /// **Invariant: all stored needles are already lowercased.** `build_search_criteria`
 /// owns the `.to_lowercase()` call so `matches()` can hot-loop over N emails
 /// without re-lowercasing the same needles per email.
 #[derive(Default, Debug)]
 struct ClientFilter {
     subject: Vec<String>,
-    text: Vec<String>,
     from: Vec<String>,
+    /// Known gap, accepted: summaries carry only the first
+    /// [`crate::email::SUMMARY_TO_PREVIEW`] recipients, so a non-ASCII `to`
+    /// fallback matches those alone. Non-ASCII in the *address* is rare
+    /// enough (IDN mailboxes) that widening the plumbing is not worth it —
+    /// unlike `text`, which hit every long body.
     to: Vec<String>,
-    text_any: Vec<Vec<String>>,
     from_any: Vec<Vec<String>>,
+    /// Everything the IMAP client applies per fetched message: full-text
+    /// criteria and the sub-day part of `since`/`before`.
+    post: PostFetchFilter,
     /// When set, post-filter by attachment presence. IMAP SEARCH has no
     /// native "has attachment" operator, so this is always client-side.
     has_attachments: Option<bool>,
@@ -614,14 +672,15 @@ struct ClientFilter {
 impl ClientFilter {
     const fn is_empty(&self) -> bool {
         self.subject.is_empty()
-            && self.text.is_empty()
             && self.from.is_empty()
             && self.to.is_empty()
-            && self.text_any.is_empty()
             && self.from_any.is_empty()
+            && self.post.is_empty()
             && self.has_attachments.is_none()
     }
 
+    /// The summary-level criteria (everything except `post`, which the
+    /// client layer already applied).
     fn matches(&self, email: &EmailSummary) -> bool {
         // `Vec` fields already AND by construction — every pushed needle
         // must match, so `_all`-style request fields just push multiple
@@ -629,12 +688,6 @@ impl ClientFilter {
         let subject_l = email.subject.to_lowercase();
         for s in &self.subject {
             if !subject_l.contains(s.as_str()) {
-                return false;
-            }
-        }
-        let snippet_l = email.snippet.to_lowercase();
-        for s in &self.text {
-            if !snippet_l.contains(s.as_str()) {
                 return false;
             }
         }
@@ -659,11 +712,6 @@ impl ClientFilter {
                 return false;
             }
         }
-        for group in &self.text_any {
-            if !group.iter().any(|s| snippet_l.contains(s.as_str())) {
-                return false;
-            }
-        }
         for group in &self.from_any {
             if !group.iter().any(|s| from_l.contains(&s.to_lowercase())) {
                 return false;
@@ -676,6 +724,102 @@ impl ClientFilter {
         }
         true
     }
+}
+
+/// One parsed `since`/`before` bound: the day-granular part for the IMAP
+/// SEARCH, plus the exact Unix second when the input carried a time of day.
+#[derive(Debug)]
+struct TimeBound {
+    /// IMAP-format date (`15-Aug-2026`) for SINCE/BEFORE — widened by one
+    /// day when a time is present, because those operators compare the
+    /// server's day-granular INTERNALDATE in the server's own timezone.
+    imap_date: String,
+    /// Exact bound in Unix seconds, applied client-side to INTERNALDATE.
+    unix: Option<i64>,
+}
+
+/// Parse a `since`/`before` value: plain `YYYY-MM-DD` (day-granular, as
+/// before) or with a time of day — `YYYY-MM-DDTHH:MM[:SS]`, optionally
+/// suffixed `Z` or `±HH:MM`. A zoneless time means the machine's local
+/// timezone: "everything since 12:20" is a local question.
+///
+/// The unattended-run failure this exists for: with only day granularity,
+/// "new since 12:20" needed *all* unread mail plus hand-filtering — and a
+/// capped page of the newest N rows dropped anything beyond the cap with no
+/// signal at all. The exact cut runs against INTERNALDATE (arrival time),
+/// deliberately not the sender-controlled `Date` header.
+fn parse_time_bound(
+    raw: &str,
+    widen_earlier: bool,
+    tz: &jiff::tz::TimeZone,
+) -> Result<TimeBound, String> {
+    // The historic day-only form stays byte-compatible.
+    if raw.len() <= 10 {
+        return Ok(TimeBound {
+            imap_date: iso_to_imap_date(raw).map_err(|e| e.to_string())?,
+            unix: None,
+        });
+    }
+
+    let err = |what: &str| {
+        format!(
+            "Invalid date-time \"{raw}\": {what}. Use YYYY-MM-DD, or \
+             YYYY-MM-DDTHH:MM[:SS] (local time), optionally with Z or ±HH:MM"
+        )
+    };
+
+    // Split an explicit offset off the stem; `Z` means +00:00. A `-` only
+    // counts as an offset past the date part (index > 10). `get` instead of
+    // slicing: byte 10 of an LLM-supplied string need not be a char
+    // boundary (`"2026-08-1€"`), and slicing there would panic.
+    let Some(tail) = raw.get(10..) else {
+        return Err(err("unparseable date or time part"));
+    };
+    let (stem, offset) = match tail.find(['Z', '+', '-']).map(|i| i + 10) {
+        Some(i) if raw.as_bytes()[i] == b'Z' => (&raw[..i], Some("+00:00".to_string())),
+        Some(i) => (&raw[..i], Some(raw[i..].to_string())),
+        None => (raw, None),
+    };
+    // Seconds are optional in the input, mandatory for strptime.
+    let stem = if stem.len() == 16 {
+        format!("{stem}:00")
+    } else {
+        stem.to_string()
+    };
+
+    let timestamp = match offset {
+        Some(off) => {
+            let full = format!("{stem}{off}");
+            jiff::Timestamp::strptime("%Y-%m-%dT%H:%M:%S%:z", &full)
+                .map_err(|_| err("unparseable date, time or offset"))?
+        }
+        None => jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", &stem)
+            .map_err(|_| err("unparseable date or time part"))?
+            .to_zoned(tz.clone())
+            .map_err(|_| err("not a valid local time"))?
+            .timestamp(),
+    };
+
+    // Widen the server-side day window by one day in the safe direction:
+    // SINCE/BEFORE compare the day of INTERNALDATE in the server's timezone,
+    // so the exact instant can fall on a neighbouring calendar day there.
+    // The precise cut happens client-side against the full timestamp.
+    let utc_day = timestamp.to_zoned(jiff::tz::TimeZone::UTC).date();
+    let widened = if widen_earlier {
+        utc_day.yesterday().map_err(|_| err("date out of range"))?
+    } else {
+        utc_day.tomorrow().map_err(|_| err("date out of range"))?
+    };
+    let iso_day = format!(
+        "{:04}-{:02}-{:02}",
+        widened.year(),
+        widened.month(),
+        widened.day()
+    );
+    Ok(TimeBound {
+        imap_date: iso_to_imap_date(&iso_day).map_err(|e| e.to_string())?,
+        unix: Some(timestamp.as_second()),
+    })
 }
 
 /// Build an IMAP SEARCH criteria string from the request. When `unicode_search`
@@ -723,11 +867,23 @@ fn build_search_criteria(
     let push_term = push_search_term;
 
     if let Some(text) = &req.text {
-        push_term(&mut parts, &mut filter.text, "TEXT", text, unicode_search);
+        push_term(
+            &mut parts,
+            &mut filter.post.body.all,
+            "TEXT",
+            text,
+            unicode_search,
+        );
     }
     if let Some(text_all) = &req.text_all {
         for term in text_all {
-            push_term(&mut parts, &mut filter.text, "TEXT", term, unicode_search);
+            push_term(
+                &mut parts,
+                &mut filter.post.body.all,
+                "TEXT",
+                term,
+                unicode_search,
+            );
         }
     }
     if let Some(text_any) = &req.text_any
@@ -743,7 +899,9 @@ fn build_search_criteria(
             }
         } else {
             filter
-                .text_any
+                .post
+                .body
+                .any
                 .push(text_any.iter().map(|s| s.to_lowercase()).collect());
         }
     }
@@ -795,15 +953,32 @@ fn build_search_criteria(
             );
         }
     }
+    let tz = jiff::tz::TimeZone::system();
     if let Some(since) = &req.since {
-        let d = iso_to_imap_date(since).map_err(|e| format!("Invalid 'since' date: {e}"))?;
-        parts.push(format!("SINCE {d}"));
+        let bound =
+            parse_time_bound(since, true, &tz).map_err(|e| format!("Invalid 'since' date: {e}"))?;
+        parts.push(format!("SINCE {}", bound.imap_date));
+        filter.post.internal_since_unix = bound.unix;
     }
     if let Some(before) = &req.before {
-        let d = iso_to_imap_date(before).map_err(|e| format!("Invalid 'before' date: {e}"))?;
-        parts.push(format!("BEFORE {d}"));
+        let bound = parse_time_bound(before, false, &tz)
+            .map_err(|e| format!("Invalid 'before' date: {e}"))?;
+        parts.push(format!("BEFORE {}", bound.imap_date));
+        filter.post.internal_before_unix = bound.unix;
     }
-    if let Some(is_read) = req.is_read {
+    // `unread_only` is list_emails' name for the same thing — accepted here
+    // as an alias, so switching between the two tools needs no re-phrasing.
+    let is_read = match (req.is_read, req.unread_only) {
+        (Some(r), Some(u)) if r == u => {
+            return Err(format!(
+                "is_read: {r} and unread_only: {u} contradict each other — pass only one"
+            ));
+        }
+        (Some(r), _) => Some(r),
+        (None, Some(u)) => Some(!u),
+        (None, None) => None,
+    };
+    if let Some(is_read) = is_read {
         parts.push(if is_read { "SEEN" } else { "UNSEEN" }.to_string());
     }
     if let Some(is_flagged) = req.is_flagged {
@@ -834,11 +1009,29 @@ fn build_search_criteria(
         return Err("At least one search criterion is required".to_string());
     }
     if parts.is_empty() {
-        // All criteria were diverted client-side. Fetching the entire mailbox
-        // would be prohibitively slow on big folders, so require a date scope.
-        return Err(
-            "Non-ASCII search on this server requires a date filter (since/before)".to_string(),
-        );
+        // Every given criterion is matched client-side AFTER fetching;
+        // without a server-side scope that would mean fetching the entire
+        // mailbox. Name the actual criteria — an earlier version blamed
+        // "Non-ASCII search" even when the only criterion was
+        // `has_attachments`, sending the caller hunting for umlauts that
+        // were not there.
+        let mut client_only: Vec<&str> = Vec::new();
+        if filter.has_attachments.is_some() {
+            client_only.push("`has_attachments`");
+        }
+        if !(filter.post.body.is_empty()
+            && filter.subject.is_empty()
+            && filter.from.is_empty()
+            && filter.to.is_empty()
+            && filter.from_any.is_empty())
+        {
+            client_only.push("the non-ASCII terms (this server's SEARCH cannot take them)");
+        }
+        return Err(format!(
+            "{} are matched client-side after fetching and need a server-side filter to \
+             bound the candidates — add since/before (a plain date is enough)",
+            client_only.join(" and ")
+        ));
     }
 
     // Prepend `CHARSET UTF-8` only when something non-ASCII actually went to
@@ -865,8 +1058,17 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
     };
     // Clamp to a hard ceiling so a prompt-injected limit can't ask for 100k
     // emails and OOM the host. Larger result sets are reached via `offset`.
+    let limit_capped = req.limit.is_some_and(|l| l > 500);
     let limit = req.limit.unwrap_or(20).clamp(1, 500);
     let offset = req.offset.unwrap_or(0);
+    let group_by_thread = req.group_by_thread.unwrap_or(false);
+    // As in list_emails: collapsing eats rows, so fetch ~3× per folder to
+    // still fill the requested page. Capped at the same ceiling.
+    let fetch_limit = if group_by_thread {
+        limit.saturating_mul(3).min(500)
+    } else {
+        limit
+    };
     // Paging happens per folder inside the client, so applying it to a
     // multi-folder search would skip `offset` messages in *each* folder —
     // silently dropping matches instead of paging past them. Refuse rather
@@ -909,7 +1111,10 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
     // from "these are the newest of many" — see the note on `matched` below.
     let mut server_matched: u32 = 0;
     for folder in &ordered_folders {
-        match client.search_emails(folder, &criteria, limit, offset).await {
+        match client
+            .search_emails(folder, &criteria, fetch_limit, offset, &filter.post)
+            .await
+        {
             Ok((results, matched)) => {
                 server_matched = server_matched.saturating_add(matched);
                 all_results.extend(results);
@@ -937,8 +1142,11 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
         return error_json(&err);
     }
 
-    // Apply client-side filters (Outlook 365 UTF-8 fallback). No-op when the
-    // server handled all criteria itself.
+    // Apply the summary-level client-side filters (Outlook 365 UTF-8
+    // fallback): subject/from/to and has_attachments. The full-text (`body`)
+    // criteria were already applied inside the IMAP client, against each
+    // message's complete body — re-checking them here would only have the
+    // snippet to look at. No-op when the server handled all criteria itself.
     if !filter.is_empty() {
         all_results.retain(|e| filter.matches(e));
     }
@@ -960,27 +1168,94 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
         });
     }
 
-    all_results.sort_by(|a, b| b.date.cmp(&a.date));
-    all_results.truncate(limit as usize);
+    render_search_payload(
+        all_results,
+        &SearchPayload {
+            account: &account_name,
+            server_matched,
+            offset,
+            limit,
+            limit_capped,
+            group_by_thread,
+            compact: req.compact.unwrap_or(false),
+        },
+    )
+}
 
-    // `matched` counts what the server matched, `returned` what we deliver.
+/// Everything `render_search_payload` needs besides the result rows —
+/// bundled so the render step stays a single call in `search_emails`.
+struct SearchPayload<'a> {
+    account: &'a str,
+    server_matched: u32,
+    offset: u32,
+    limit: u32,
+    limit_capped: bool,
+    group_by_thread: bool,
+    compact: bool,
+}
+
+/// Sort, optionally thread-group, page-cap and serialize search results.
+fn render_search_payload(mut all_results: Vec<EmailSummary>, p: &SearchPayload<'_>) -> String {
+    all_results.sort_by(|a, b| b.date.cmp(&a.date));
+
+    // Grouping mirrors list_emails exactly (same union-find, same
+    // representative choice, same truncation report) so the two tools'
+    // thread views can never disagree. It runs across folders, which is the
+    // point: a conversation spanning INBOX and an archive folder collapses
+    // into one row here too.
+    let rows_from_server = all_results.len();
+    // `rows_truncated`: a multi-folder search server-caps each folder at
+    // `limit`, so the union can exceed the page and `truncate` cuts real,
+    // already-fetched matches — which `matched > offset + rows_from_server`
+    // cannot see (both sides count the same union). Without it, 3 folders
+    // × 10 hits at `limit: 20` reported `has_more: false` over 10 dropped
+    // rows. The grouping branch reports its cut via `threads_before_cap`.
+    let (threads_before_cap, rows_truncated) = if p.group_by_thread {
+        let (grouped, cut) = cap_threads(group_summaries_by_thread(all_results), p.limit);
+        all_results = grouped;
+        (cut, false)
+    } else {
+        let truncated = all_results.len() > p.limit as usize;
+        all_results.truncate(p.limit as usize);
+        (None, truncated)
+    };
+
+    // `matched` counts what the folder searches matched (per-folder counts
+    // taken after the sub-day time cut), `returned` what we deliver.
     // Reporting only the delivered count made a capped result indistinguishable
     // from a complete one, so a caller asking "everything since date X" could
     // silently miss the remainder.
     //
-    // Client-side filtering and cross-folder dedup happen after the server
-    // count, so `matched` is an upper bound in those cases — never lower than
-    // what exists, which keeps "returned < matched ⇒ there is more" true.
-    let rows = summary_rows(&all_results, req.compact.unwrap_or(false));
-    serde_json::to_string(&serde_json::json!({
-        "account": account_name,
-        "matched": server_matched.max(u32::try_from(all_results.len()).unwrap_or(u32::MAX)),
+    // Full-text client-side filtering and cross-folder dedup happen after
+    // that count, so `matched` is an upper bound in those cases — never lower
+    // than what exists, which keeps "returned < matched ⇒ there is more" true.
+    let matched = p
+        .server_matched
+        .max(u32::try_from(all_results.len()).unwrap_or(u32::MAX));
+    // "Another call can reach more": the server had more candidates than
+    // this page consumed, or thread collapsing cut rows. Client-side
+    // filters can thin a page without lowering `matched`, so `has_more`
+    // shares its upper-bound nature.
+    let has_more = matched as usize > p.offset as usize + rows_from_server
+        || threads_before_cap.is_some()
+        || rows_truncated;
+    let rows = summary_rows(&all_results, p.compact);
+    let mut payload = serde_json::json!({
+        "account": p.account,
+        "matched": matched,
         "returned": all_results.len(),
-        "offset": offset,
-        "limit": limit,
+        "offset": p.offset,
+        "limit": p.limit,
+        "has_more": has_more,
         "emails": rows,
-    }))
-    .unwrap_or_else(|e| error_json(&e.to_string()))
+    });
+    if p.limit_capped {
+        payload["limit_capped"] = serde_json::json!(true);
+    }
+    if let Some(count) = threads_before_cap {
+        payload["threads_truncated_from"] = serde_json::json!(count);
+    }
+    serde_json::to_string(&payload).unwrap_or_else(|e| error_json(&e.to_string()))
 }
 
 /// Make a filesystem-safe filename out of an LLM-supplied attachment name.
@@ -1043,24 +1318,32 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
         return error_json("Failed to parse email");
     };
 
-    // Match on the sanitized name — that's what the LLM saw in `get_email`'s
-    // attachments list (see `email.rs::sanitize_external_str`). Comparing raw
-    // to sanitized would otherwise 404 any attachment whose real name
-    // contains stripped chars (bidi overrides, zero-width, NUL).
-    let attachment = message.attachments().find(|att| {
-        crate::email::sanitize_external_str(att.attachment_name().unwrap_or("")) == req.filename
-    });
-
-    // Filename in error/JSON responses: strip control/bidi so a prompt-
-    // injected LLM echoing a crafted name can't round-trip the payload
-    // back into its own context through our error message.
-    let safe_filename = crate::email::sanitize_external_str(&req.filename);
-    let Some(attachment) = attachment else {
-        return error_json(&format!(
-            "Attachment \"{safe_filename}\" not found in email UID {}",
-            req.uid
-        ));
+    // The names exactly as `get_email` renders them — same sanitizer, same
+    // `"attachment"` placeholder for nameless parts. The two defaults used
+    // to diverge (`"attachment"` here vs `""` there), so following the
+    // documented get_email→download flow dead-ended on any nameless part:
+    // the placeholder shown could never match.
+    let names: Vec<String> = message
+        .attachments()
+        .map(|att| {
+            crate::email::sanitize_external_str(att.attachment_name().unwrap_or("attachment"))
+        })
+        .collect();
+    // `filename` is LLM input echoed into errors: strip control/bidi so a
+    // crafted name can't round-trip a payload through our message.
+    let safe_requested = req
+        .filename
+        .as_deref()
+        .map(crate::email::sanitize_external_str);
+    let selected = match resolve_attachment_selection(&names, req.index, safe_requested.as_deref())
+    {
+        Ok(i) => i,
+        Err(e) => return error_json(&format!("{e} (email UID {})", req.uid)),
     };
+    let Some(attachment) = message.attachments().nth(selected) else {
+        return error_json("Attachment list changed during processing");
+    };
+    let attachment_name = names[selected].clone();
 
     let content_type = crate::email::format_content_type(attachment.content_type());
 
@@ -1069,7 +1352,7 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
 
     if size > MAX_ATTACHMENT_SIZE {
         return error_json(&format!(
-            "Attachment \"{safe_filename}\" is {size} bytes — exceeds the {MAX_ATTACHMENT_SIZE}-byte cap"
+            "Attachment \"{attachment_name}\" is {size} bytes — exceeds the {MAX_ATTACHMENT_SIZE}-byte cap"
         ));
     }
 
@@ -1120,7 +1403,7 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
     // joining onto the download dir — a crafted attachment named
     // `"../../../etc/passwd"` would otherwise let `Path::join` traverse
     // outside our allowed tree. Empty / `.` / `..` collapse to "attachment".
-    let fs_safe_name = filesystem_safe_filename(&req.filename);
+    let fs_safe_name = filesystem_safe_filename(&attachment_name);
     let save_path = download_dir.join(&fs_safe_name);
     // Write to a `.partial` sibling first, then atomically rename. If the
     // write fails mid-way (ENOSPC, quota, brief I/O error) we remove the
@@ -1158,11 +1441,66 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
     serde_json::to_string(&serde_json::json!({
         "account": account_name,
         "saved_to": save_path.to_string_lossy(),
-        "filename": req.filename,
+        // The attachment actually picked — with `index` selection or the
+        // placeholder name, echoing the request input would be misleading.
+        "filename": attachment_name,
+        "index": selected,
         "size": size,
         "content_type": content_type,
     }))
     .unwrap_or_else(|e| error_json(&e.to_string()))
+}
+
+/// Pick one attachment by `index` or by (sanitized) `filename`.
+///
+/// `index` wins when both are given — it is the unambiguous handle.
+/// Filename matches can legitimately be ambiguous: nameless parts all
+/// render as the `"attachment"` placeholder, and senders do attach two
+/// files with the same name. Picking the first silently (the previous
+/// behaviour) downloaded an arbitrary one; the error lists the indices so
+/// the caller can address the right part directly.
+fn resolve_attachment_selection(
+    names: &[String],
+    index: Option<usize>,
+    filename: Option<&str>,
+) -> Result<usize, String> {
+    let listing = || {
+        names
+            .iter()
+            .enumerate()
+            .map(|(i, n)| format!("index {i}: \"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    if let Some(i) = index {
+        if i < names.len() {
+            return Ok(i);
+        }
+        return Err(format!(
+            "Attachment index {i} is out of range — the message has {} attachment(s): {}",
+            names.len(),
+            listing()
+        ));
+    }
+    let Some(filename) = filename else {
+        return Err("Pass `filename` or `index` to pick an attachment".to_string());
+    };
+    let matches: Vec<usize> = names
+        .iter()
+        .enumerate()
+        .filter(|(_, n)| n.as_str() == filename)
+        .map(|(i, _)| i)
+        .collect();
+    match matches.as_slice() {
+        [] => Err(format!(
+            "Attachment \"{filename}\" not found. Available: {}",
+            listing()
+        )),
+        [one] => Ok(*one),
+        many => Err(format!(
+            "Attachment name \"{filename}\" is ambiguous — it matches indices {many:?}; pass `index` to pick one"
+        )),
+    }
 }
 
 pub async fn list_drafts(server: &ImapMcpServer, req: ListDraftsRequest) -> String {
@@ -1173,6 +1511,7 @@ pub async fn list_drafts(server: &ImapMcpServer, req: ListDraftsRequest) -> Stri
     let account_name = account_config.name.clone();
     // Clamp to a hard ceiling so a prompt-injected limit can't ask for 100k
     // emails and OOM the host. Users needing more should paginate via offset.
+    let limit_capped = req.limit.is_some_and(|l| l > 500);
     let limit = req.limit.unwrap_or(20).clamp(1, 500);
     let offset = req.offset.unwrap_or(0);
     let mut client = client_arc.lock().await;
@@ -1191,16 +1530,22 @@ pub async fn list_drafts(server: &ImapMcpServer, req: ListDraftsRequest) -> Stri
         .list_emails(&drafts_folder, limit, offset, false)
         .await
     {
-        Ok((emails, total, _)) => serde_json::to_string(&serde_json::json!({
-            "account": account_name,
-            "folder": drafts_folder,
-            "total": total,
-            "offset": offset,
-            "limit": limit,
-            "returned": emails.len(),
-            "drafts": summary_rows(&emails, req.compact.unwrap_or(false)),
-        }))
-        .unwrap_or_else(|e| error_json(&e.to_string())),
+        Ok((emails, total, _)) => {
+            let mut payload = serde_json::json!({
+                "account": account_name,
+                "folder": drafts_folder,
+                "total": total,
+                "offset": offset,
+                "limit": limit,
+                "returned": emails.len(),
+                "has_more": total as usize > offset as usize + emails.len(),
+                "drafts": summary_rows(&emails, req.compact.unwrap_or(false)),
+            });
+            if limit_capped {
+                payload["limit_capped"] = serde_json::json!(true);
+            }
+            serde_json::to_string(&payload).unwrap_or_else(|e| error_json(&e.to_string()))
+        }
         Err(e) => error_json(&client.check_error(e).to_string()),
     }
 }
@@ -1272,6 +1617,7 @@ mod tests {
         EmailSummary {
             uid,
             folder: "INBOX".into(),
+            folder_display: None,
             message_id: Some(format!("<{uid}@x>")),
             in_reply_to: None,
             references: vec![],
@@ -1281,6 +1627,8 @@ mod tests {
             cc_count: 0,
             subject: format!("s{uid}"),
             date: None,
+            date_original: None,
+            internal_date: None,
             flags: vec![],
             has_attachments: false,
             snippet: "x".repeat(200),
@@ -1309,6 +1657,36 @@ mod tests {
         let (kept, before) = cap_threads(vec![row(1)], 10);
         assert_eq!(kept.len(), 1);
         assert_eq!(before, None);
+    }
+
+    /// The union of a multi-folder search can exceed the page even though
+    /// each folder was server-capped at `limit` — the final truncate then
+    /// cuts real, already-fetched matches, which the `matched > offset +
+    /// rows` arithmetic cannot see (both sides count the same union).
+    /// Before the fix, 3 folders × 10 hits at `limit: 20` reported
+    /// `has_more: false` over 10 dropped rows.
+    #[test]
+    fn render_search_payload_reports_truncated_multi_folder_unions() {
+        let payload = |server_matched| SearchPayload {
+            account: "A",
+            server_matched,
+            offset: 0,
+            limit: 20,
+            limit_capped: false,
+            group_by_thread: false,
+            compact: true,
+        };
+        let rendered = render_search_payload((1..=30).map(row).collect(), &payload(30));
+        let v: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(v["returned"], 20);
+        assert_eq!(v["matched"], 30);
+        assert_eq!(v["has_more"], true, "{v}");
+
+        // Exactly filling the page is not a truncation — no phantom "more".
+        let rendered = render_search_payload((1..=20).map(row).collect(), &payload(20));
+        let v: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+        assert_eq!(v["returned"], 20);
+        assert_eq!(v["has_more"], false, "{v}");
     }
 
     /// Both tools render through this, so a divergence between them would be
@@ -1355,6 +1733,8 @@ mod tests {
             since: None,
             before: None,
             is_read: None,
+            unread_only: None,
+            group_by_thread: None,
             is_flagged: None,
             is_answered: None,
             has_attachments: None,
@@ -1372,6 +1752,7 @@ mod tests {
         EmailSummary {
             uid: 1,
             folder: "INBOX".to_string(),
+            folder_display: None,
             message_id: None,
             in_reply_to: None,
             references: vec![],
@@ -1384,6 +1765,8 @@ mod tests {
             cc_count: 0,
             subject: subject.to_string(),
             date: None,
+            date_original: None,
+            internal_date: None,
             flags: vec![],
             has_attachments: false,
             snippet: snippet.to_string(),
@@ -1518,9 +1901,197 @@ mod tests {
     fn fallback_requires_date_when_only_unicode_criteria() {
         let mut req = empty_req();
         req.subject = Some("Bestätigung".to_string());
-        // No date scope → would need to fetch the entire mailbox.
+        // No server-side scope → would need to fetch the entire mailbox. The
+        // message must name the actual cause (the diverted non-ASCII terms).
         let err = build_search_criteria(&req, false).unwrap_err();
-        assert!(err.contains("date filter"));
+        assert!(err.contains("since/before"), "{err}");
+        assert!(err.contains("non-ASCII"), "{err}");
+        assert!(!err.contains("has_attachments"), "{err}");
+    }
+
+    /// The misdiagnosis this replaces: `has_attachments` alone (client-side
+    /// on EVERY server) used to fail with "Non-ASCII search on this server
+    /// requires a date filter" — no non-ASCII anywhere in the request, and
+    /// the caller went hunting for umlauts instead of adding `since`.
+    #[test]
+    fn client_only_criteria_error_names_the_actual_criteria() {
+        let mut req = empty_req();
+        req.has_attachments = Some(true);
+        let err = build_search_criteria(&req, true).unwrap_err();
+        assert!(err.contains("has_attachments"), "{err}");
+        assert!(!err.to_lowercase().contains("non-ascii"), "{err}");
+        assert!(err.contains("since/before"), "{err}");
+
+        // With a date scope the same request builds fine.
+        req.since = Some("2026-01-01".to_string());
+        let (criteria, filter) = build(&req, true);
+        assert!(criteria.contains("SINCE 1-Jan-2026"), "{criteria}");
+        assert_eq!(filter.has_attachments, Some(true));
+
+        // Both causes at once: both are named.
+        let mut req = empty_req();
+        req.has_attachments = Some(true);
+        req.subject = Some("Bestätigung".to_string());
+        let err = build_search_criteria(&req, false).unwrap_err();
+        assert!(err.contains("has_attachments"), "{err}");
+        assert!(err.contains("non-ASCII"), "{err}");
+    }
+
+    // ===== time bounds =====
+
+    /// Fixed +02:00 — Berlin summer time as a constant offset, so the tests
+    /// need no IANA tzdb (the Nix build sandbox has none).
+    fn cest() -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(2))
+    }
+
+    #[test]
+    fn time_bound_plain_date_stays_day_granular() {
+        let b = parse_time_bound("2026-08-15", true, &cest()).unwrap();
+        assert_eq!(b.imap_date, "15-Aug-2026");
+        assert!(b.unix.is_none(), "no client-side cut for a plain date");
+    }
+
+    #[test]
+    fn time_bound_with_time_widens_the_server_window_and_sets_the_cut() {
+        // 12:20 at +02:00 on Aug 15 = 10:20Z. The server window must be
+        // widened a day EARLIER for `since` (server timezones), the exact
+        // cut is the Unix second.
+        let b = parse_time_bound("2026-08-15T12:20", true, &cest()).unwrap();
+        assert_eq!(b.imap_date, "14-Aug-2026");
+        // Compute independently: 2026-08-15T10:20:00Z.
+        let expect = jiff::civil::date(2026, 8, 15)
+            .at(10, 20, 0, 0)
+            .to_zoned(jiff::tz::TimeZone::UTC)
+            .unwrap()
+            .timestamp()
+            .as_second();
+        assert_eq!(b.unix, Some(expect));
+
+        // `before` widens a day LATER.
+        let b = parse_time_bound("2026-08-15T12:20", false, &cest()).unwrap();
+        assert_eq!(b.imap_date, "16-Aug-2026");
+
+        // Explicit offsets and Z are honoured as given.
+        let z = parse_time_bound("2026-08-15T10:20:00Z", true, &cest()).unwrap();
+        assert_eq!(z.unix, Some(expect));
+        let off = parse_time_bound("2026-08-15T12:20:00+02:00", true, &cest()).unwrap();
+        assert_eq!(off.unix, Some(expect));
+    }
+
+    #[test]
+    fn time_bound_rejects_garbage_with_format_help() {
+        for bad in [
+            "2026-08-15Txx:20",
+            "2026-08-15T12:20:00+2",
+            "2026-13-01T00:00",
+            // Multi-byte input: byte 10 inside the `€` used to panic on
+            // `raw[10..]` instead of returning an error.
+            "2026-08-1€",
+            // Multi-byte in the tail (byte 10 is a boundary here) — takes
+            // the strptime error path, must not panic either.
+            "2026-08-15T1€:20",
+        ] {
+            let err = parse_time_bound(bad, true, &cest()).unwrap_err();
+            assert!(err.contains(bad), "{err}");
+            assert!(err.contains("YYYY-MM-DD"), "{err}");
+        }
+        // The historic day form keeps its historic error.
+        assert!(parse_time_bound("15.08.2026", true, &cest()).is_err());
+    }
+
+    #[test]
+    fn unread_only_alias_maps_and_conflicts_loudly() {
+        let mut req = empty_req();
+        req.unread_only = Some(true);
+        let (criteria, _) = build(&req, true);
+        assert!(criteria.contains("UNSEEN"), "{criteria}");
+
+        let mut req = empty_req();
+        req.unread_only = Some(false);
+        let (criteria, _) = build(&req, true);
+        assert!(criteria.contains("SEEN"), "{criteria}");
+
+        // Contradiction is refused, agreement is accepted.
+        let mut req = empty_req();
+        req.is_read = Some(true);
+        req.unread_only = Some(true);
+        assert!(build_search_criteria(&req, true).is_err());
+        let mut req = empty_req();
+        req.is_read = Some(false);
+        req.unread_only = Some(true);
+        let (criteria, _) = build(&req, true);
+        assert!(criteria.contains("UNSEEN"));
+    }
+
+    // ===== attachment selection =====
+
+    fn names(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| (*s).to_string()).collect()
+    }
+
+    #[test]
+    fn attachment_selection_by_index_and_by_unique_name() {
+        let n = names(&["report.pdf", "attachment", "attachment"]);
+        assert_eq!(resolve_attachment_selection(&n, Some(2), None), Ok(2));
+        // Index wins over filename when both are present.
+        assert_eq!(
+            resolve_attachment_selection(&n, Some(0), Some("attachment")),
+            Ok(0)
+        );
+        assert_eq!(
+            resolve_attachment_selection(&n, None, Some("report.pdf")),
+            Ok(0)
+        );
+    }
+
+    /// The documented `get_email` → `download_attachment` flow used to
+    /// dead-end on nameless parts: `get_email` showed the "attachment"
+    /// placeholder while download
+    /// compared against "" — the shown name could never match. With one
+    /// shared default the placeholder matches; TWO placeholders are
+    /// ambiguous and must point at `index` instead of silently picking one.
+    #[test]
+    fn attachment_selection_handles_placeholder_names() {
+        let single = names(&["report.pdf", "attachment"]);
+        assert_eq!(
+            resolve_attachment_selection(&single, None, Some("attachment")),
+            Ok(1)
+        );
+
+        let double = names(&["attachment", "attachment"]);
+        let err = resolve_attachment_selection(&double, None, Some("attachment")).unwrap_err();
+        assert!(err.contains("ambiguous"), "{err}");
+        assert!(err.contains("index"), "{err}");
+    }
+
+    #[test]
+    fn attachment_selection_errors_list_what_is_available() {
+        let n = names(&["a.png", "b.pdf"]);
+        let err = resolve_attachment_selection(&n, None, Some("missing.txt")).unwrap_err();
+        assert!(err.contains("index 0: \"a.png\""), "{err}");
+        assert!(err.contains("index 1: \"b.pdf\""), "{err}");
+        let err = resolve_attachment_selection(&n, Some(5), None).unwrap_err();
+        assert!(err.contains("out of range"), "{err}");
+        assert!(
+            resolve_attachment_selection(&n, None, None)
+                .unwrap_err()
+                .contains("filename"),
+        );
+    }
+
+    #[test]
+    fn fallback_diverts_unicode_text_to_the_body_filter() {
+        // `text` terms the server cannot take go into the BODY filter the
+        // IMAP client applies against the full body_text — not into a
+        // summary-level filter, whose 200-char snippet would silently drop
+        // every mail with the term further down.
+        let mut req = empty_req();
+        req.text = Some("Bestätigung".to_string());
+        req.since = Some("2026-01-01".to_string());
+        let (criteria, filter) = build(&req, false);
+        assert!(!criteria.contains("TEXT"));
+        assert_eq!(filter.post.body.all, vec!["bestätigung".to_string()]);
     }
 
     #[test]
@@ -1530,8 +2101,8 @@ mod tests {
         req.since = Some("2026-01-01".to_string());
         let (criteria, filter) = build(&req, false);
         assert!(!criteria.contains("TEXT"));
-        assert_eq!(filter.text_any.len(), 1);
-        assert_eq!(filter.text_any[0].len(), 2);
+        assert_eq!(filter.post.body.any.len(), 1);
+        assert_eq!(filter.post.body.any[0].len(), 2);
     }
 
     #[test]
@@ -1540,7 +2111,7 @@ mod tests {
         req.text_any = Some(vec!["foo".to_string(), "bar".to_string()]);
         let (criteria, filter) = build(&req, false);
         assert!(criteria.contains("OR TEXT \"foo\" TEXT \"bar\""));
-        assert!(filter.text_any.is_empty());
+        assert!(filter.post.body.is_empty());
     }
 
     #[test]
@@ -1563,15 +2134,16 @@ mod tests {
     }
 
     #[test]
-    fn client_filter_text_any_or_semantics() {
+    fn client_filter_matches_ignores_the_body_criteria() {
+        // The division of labour: `matches()` covers summary-level fields
+        // only. Body criteria were already applied by the IMAP client against
+        // the full text — re-checking them here against the snippet would
+        // re-introduce the 200-char false negatives this split removed.
         let mut filter = ClientFilter::default();
-        filter
-            .text_any
-            .push(vec!["glückwunsch".to_string(), "gratulation".to_string()]);
-        let s_match = summary_with("Test", "Herzlichen Glückwunsch zum Geburtstag", "x@y");
-        let s_no_match = summary_with("Test", "Nichts davon hier", "x@y");
-        assert!(filter.matches(&s_match));
-        assert!(!filter.matches(&s_no_match));
+        filter.post.body.all.push("glückwunsch".to_string());
+        let s = summary_with("Test", "Nichts davon hier", "x@y");
+        assert!(filter.matches(&s), "body terms are not the summary's job");
+        assert!(!filter.is_empty(), "…but they do make the filter non-empty");
     }
 
     #[test]

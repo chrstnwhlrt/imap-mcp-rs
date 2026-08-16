@@ -26,6 +26,9 @@ username = "user@gmail.com"
 # read_only = false                  # true = only read tools, no write/draft
 # allow_delete = true                # false = delete_email blocked
 # allow_move = true                  # false = move_email blocked
+# allow_flag_change = true           # false = mark_as_read/unread + flag/unflag blocked
+#                                    # (the unread state is often a human's work queue —
+#                                    # a bulk mark_as_read erases it with no undo)
 # allow_unsafe_expunge = false       # true = permit plain EXPUNGE fallback on servers without UIDPLUS
 #                                    # (on such servers, it would sweep \Deleted messages flagged by
 #                                    # concurrent clients — phone, webmail. Default false refuses.)

@@ -3,9 +3,266 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 2.0.0
+
+Ergonomics release, driven by a field report from an LLM assistant using the
+server unattended (twelve folders, every 15 minutes, nobody watching): in
+that mode a misleading description becomes a wrong result and a convenient
+default a silent misfire. Three of the report's findings were verifiable
+bugs; the rest reshaped defaults and result fields. Major version because
+two behaviours and one result field change incompatibly.
+
+### Breaking
+
+- **`account` is required when several accounts are configured.** The old
+  silent first-account fallback made every call quietly work in whichever
+  account was listed first — for `draft_*` that composed from the wrong
+  mailbox under the wrong sender. With one account the parameter stays
+  optional (the default is unambiguous); with several, omitting it errors
+  and lists the names, so recovery is one retry.
+- **`date` fields are UTC-normalized.** Sender offsets were passed through,
+  so one response mixed `+02:00`, `-07:00` and `Z` rows: unreadable
+  (`11:02-07:00` skims as older than `13:20Z` while being five hours
+  younger) and — worse — the cross-folder sort and the thread-representative
+  pick order these strings lexicographically, which is simply wrong for
+  mixed offsets. `date` is now always `…Z` (sort and compare directly);
+  `date_original` carries the sender's rendition when its offset differs.
+  Draft quote headers render the time in the reader's local zone, the way
+  desktop clients do.
+- **`move_email`, `delete_email`, `delete_draft` return `failed` alongside
+  `succeeded`** — the input minus what existed. A caller checking only "no
+  error came back" read a partial success as a full one; an empty `failed`
+  is a statement, a gap in `succeeded` was not. (`mark_*` keeps the
+  two-field shape: there the difference means "already in the target state
+  or unknown", and calling that `failed` would be the next misdirection.)
+
+### Fixed
+
+- **The documented `get_email` → `download_attachment` flow dead-ended on
+  nameless attachments.** `get_email` renders missing names as the
+  placeholder `"attachment"`, but `download_attachment` compared against a
+  DIFFERENT default (`""`) — the shown name could never match, and with two
+  nameless parts even a fixed name is ambiguous. Attachments now carry an
+  `index` (the unambiguous handle, accepted by `download_attachment`),
+  filename matching uses the same placeholder default as the display, and
+  an ambiguous name errors with the candidate indices instead of silently
+  picking the first.
+- **A client-side-only search no longer blames "Non-ASCII search".**
+  `search_emails(has_attachments: true)` without a date failed with
+  "Non-ASCII search on this server requires a date filter" — no non-ASCII
+  anywhere in the request, on every provider. The message now names the
+  actual criteria (`has_attachments`, diverted non-ASCII terms) and the
+  actual requirement (a server-side scope such as since/before).
+- **`\Recent` no longer appears in `flags`.** It is session-scoped server
+  bookkeeping (removed from IMAP4rev2 by RFC 9051) that reads like "new
+  for me" and invited exactly that misread.
+
+### Added
+
+- **Sub-day `since`/`before`.** Both accept a time of day
+  (`2026-08-15T12:20`, local; or with `Z`/`±HH:MM`) on top of the historic
+  day form. IMAP's own operators are day-granular, so the server window is
+  widened by a day and the exact cut runs client-side against INTERNALDATE
+  — the arrival time, deliberately not the sender-controlled Date header.
+  The cut is resolved on a lightweight `(UID INTERNALDATE)` round before
+  counting and paging, so `matched`, `offset` and `has_more` operate on
+  rows a caller can actually get — no discarded full-body transfers, no
+  empty pages on the way to the first hit. Result rows echo the arrival
+  time as `internal_date` while the bound is active: `date` is the
+  sender's header and may legitimately sit outside the requested window,
+  which would otherwise read as a filter bug with no way to verify it.
+  Previously "everything since 12:20" meant fetching all unread mail and
+  hand-filtering, and a capped page of the newest N rows silently dropped
+  the rest.
+- **`group_by_thread` on `search_emails`** — same collapsing as
+  `list_emails`, so "unread since 12:20, grouped by conversation" is one
+  call instead of a capability puzzle across two tools. `unread_only` is
+  accepted as an alias for `is_read` (the two tools named the same filter
+  differently); contradictions are refused.
+- **`has_more` on every listing tool, `returned` on `list_emails`,
+  `limit_capped` when a requested limit was cut** — the three tools shipped
+  three different count-field combinations, each requiring different
+  arithmetic to answer "is there more". `has_more` answers it directly.
+- **`retryable` on every error** — the one bit the error text cannot
+  convey: whether repeating the call later can help. A field report showed
+  an unattended run treating "Server Unavailable" as permanent and skipping
+  a folder for a day. Transient states (unavailable, in use, connection
+  class) are `true`; facts (no such folder, unknown UID, permission denied)
+  are `false`.
+- **`allow_flag_change` per account plus `dry_run` on all four flag
+  tools.** The protections sat inversely to the danger: `move`/`delete` had
+  preview and per-account gates while `mark_as_read` — which erases a
+  human's work queue with no trash and no record of which messages it hit —
+  had neither. The existing pattern, applied consistently.
+- **`folder_display` in result rows** — the modified-UTF-7-decoded folder
+  name (`Gel&APY-schte Elemente` → `Gelöschte Elemente`), previously only
+  in `list_folders`; a cross-folder hit from the trash is now recognizable
+  in place.
+
+### Changed
+
+- **The server instructions were cut to fit the client's truncation
+  budget.** Field reports (and this repo's own development sessions) showed
+  MCP clients truncating the ~3.4 KB instructions mid-word — from the
+  permissions section on, with the reader unaware anything was missing.
+  Now ~1.6 KB, ordered security → permissions → workflow, with everything
+  tool-specific moved into that tool's description; a test pins the budget.
+- `list_emails` and `search_emails` describe their return shape as a field
+  list instead of one-line pseudo-JSON, and document honestly that
+  `has_attachments` counts every non-text part (signature images and
+  S/MIME signatures included) — read it as "has parts", not "has a
+  document".
+
+283 unit tests (up from 261) and 17 GreenMail integration tests (up from
+16 — the new one proves the sub-day cut runs on INTERNALDATE over the
+wire), plus `tests/e2e_mcp_all_tools.py`: an MCP-layer end-to-end round
+that exercises every one of the 19 tools as real JSON-RPC calls against
+the built binary — 35 checks covering the account requirement,
+`retryable`, grouped sub-day search with the `internal_date` echo, the
+index-based attachment round trip, `dry_run` previews and the `failed`
+field.
+
 ## 1.6.1
 
 ### Fixed
+
+- **The inline-image `multipart/related` container lacked its mandatory
+  `type` parameter.** RFC 2387 — the very RFC the hand-built tree cites —
+  requires `type="multipart/alternative"` so a client knows the root part
+  before walking the children. Tolerant clients guess; strict ones may treat
+  the container as malformed and show the body as a detached attachment,
+  the exact failure the hand-built tree exists to avoid.
+- **Inline `Content-ID`s are now globally unique msg-ids.** The marker id
+  was written verbatim as `Content-ID: <shot>` — not the `local@domain`
+  shape RFC 2045 requires, identical in every draft that names its image
+  `shot`, and a fingerprint of this tool. Clients and gateways that cache or
+  deduplicate inline parts by Content-ID could show another mail's image; a
+  `cid:` reference inside a quoted original could collide outright. The wire
+  id is now `<id.random@domain>` (domain as for `message_id_domain`) while
+  the marker id stays the user-facing handle. One shared `is_valid_cid`
+  rule (alphabet, 128-byte cap, RFC 5322 dot-atom placement: no leading,
+  trailing or doubled dots) now governs the body scanner, explicit cids and
+  the derived fallback alike — previously `derive_cid` had no length cap,
+  so a long file-name stem minted an id the scanner rejected by
+  construction (a dead end with a misleading error), and `shot..png`
+  produced `<shot..uuid@domain>`, which is not a valid msg-id local part.
+  An empty `message_id_domain = ""` in the config now counts as unset
+  instead of minting `<uuid@>` ids.
+- **The marker scanner is linear now — including validation and rendering.**
+  A body crafted as thousands of `![` sharing one distant `]` made the scan
+  quadratic — minutes of CPU within the 10 MiB body cap, on the async
+  worker. Bracket, parenthesis and newline lookups go through a
+  forward-only cache. Review of the fix found two more quadratics hiding
+  beside it: the stray-fragment check re-tested every `](cid:` occurrence
+  against the whole marker list (O(k²) on the SUCCESS path — empirically
+  ~7 minutes at 10 MiB of repeated valid markers) and id dedup walked a
+  `Vec` (O(u²) in distinct ids, reachable with zero attachments). Both
+  lists are position-sorted, so the fragment check is now a two-pointer
+  walk and dedup a `HashSet`; validation runs off ONE shared scan, the
+  render passes look refs up in a map, and regression tests pin all three
+  shapes.
+- **A stray `![` in prose can no longer swallow paragraphs.** The alt text
+  of a marker must stay on one line (and within 300 bytes); previously a
+  `![` followed pages later by `](cid:x)` moved everything in between into
+  an invisible `alt` attribute of the rendered HTML.
+- **Marker validation and HTML rendering see the same markers.** Rendering
+  used to re-scan the HTML-escaped body, so an id the raw-body validation
+  rejected (e.g. containing `"`) could be accepted after escaping — saved as
+  visible marker source with no warning. The HTML pass now scans the raw
+  body and escapes around the markers; ids are additionally restricted to
+  the attachment-cid alphabet (letters, digits, `.`, `_`, `-`, max 128), so
+  the scanner can never accept a reference no attachment could carry.
+- **Malformed marker attempts are refused, not silently kept as text.** A
+  `](cid:` fragment the scanner rejects — an id with spaces (the shape every
+  downloaded `Bildschirmfoto 2026-… .png` produces), an alt spanning lines —
+  now fails the draft with the offending line and the marker grammar,
+  instead of saving a draft that shows raw marker source. Scoped to inline
+  context: with no inline attachments and no valid markers the fragment is
+  most likely prose *about* the syntax, so the draft saves with a warning
+  naming what was seen — explaining the feature in a mail must not make it
+  unsendable.
+- **Reading back an own draft no longer trips `body_parts_diverge`.** The
+  plain part's `[alt]` placeholders sit in the HTML only inside `alt`
+  attributes, which the text extraction discarded — the exact
+  hidden-extra-text signature the divergence heuristic flags. `strip_html`
+  now keeps `<img>` alt texts as text (they are what a reader sees with
+  images blocked), which also makes the heuristic fairer to incoming mail
+  with meaningful alt texts. The extraction is quote-aware: a `>` inside a
+  quoted attribute value (`alt="Umsatz > Vorjahr"` — legal HTML) no longer
+  truncates the tag, losing the alt and leaking the attribute tail into
+  the body text, and an `alt=` lookalike inside another attribute's quoted
+  value (`data-caption="… alt='x' …"`) is no longer mistaken for the real
+  alt. Documented trade-off: counting alt text as visible gives a sender
+  one more place to mirror plain-part text where an HTML reader will not
+  see it (an alt behind an always-loading inline image) — one of several
+  evasions the heuristic already cannot catch, now listed in the README's
+  prompt-injection section.
+- **Attachment objects with unknown fields are rejected by name.** The
+  untagged deserialization ignored unknown fields, so a typo like
+  `"inlin": true` silently degraded the entry to a regular attachment; a
+  wrong type produced only "data did not match any variant". Both now fail
+  with the field name respectively the accepted shapes, and the parameter's
+  JSON schema is kept `$ref`-free for strict client-side validators.
+- **Inline type and size checks run before the file is read.** A PDF marked
+  inline, or an oversized file, was read fully into memory (up to 50 MiB —
+  or unbounded for the oversize check itself) only to be rejected; the
+  extension-based type check and a metadata size precheck now fire first,
+  with the post-read check kept authoritative.
+- **`move_email`, `delete_email` and `delete_draft` report only UIDs that
+  actually existed.** All three echoed the input list as `succeeded` — but
+  IMAP UID commands silently ignore nonexistent UIDs, so a stale UID
+  (rotated UIDVALIDITY, externally expunged, typo) was reported as moved or
+  deleted when nothing happened. The confirmation source is a `UID SEARCH`
+  up front, not the STORE acknowledgements an intermediate version used:
+  RFC 3501 only SHOULDs the untagged FETCH and RFC 7162 explicitly allows
+  omitting it for a no-op change (a message another client already flagged
+  `\Deleted`), so acknowledgement-based reporting could under-report a
+  fully processed message — and an under-reported move invites the retry
+  that duplicates it. Existence-before-action cannot under-report;
+  `mark_as_read` keeps its acknowledgement-based reply, whose "actually
+  updated" meaning is documented and where a retry is harmless. Side
+  effect: replacing an already-gone draft via `replaces_uid` now correctly
+  returns `replace_warning` instead of a false `replaced_uid`. An
+  integration test pins the parallel-client shape: a pre-flagged message
+  that moves is reported, a stale UID is not.
+- **The Outlook 365 non-ASCII `text` fallback matches the full body.** The
+  diverted terms were checked against the 200-character snippet, silently
+  dropping every mail whose term appeared later — undocumented false
+  negatives in exactly the searches the fallback exists for. Full-text
+  criteria now travel into the IMAP client and run against each fetched
+  message's subject, addressing headers and complete `body_text` before it
+  is cut down to the snippet — RFC 3501's `TEXT` matches header OR body, so
+  a body-only fallback would still have dropped mails carrying the term
+  only in their subject.
+  `matched` stays the server-side count and therefore an upper bound, as
+  documented. (Known remaining gap, deliberate: a non-ASCII `to` fallback
+  still sees only the 3-recipient summary preview — IDN mailbox names are
+  rare enough that the extra plumbing isn't warranted.)
+- **The all-folder search docs described a skip that never existed.** README
+  and tool description claimed Gmail's `[Gmail]/All Mail` mirror "is
+  skipped to avoid duplicates"; the code searches every folder and
+  deduplicates by Message-ID afterwards. The code is the correct side: an
+  actual skip would lose archived mail, which exists *only* in All Mail.
+  The docs now say what happens (and why `matched` counts per folder).
+- `draft_email` and `draft_forward` echo the sanitized recipients and
+  subject — the values actually written to the headers — instead of the
+  raw input: a request smuggling `\r\nBcc:` into an address had the
+  injection stripped from the saved draft but reflected verbatim in the
+  response. `draft_email` also routes its recipients through the same
+  `clean_recipients` helper as the other flows, and the attachments list
+  is capped at 100 entries (the byte caps alone allowed thousands of
+  one-byte files).
+- **`rust-version = "1.91"` declared in Cargo.toml.** The crate uses APIs
+  stabilized in recent releases (`File::lock`, `Duration::from_mins`,
+  `str::floor_char_boundary`); an older toolchain previously failed with
+  bare E0658 compiler errors instead of cargo's one-line version message.
+  Determined empirically: 1.91 compiles, 1.90 does not. The flake pins
+  latest stable and is unaffected.
+- The `draft_*` tool descriptions now document the object attachment form,
+  the `inline_warning` field, and the revision caveat that `get_email`
+  returns `[alt]` placeholders — markers and inline attachments must be
+  re-supplied when revising via `replaces_uid`, otherwise images degrade to
+  regular attachments.
 
 - **Claude Code refused every tool of this server** with
   `Failed to fetch tools: Invalid result for tools/list` naming two missing
@@ -33,6 +290,15 @@ the MCP tool surface and the config format are the public API.
   tokio 1.53.1, rustls 0.23.43, mail-parser 0.11.6 and schemars 1.2.2. No
   major version is outstanding.
 
+261 unit tests (up from 240), the 16 GreenMail integration tests — now also
+proving over the wire that a stale UID mixed into a move or delete is absent
+from `succeeded`, that re-deleting a gone draft returns empty, and that the
+body filter matches full bodies on a real server — and a live
+`initialize` + `tools/list` + `draft_email` exchange under protocol
+`2026-07-28` — including a stored-draft MIME inspection — verified alongside.
+The handshake replay is also what caught the `$ref` reappearing in the
+*served* schema after a unit test on the bare type had passed.
+
 ## 1.6.0
 
 ### Added
@@ -41,9 +307,11 @@ the MCP tool surface and the config format are the public API.
   instead of a path: `{"path": "…", "inline": true, "cid": "shot"}`. Reference
   it from the body as `![alt](cid:shot)` and the image renders at that exact
   spot instead of dangling at the end of the mail. `cid` is optional and
-  defaults to the file name without extension; setting it implies `inline`.
-  Bare path strings keep their meaning, and both spellings mix in one array,
-  so existing callers are unaffected.
+  defaults to a slug of the file name — extension dropped, characters outside
+  letters/digits/`.`/`_`/`-` collapsed to `-` (`Rollen und Rechte.png` →
+  `Rollen-und-Rechte`); setting it implies `inline`. Bare path strings keep
+  their meaning, and both spellings mix in one array, so existing callers are
+  unaffected.
 
   The MIME tree follows RFC 2387: inline parts go into a `multipart/related`
   beside the HTML that references them, regular attachments stay outside it in

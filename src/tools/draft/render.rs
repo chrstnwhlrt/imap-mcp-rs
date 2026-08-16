@@ -171,10 +171,7 @@ pub(super) fn build_reply_bodies(
     );
     let html_body = wrap_html_document(&format!(
         "{body}{sig}{appendonsend}{metablock}",
-        body = body_div(
-            &apply_cid_markers_html(&html_escape(user_body), inline),
-            locale
-        ),
+        body = body_div(&render_body_html(user_body, inline), locale),
         sig = signature_block(&signatures.html, locale),
         appendonsend = APPEND_ON_SEND,
     ));
@@ -220,7 +217,7 @@ pub(super) fn build_forward_bodies(
         locale,
     );
     let body_html_content = match user_body {
-        Some(msg) if !msg.is_empty() => apply_cid_markers_html(&html_escape(msg), inline),
+        Some(msg) if !msg.is_empty() => render_body_html(msg, inline),
         _ => "<br>".to_string(),
     };
     let html_body = wrap_html_document(&format!(
@@ -244,7 +241,7 @@ pub(super) fn build_compose_bodies(
     let plain_body = signatures.apply_plain(&apply_cid_markers_plain(body, inline));
     let html_body = wrap_html_document(&format!(
         "{body}{sig}",
-        body = body_div(&apply_cid_markers_html(&html_escape(body), inline), locale),
+        body = body_div(&render_body_html(body, inline), locale),
         sig = signature_block(&signatures.html, locale),
     ));
     (plain_body, html_body)
@@ -523,32 +520,34 @@ fn format_recipients(addrs: &[EmailAddress]) -> String {
         .join("; ")
 }
 
-/// Format an ISO 8601 date string into Outlook-style human-readable format.
-/// EN: "Tuesday, March 24, 2026 1:56:47 PM" (12h with seconds, uppercase)
+/// Format a date for the Outlook-style quote header, in the READER's (this
+/// machine's) timezone — desktop clients render the quoted mail's time in
+/// the local zone, not the sender's. The input is the UTC-normalized `date`
+/// (offset forms parse too); unparseable input is returned verbatim, since
+/// wrong-looking beats absent.
+/// EN: "Tuesday, March 24, 2026 1:56:47 PM" (12h with seconds)
 /// DE: "Dienstag, 24. März 2026 13:56" (24h, no seconds)
 fn format_date_outlook(iso: Option<&str>, locale: Locale) -> String {
+    format_date_outlook_in(iso, locale, &jiff::tz::TimeZone::system())
+}
+
+/// [`format_date_outlook`] with an explicit zone, so tests are not hostage
+/// to the machine's timezone.
+fn format_date_outlook_in(iso: Option<&str>, locale: Locale, tz: &jiff::tz::TimeZone) -> String {
     let Some(iso) = iso else {
         return locale.unknown_date().to_string();
     };
-    if iso.len() < 16 {
+    let norm = iso
+        .strip_suffix('Z')
+        .map_or_else(|| iso.to_string(), |stem| format!("{stem}+00:00"));
+    let Ok(ts) = jiff::Timestamp::strptime("%Y-%m-%dT%H:%M:%S%:z", &norm) else {
         return iso.to_string();
-    }
-    let year: i32 = iso[0..4].parse().unwrap_or(0);
-    let month: u32 = iso[5..7].parse().unwrap_or(0);
-    let day: u32 = iso[8..10].parse().unwrap_or(0);
-    let hour: u32 = iso[11..13].parse().unwrap_or(0);
-    let minute = &iso[14..16];
-    let second = if iso.len() >= 19 { &iso[17..19] } else { "00" };
-
-    // `mail-parser` can store `DateTime.month == 0` when it fails to parse the
-    // `Date:` header, which `format_datetime` then emits as `"...00-..."` in
-    // `iso`. Downstream `weekday_index` and `MONTHS.get(month-1)` would then
-    // panic / wrap. Return the raw ISO so the user at least sees SOMETHING
-    // instead of crashing the whole MCP runtime.
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
-        return iso.to_string();
-    }
-
+    };
+    let z = ts.to_zoned(tz.clone());
+    let year = i32::from(z.year());
+    let month = u32::try_from(z.month()).unwrap_or(1);
+    let day = u32::try_from(z.day()).unwrap_or(1);
+    let (hour, minute, second) = (z.hour(), z.minute(), z.second());
     let weekday_idx = weekday_index(year, month, day);
 
     match locale {
@@ -576,7 +575,7 @@ fn format_date_outlook(iso: Option<&str>, locale: Locale) -> String {
                 "Friday",
                 "Saturday",
             ];
-            let month_name = MONTHS.get(month.wrapping_sub(1) as usize).unwrap_or(&"???");
+            let month_name = MONTHS[(month - 1) as usize];
             let weekday = WEEKDAYS[weekday_idx];
             let (h12, ampm) = match hour {
                 0 => (12, "AM"),
@@ -584,7 +583,7 @@ fn format_date_outlook(iso: Option<&str>, locale: Locale) -> String {
                 12 => (12, "PM"),
                 _ => (hour - 12, "PM"),
             };
-            format!("{weekday}, {month_name} {day}, {year} {h12}:{minute}:{second} {ampm}")
+            format!("{weekday}, {month_name} {day}, {year} {h12}:{minute:02}:{second:02} {ampm}")
         }
         Locale::De => {
             const MONTHS: [&str; 12] = [
@@ -610,10 +609,9 @@ fn format_date_outlook(iso: Option<&str>, locale: Locale) -> String {
                 "Freitag",
                 "Samstag",
             ];
-            let month_name = MONTHS.get(month.wrapping_sub(1) as usize).unwrap_or(&"???");
+            let month_name = MONTHS[(month - 1) as usize];
             let weekday = WEEKDAYS[weekday_idx];
-            // German: 24h, no seconds, "Dienstag, 24. März 2026 13:56"
-            format!("{weekday}, {day}. {month_name} {year} {hour:02}:{minute}")
+            format!("{weekday}, {day}. {month_name} {year} {hour:02}:{minute:02}")
         }
     }
 }
@@ -640,7 +638,12 @@ fn weekday_index(year: i32, month: u32, day: u32) -> usize {
 
 /// An inline image the body may reference as `![alt](cid:<id>)`.
 pub(super) struct InlineRef<'a> {
+    /// The id as it appears in body markers — the user-facing handle.
     pub cid: &'a str,
+    /// The globally unique value written into the part's `Content-ID` header
+    /// and the `src="cid:…"` referencing it. See `read_attachments` for why
+    /// this differs from `cid`.
+    pub content_id: &'a str,
     pub filename: &'a str,
 }
 
@@ -652,20 +655,99 @@ struct CidMarker {
     cid: String,
 }
 
+/// Longest accepted id inside a `(cid:<id>)` marker. Real ids are short
+/// file-name stems; anything longer is prose that happens to contain the
+/// delimiters. The cap also bounds the per-candidate validation work.
+pub(super) const MAX_MARKER_CID_BYTES: usize = 128;
+
+/// Longest accepted alt text, which must also stay on one line. An alt is a
+/// one-phrase description; without the bound, a stray `![` in prose followed
+/// much later by `](cid:<id>)` would swallow everything in between into an
+/// `alt` attribute — whole paragraphs silently vanishing from the visible
+/// HTML body.
+pub(super) const MAX_MARKER_ALT_BYTES: usize = 300;
+
+/// Forward-only cached byte finder: `at_or_after(from)` returns the first
+/// position at or past `from` holding one of `needles`.
+///
+/// Queries must arrive with non-decreasing `from`; the cache then never
+/// re-reads a byte, so all lookups over one scan cost O(n) *together*. This
+/// is what keeps [`scan_cid_markers`] linear on adversarial input: a body of
+/// repeated `![` sharing one distant `]` made the previous per-candidate
+/// `find` rescan the same span every time — O(n²), minutes of CPU inside the
+/// 10 MiB body cap, on the async worker thread.
+struct NextByte<'a> {
+    haystack: &'a [u8],
+    needles: &'static [u8],
+    cached: NextByteCache,
+}
+
+/// Search state of a [`NextByte`]. `Exhausted` is final: `from` only grows,
+/// so once a search ran off the end no later query can hit either.
+enum NextByteCache {
+    Unqueried,
+    Exhausted,
+    /// Hit at this position — valid for every `from <= position`.
+    Hit(usize),
+}
+
+impl<'a> NextByte<'a> {
+    const fn new(haystack: &'a [u8], needles: &'static [u8]) -> Self {
+        Self {
+            haystack,
+            needles,
+            cached: NextByteCache::Unqueried,
+        }
+    }
+
+    fn at_or_after(&mut self, from: usize) -> Option<usize> {
+        match self.cached {
+            NextByteCache::Exhausted => None,
+            NextByteCache::Hit(p) if p >= from => Some(p),
+            NextByteCache::Unqueried | NextByteCache::Hit(_) => {
+                let start = from.min(self.haystack.len());
+                let found = self.haystack[start..]
+                    .iter()
+                    .position(|b| self.needles.contains(b))
+                    .map(|i| start + i);
+                self.cached = found.map_or(NextByteCache::Exhausted, NextByteCache::Hit);
+                found
+            }
+        }
+    }
+}
+
+/// Middle delimiter of a marker. Shared between the scanner and the stray-
+/// fragment detection in [`inspect_markers`] — as two literals, a grammar
+/// change touching one but not the other would silently stop flagging
+/// malformed markers.
+const MID: &str = "](cid:";
+
 /// Scan a body for `![alt](cid:<id>)` markers.
 ///
 /// Hand-rolled rather than regex-based: the grammar is three fixed delimiters
-/// and the crate carries no regex dependency. Deliberately strict — an id may
-/// not be empty and may not contain whitespace, `<`, `>` or `)`. That way a
-/// stray `![](cid:` in prose cannot swallow the rest of the message, and an id
-/// can never break out of the `src="cid:…"` attribute it lands in.
+/// and the crate carries no regex dependency. Deliberately strict:
 ///
-/// Runs identically on the raw body and on the HTML-escaped one: escaping
-/// rewrites `& < > "` and newlines, none of which appear in the delimiters or
-/// in a valid id.
+/// - The id must satisfy [`super::is_valid_cid`] — the exact rule an
+///   attachment's `cid` is held to (alphabet, length, dot placement), so the
+///   scanner can never accept a reference no attachment could carry. The
+///   accepted characters are also invariant under [`html_escape`], which
+///   closes the gap where validation (on the raw body) and rendering
+///   (previously on the escaped one) could disagree about what is a marker.
+/// - The alt text must stay on one line and within
+///   [`MAX_MARKER_ALT_BYTES`] — see there.
+///
+/// Candidates the grammar rejects stay ordinary text for *this* function;
+/// [`inspect_markers`] reports them so validation can refuse (or warn)
+/// loudly instead of saving a draft with visible marker source.
 fn scan_cid_markers(body: &str) -> Vec<CidMarker> {
     const OPEN: &str = "![";
-    const MID: &str = "](cid:";
+
+    let bytes = body.as_bytes();
+    // All positions these return are ASCII bytes, hence char boundaries.
+    let mut next_rbracket = NextByte::new(bytes, b"]");
+    let mut next_paren = NextByte::new(bytes, b")");
+    let mut next_newline = NextByte::new(bytes, b"\r\n");
 
     let mut out = Vec::new();
     let mut cursor = 0usize;
@@ -676,10 +758,20 @@ fn scan_cid_markers(body: &str) -> Vec<CidMarker> {
 
         // Alt text runs to the first `]`. No `]` left at all means no further
         // marker can complete either, so stop rather than rescan.
-        let Some(alt_rel) = body[alt_start..].find(']') else {
+        let Some(alt_end) = next_rbracket.at_or_after(alt_start) else {
             break;
         };
-        let alt_end = alt_start + alt_rel;
+
+        // Oversized or multi-line alt: prose, not a marker. Resume right
+        // after the opener (see the id branch below for why not further).
+        if alt_end - alt_start > MAX_MARKER_ALT_BYTES
+            || next_newline
+                .at_or_after(alt_start)
+                .is_some_and(|nl| nl < alt_end)
+        {
+            cursor = alt_start;
+            continue;
+        }
 
         if !body[alt_end..].starts_with(MID) {
             // `![…]` without the `(cid:` tail — ordinary text. Resume after the
@@ -689,17 +781,14 @@ fn scan_cid_markers(body: &str) -> Vec<CidMarker> {
         }
 
         let id_start = alt_end + MID.len();
-        let Some(id_rel) = body[id_start..].find(')') else {
+        let Some(id_end) = next_paren.at_or_after(id_start) else {
             break;
         };
-        let id_end = id_start + id_rel;
         let id = &body[id_start..id_end];
 
-        if id.is_empty()
-            || id
-                .chars()
-                .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | '"'))
-        {
+        // `is_valid_cid` checks length before content, so a slice reaching a
+        // `)` far down the mail costs O(1), not a scan of everything between.
+        if !super::is_valid_cid(id) {
             // Resume right after this opener, NOT after the `)` that ended the
             // candidate: an unterminated `![](cid:` in prose reaches forward to
             // the next `)` anywhere in the mail, and skipping that far would
@@ -721,60 +810,124 @@ fn scan_cid_markers(body: &str) -> Vec<CidMarker> {
     out
 }
 
-/// The content ids the body references, in order of first appearance and
-/// without duplicates. Used by the caller to verify that every marker has a
-/// matching inline attachment before a draft is built.
-pub(super) fn collect_cid_markers(body: &str) -> Vec<String> {
-    let mut seen = Vec::new();
-    for marker in scan_cid_markers(body) {
-        if !seen.contains(&marker.cid) {
-            seen.push(marker.cid);
-        }
-    }
-    seen
+/// Everything validation needs to know about a body's markers, from ONE scan.
+pub(super) struct MarkerInspection {
+    /// The referenced ids, in order of first appearance, deduplicated.
+    pub unique_ids: Vec<String>,
+    /// The (capped) line around the first `](cid:` occurrence that is not
+    /// part of any accepted marker, when one exists.
+    pub stray_fragment: Option<String>,
 }
 
-/// Replace markers with `<img src="cid:…">` tags.
+/// Inspect a body's markers for validation: collect the referenced ids and
+/// detect malformed marker attempts.
 ///
-/// The input must ALREADY be HTML-escaped — the alt text is copied through
-/// verbatim into the attribute, so escaping has to happen before this runs,
-/// never after (afterwards would escape the generated tag itself).
+/// The scanner's grammar is strict, and a rejected candidate simply stays
+/// text. For a caller that *meant* to place an image — an id with spaces, an
+/// alt spanning lines — that silence is the worst outcome: the draft would
+/// be saved showing raw marker source, with nothing pointing at the cause.
+/// The `](cid:` sequence does not occur in prose, so surfacing a stray one
+/// makes every malformed marker loud.
+///
+/// Complexity notes, both learned the hard way in review:
+/// - id dedup goes through a `HashSet`; a `Vec::contains` walk was O(u²) in
+///   distinct ids and reachable with zero attachments.
+/// - the stray check walks occurrences and markers with two pointers —
+///   both are position-sorted, so it is O(n). Re-testing every occurrence
+///   against the whole marker list was O(k²): ~7 minutes of blocking CPU
+///   for a 10 MiB body of repeated valid markers, on the SUCCESS path.
+pub(super) fn inspect_markers(body: &str) -> MarkerInspection {
+    use std::collections::HashSet;
+
+    let markers = scan_cid_markers(body);
+
+    let mut seen: HashSet<&str> = HashSet::with_capacity(markers.len().min(64));
+    let mut unique_ids = Vec::new();
+    for marker in &markers {
+        if seen.insert(&marker.cid) {
+            unique_ids.push(marker.cid.clone());
+        }
+    }
+
+    let mut stray_fragment = None;
+    let mut from = 0usize;
+    let mut mi = 0usize; // markers are position-sorted; advances only forward
+    while let Some(rel) = body[from..].find(MID) {
+        let pos = from + rel;
+        while mi < markers.len() && markers[mi].end <= pos {
+            mi += 1;
+        }
+        let inside = mi < markers.len() && pos >= markers[mi].start;
+        if !inside {
+            let line_start = body[..pos].rfind(['\n', '\r']).map_or(0, |i| i + 1);
+            let line_end = body[pos..]
+                .find(['\n', '\r'])
+                .map_or(body.len(), |i| pos + i);
+            stray_fragment = Some(body[line_start..line_end].chars().take(120).collect());
+            break;
+        }
+        from = pos + MID.len();
+    }
+
+    MarkerInspection {
+        unique_ids,
+        stray_fragment,
+    }
+}
+
+/// Render a raw body to HTML: replace markers with `<img src="cid:…">` tags
+/// and HTML-escape everything around them.
+///
+/// Scans the RAW body — the same text the caller validated markers on — and
+/// escapes the segments between markers afterwards. Scanning an
+/// already-escaped body instead (the previous design) let the two passes see
+/// different marker sets whenever escaping rewrote a character the grammar
+/// cares about, and a marker only one side accepted was either silently
+/// dropped or saved as visible source text. One scan, one truth.
 ///
 /// `max-width` keeps a phone screenshot from blowing up the mail layout;
 /// `alt` falls back to the file name so the image still announces itself in
-/// clients that block remote content or in screen readers.
-pub(super) fn apply_cid_markers_html(escaped: &str, refs: &[InlineRef]) -> String {
-    let markers = scan_cid_markers(escaped);
+/// clients that block remote content or in screen readers. The alt text is
+/// single-line by grammar, so escaping it can never introduce a `<br>` into
+/// the attribute. `src` carries the part's globally unique Content-ID, not
+/// the user-facing marker id — see `read_attachments`.
+pub(super) fn render_body_html(raw: &str, refs: &[InlineRef]) -> String {
+    let markers = scan_cid_markers(raw);
     if markers.is_empty() {
-        return escaped.to_string();
+        return html_escape(raw);
     }
+    // Map lookup, not a linear `find` per marker: repeated markers are
+    // unbounded (the same image may legitimately appear many times), and
+    // markers × refs comparisons would grow quadratic-ish with them.
+    let by_cid: std::collections::HashMap<&str, &InlineRef> =
+        refs.iter().map(|r| (r.cid, r)).collect();
 
-    let mut out = String::with_capacity(escaped.len() + markers.len() * 64);
+    let mut out = String::with_capacity(raw.len() + markers.len() * 64);
     let mut last = 0usize;
     for marker in markers {
-        let Some(found) = refs.iter().find(|r| r.cid == marker.cid) else {
+        let Some(found) = by_cid.get(marker.cid.as_str()) else {
             // Unknown id: leave the marker untouched. The caller rejects this
             // case up front; keeping the text verbatim here means a future
             // caller that skips validation degrades to visible text rather
             // than to a broken image icon.
             continue;
         };
-        out.push_str(&escaped[last..marker.start]);
+        out.push_str(&html_escape(&raw[last..marker.start]));
         let alt = if marker.alt.is_empty() {
-            html_escape(found.filename)
+            found.filename
         } else {
-            marker.alt.clone()
+            marker.alt.as_str()
         };
         // Built by pushes rather than `format!` into the buffer: the tag is
         // assembled once per image and this avoids the intermediate String.
         out.push_str("<img src=\"cid:");
-        out.push_str(found.cid);
+        out.push_str(&html_escape(found.content_id));
         out.push_str("\" alt=\"");
-        out.push_str(&alt);
+        out.push_str(&html_escape(alt));
         out.push_str("\" style=\"max-width:100%; height:auto;\">");
         last = marker.end;
     }
-    out.push_str(&escaped[last..]);
+    out.push_str(&html_escape(&raw[last..]));
     out
 }
 
@@ -786,11 +939,14 @@ pub(super) fn apply_cid_markers_plain(body: &str, refs: &[InlineRef]) -> String 
     if markers.is_empty() {
         return body.to_string();
     }
+    // See render_body_html for why this is a map, not a per-marker `find`.
+    let by_cid: std::collections::HashMap<&str, &InlineRef> =
+        refs.iter().map(|r| (r.cid, r)).collect();
 
     let mut out = String::with_capacity(body.len());
     let mut last = 0usize;
     for marker in markers {
-        let Some(found) = refs.iter().find(|r| r.cid == marker.cid) else {
+        let Some(found) = by_cid.get(marker.cid.as_str()) else {
             continue;
         };
         out.push_str(&body[last..marker.start]);
@@ -881,18 +1037,55 @@ mod tests {
         assert_eq!(format_date_outlook(None, Locale::De), "unbekanntes Datum");
     }
 
+    /// Fixed +02:00 — Berlin summer time as a constant offset, so the tests
+    /// need no IANA tzdb (the Nix build sandbox has none).
+    fn cest() -> jiff::tz::TimeZone {
+        jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(2))
+    }
+
     #[test]
     fn format_date_outlook_known_iso_en() {
-        let r = format_date_outlook(Some("2026-04-19T13:30:45Z"), Locale::En);
-        assert!(r.starts_with("Sunday, April 19, 2026"));
-        assert!(r.contains("1:30:45 PM"));
+        let r = format_date_outlook_in(
+            Some("2026-04-19T13:30:45Z"),
+            Locale::En,
+            &jiff::tz::TimeZone::UTC,
+        );
+        assert!(r.starts_with("Sunday, April 19, 2026"), "{r}");
+        assert!(r.contains("1:30:45 PM"), "{r}");
     }
 
     #[test]
     fn format_date_outlook_known_iso_de() {
-        let r = format_date_outlook(Some("2026-04-19T13:30:45Z"), Locale::De);
-        assert!(r.starts_with("Sonntag, 19. April 2026"));
-        assert!(r.contains("13:30"));
+        let r = format_date_outlook_in(
+            Some("2026-04-19T13:30:45Z"),
+            Locale::De,
+            &jiff::tz::TimeZone::UTC,
+        );
+        assert!(r.starts_with("Sonntag, 19. April 2026"), "{r}");
+        assert!(r.contains("13:30"), "{r}");
+    }
+
+    /// The quote header shows the reader's clock, the way desktop clients
+    /// render it — a UTC instant appears as local wall time, and an instant
+    /// late in the UTC day rolls into the reader's next calendar day.
+    #[test]
+    fn format_date_outlook_renders_in_the_readers_zone() {
+        let reader = cest();
+        let r = format_date_outlook_in(Some("2026-04-19T13:30:45Z"), Locale::De, &reader);
+        assert!(r.contains("15:30"), "reader zone is UTC+2: {r}");
+
+        // 23:30Z on the 19th is already the 20th at +02:00 — day AND
+        // weekday must roll, not just the hour.
+        let r = format_date_outlook_in(Some("2026-04-19T23:30:00Z"), Locale::De, &reader);
+        assert!(r.starts_with("Montag, 20. April 2026"), "{r}");
+
+        // Sender-offset forms (date_original era inputs) parse too.
+        let r = format_date_outlook_in(
+            Some("2026-04-19T13:30:45+02:00"),
+            Locale::De,
+            &jiff::tz::TimeZone::UTC,
+        );
+        assert!(r.contains("11:30"), "{r}");
     }
 
     #[test]
@@ -1024,6 +1217,7 @@ mod tests {
             cc: vec![],
             subject: "Hello".to_string(),
             date: Some("2026-07-30T21:18:00+02:00".to_string()),
+            date_original: None,
             message_id: None,
             in_reply_to: None,
             references: vec![],
@@ -1040,7 +1234,11 @@ mod tests {
         // Outlook text part: body, signature, blank line, Von/Gesendet/An/
         // Betreff block, blank line, unprefixed original text.
         assert!(plain.starts_with("my reply\n-- \nSig line\n\nVon: Alice <alice@example.com>\n"));
-        assert!(plain.contains("\nGesendet: Donnerstag, 30. Juli 2026 21:18\n"));
+        // The exact wall time depends on the machine's zone (that is the
+        // point — the reader's clock); format correctness is pinned by the
+        // fixed-zone tests above. Here: formatted, not passed through raw.
+        assert!(plain.contains(". Juli 2026 "), "{plain}");
+        assert!(!plain.contains("2026-07-30T"), "raw ISO leaked: {plain}");
         assert!(plain.contains("\nAn: me@example.com <me@example.com>\n"));
         assert!(plain.contains("\nBetreff: Hello\n\noriginal text"));
         assert!(!plain.contains("> original"), "no > prefixes: {plain}");
@@ -1051,6 +1249,27 @@ mod tests {
 
     // ===== inline image markers =====
 
+    /// Test shims over [`inspect_markers`], keeping the assertions phrased
+    /// in terms of the two questions it answers.
+    fn collect_cid_markers(body: &str) -> Vec<String> {
+        inspect_markers(body).unique_ids
+    }
+    fn find_unparsed_cid_fragment(body: &str) -> Option<String> {
+        inspect_markers(body).stray_fragment
+    }
+
+    /// Test refs with a fixed, recognizable wire id per marker id.
+    fn make_ref(cid: &'static str, filename: &'static str) -> InlineRef<'static> {
+        // Leak is fine in tests; keeps InlineRef borrowing simple.
+        let content_id: &'static str =
+            Box::leak(format!("{cid}.fixed0@unit.invalid").into_boxed_str());
+        InlineRef {
+            cid,
+            content_id,
+            filename,
+        }
+    }
+
     #[test]
     fn cid_markers_are_collected_in_order_without_duplicates() {
         let body = "one ![](cid:a) two ![alt](cid:b) three ![](cid:a)";
@@ -1059,20 +1278,49 @@ mod tests {
 
     #[test]
     fn cid_marker_scan_rejects_malformed_ids() {
-        // Empty id, whitespace, angle brackets and quotes would all let an id
-        // break out of `src="cid:…"`, so none of them may parse.
+        // The id alphabet is exactly what an attachment's `cid` may carry
+        // (letters, digits, `.`, `_`, `-`): nothing else can ever resolve,
+        // and every accepted id is invariant under HTML escaping.
+        let long_id = format!("![](cid:{})", "a".repeat(MAX_MARKER_CID_BYTES + 1));
         for body in [
             "![](cid:)",
             "![](cid:a b)",
             "![](cid:a<b)",
             "![](cid:a>b)",
             "![](cid:a\"b)",
+            "![](cid:a&b)",
+            "![](cid:a/b)",
+            // Dot-atom rules, shared with attachment cids: an id the
+            // Content-ID local part cannot legally carry never parses.
+            "![](cid:.a)",
+            "![](cid:a.)",
+            "![](cid:a..b)",
+            long_id.as_str(),
         ] {
             assert!(
                 collect_cid_markers(body).is_empty(),
                 "should not parse as a marker: {body}"
             );
         }
+        // At the cap it still parses.
+        let max_id = "a".repeat(MAX_MARKER_CID_BYTES);
+        assert_eq!(
+            collect_cid_markers(&format!("![](cid:{max_id})")),
+            vec![max_id]
+        );
+    }
+
+    #[test]
+    fn cid_marker_alt_must_stay_on_one_line_and_bounded() {
+        // A `![` in prose followed paragraphs later by `](cid:x)` must not
+        // swallow the text in between into an alt attribute.
+        assert!(collect_cid_markers("Na toll![\nZeile zwei](cid:x)").is_empty());
+        assert!(collect_cid_markers("a![\r\nb](cid:x)").is_empty());
+        let oversized = format!("![{}](cid:x)", "a".repeat(MAX_MARKER_ALT_BYTES + 1));
+        assert!(collect_cid_markers(&oversized).is_empty());
+        // At the cap, and with arbitrary single-line prose, it parses.
+        let max_alt = format!("![{}](cid:x)", "ä".repeat(MAX_MARKER_ALT_BYTES / 2));
+        assert_eq!(collect_cid_markers(&max_alt), vec!["x"]);
     }
 
     #[test]
@@ -1087,22 +1335,84 @@ mod tests {
         assert_eq!(collect_cid_markers(body), vec!["real"]);
     }
 
+    /// Adversarial-shape regression: many openers sharing one distant `]`
+    /// made the scan quadratic before the forward-cached byte finder. At
+    /// O(n²) this input costs ~10¹⁰ steps and times the test out; linear, it
+    /// finishes in microseconds.
     #[test]
-    fn markers_survive_html_escaping_unchanged() {
-        // The HTML pass runs on escaped text, so escaping must not disturb the
-        // delimiters — otherwise the marker would never be found there.
-        let escaped = html_escape("text ![](cid:shot) more");
-        assert_eq!(collect_cid_markers(&escaped), vec!["shot"]);
+    fn cid_marker_scan_stays_linear_on_pathological_input() {
+        let mut body = "![".repeat(100_000);
+        body.push_str("end ] and one real ![x](cid:ok)");
+        assert_eq!(collect_cid_markers(&body), vec!["ok"]);
+
+        // Same shape for the `)` lookup: many complete-looking prefixes, one
+        // far parenthesis.
+        let mut body = "![a](cid:x ".repeat(50_000);
+        body.push(')');
+        assert!(collect_cid_markers(&body).is_empty());
+    }
+
+    /// The SECOND pair of quadratics, found in review after the first was
+    /// fixed: (a) the stray-fragment check re-tested every `](cid:`
+    /// occurrence against the whole marker list — O(k²) on the SUCCESS path
+    /// of a body with many repeated valid markers (~7 min CPU at 10 MiB);
+    /// (b) id dedup via `Vec::contains` was O(u²) in distinct ids, reachable
+    /// with zero attachments. Both shapes at this size finish in
+    /// milliseconds linear and would time the test out quadratic.
+    #[test]
+    fn marker_inspection_stays_linear_on_repeated_and_distinct_markers() {
+        // (a) 150k repetitions of one valid marker: two-pointer walk.
+        let repeated = "![](cid:a)".repeat(150_000);
+        let inspection = inspect_markers(&repeated);
+        assert_eq!(inspection.unique_ids, vec!["a"]);
+        assert!(inspection.stray_fragment.is_none());
+
+        // (b) 100k distinct ids: HashSet dedup.
+        let mut distinct = String::with_capacity(2_400_000);
+        for i in 0..100_000 {
+            use std::fmt::Write;
+            let _ = write!(distinct, "![](cid:id{i})");
+        }
+        let inspection = inspect_markers(&distinct);
+        assert_eq!(inspection.unique_ids.len(), 100_000);
+        assert!(inspection.stray_fragment.is_none());
+
+        // Two-pointer correctness at the edge: a stray AFTER many valid
+        // markers is still found.
+        let mut tail_stray = "![](cid:a)".repeat(1_000);
+        tail_stray.push_str(" ![x](cid:bad id)");
+        assert!(inspect_markers(&tail_stray).stray_fragment.is_some());
     }
 
     #[test]
-    fn html_marker_becomes_img_tag_with_filename_alt() {
-        let refs = [InlineRef {
-            cid: "shot",
-            filename: "screenshot.png",
-        }];
-        let out = apply_cid_markers_html(&html_escape("before ![](cid:shot) after"), &refs);
-        assert!(out.contains("<img src=\"cid:shot\""), "{out}");
+    fn find_unparsed_cid_fragment_reports_rejected_candidates() {
+        // Space in the id — the README's screenshot-name trap.
+        let frag = find_unparsed_cid_fragment("see ![x](cid:Bildschirmfoto 2026-08-14) here")
+            .expect("must be reported");
+        assert!(frag.contains("Bildschirmfoto"), "{frag}");
+
+        // Multi-line alt: rejected candidate, must be reported too.
+        assert!(find_unparsed_cid_fragment("a![\nb](cid:x)").is_some());
+
+        // A valid marker is not a stray fragment; neither is marker-free text.
+        assert!(find_unparsed_cid_fragment("ok ![x](cid:shot) done").is_none());
+        assert!(find_unparsed_cid_fragment("no markers at all").is_none());
+
+        // Valid marker plus a stray fragment: the stray is still found.
+        assert!(find_unparsed_cid_fragment("![x](cid:ok) and ![y](cid:bad id)").is_some());
+    }
+
+    #[test]
+    fn html_marker_becomes_img_tag_with_unique_content_id() {
+        let refs = [make_ref("shot", "screenshot.png")];
+        let out = render_body_html("before ![](cid:shot) after", &refs);
+        // src references the globally unique wire id, never the bare marker
+        // id — a bare `cid:shot` would repeat across drafts.
+        assert!(
+            out.contains("<img src=\"cid:shot.fixed0@unit.invalid\""),
+            "{out}"
+        );
+        assert!(!out.contains("src=\"cid:shot\""), "{out}");
         assert!(out.contains("alt=\"screenshot.png\""), "{out}");
         assert!(out.contains("max-width:100%"), "{out}");
         assert!(out.starts_with("before "), "{out}");
@@ -1110,24 +1420,21 @@ mod tests {
     }
 
     #[test]
-    fn html_marker_keeps_author_alt_text_escaped() {
-        let refs = [InlineRef {
-            cid: "x",
-            filename: "f.png",
-        }];
-        // The alt text is escaped by the earlier html_escape pass; the tag
-        // must carry that escaped form, never the raw one.
-        let out = apply_cid_markers_html(&html_escape("![a<b](cid:x)"), &refs);
-        assert!(out.contains("alt=\"a&lt;b\""), "{out}");
-        assert!(!out.contains("alt=\"a<b\""), "{out}");
+    fn html_rendering_escapes_text_and_alt_around_markers() {
+        let refs = [make_ref("x", "f.png")];
+        // The scan runs on the raw body; the surrounding text and the alt are
+        // escaped afterwards. Scanning escaped text instead let validation
+        // and rendering disagree about the marker set.
+        let out = render_body_html("a<b ![c<d](cid:x) e\"f", &refs);
+        assert!(out.starts_with("a&lt;b "), "{out}");
+        assert!(out.contains("alt=\"c&lt;d\""), "{out}");
+        assert!(out.ends_with(" e&quot;f"), "{out}");
+        assert!(!out.contains("alt=\"c<d\""), "{out}");
     }
 
     #[test]
     fn plain_marker_becomes_readable_placeholder() {
-        let refs = [InlineRef {
-            cid: "shot",
-            filename: "screenshot.png",
-        }];
+        let refs = [make_ref("shot", "screenshot.png")];
         assert_eq!(
             apply_cid_markers_plain("before ![](cid:shot) after", &refs),
             "before [screenshot.png] after"
@@ -1143,40 +1450,27 @@ mod tests {
     fn unknown_cid_is_left_verbatim_in_both_parts() {
         // Callers reject this case up front; if one ever forgets, degrading to
         // visible text beats shipping a broken image.
-        let refs = [InlineRef {
-            cid: "known",
-            filename: "k.png",
-        }];
+        let refs = [make_ref("known", "k.png")];
         assert_eq!(
             apply_cid_markers_plain("x ![](cid:other) y", &refs),
             "x ![](cid:other) y"
         );
-        assert!(apply_cid_markers_html("x ![](cid:other) y", &refs).contains("![](cid:other)"));
+        assert!(render_body_html("x ![](cid:other) y", &refs).contains("![](cid:other)"));
     }
 
     #[test]
-    fn bodies_without_markers_are_untouched() {
-        let refs = [InlineRef {
-            cid: "a",
-            filename: "a.png",
-        }];
+    fn bodies_without_markers_render_as_plain_escaped_text() {
+        let refs = [make_ref("a", "a.png")];
         let body = "just text, no markers at all";
         assert_eq!(apply_cid_markers_plain(body, &refs), body);
-        assert_eq!(apply_cid_markers_html(body, &refs), body);
+        assert_eq!(render_body_html(body, &refs), body);
+        // …and the no-marker path still escapes.
+        assert_eq!(render_body_html("a<b", &refs), "a&lt;b");
     }
 
     #[test]
     fn multiple_markers_all_replaced() {
-        let refs = [
-            InlineRef {
-                cid: "a",
-                filename: "a.png",
-            },
-            InlineRef {
-                cid: "b",
-                filename: "b.png",
-            },
-        ];
+        let refs = [make_ref("a", "a.png"), make_ref("b", "b.png")];
         let out = apply_cid_markers_plain("![](cid:a) middle ![](cid:b)", &refs);
         assert_eq!(out, "[a.png] middle [b.png]");
     }

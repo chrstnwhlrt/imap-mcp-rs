@@ -135,6 +135,42 @@ pub fn sanitize_log_str(s: &str) -> String {
     out
 }
 
+/// Whether retrying the same call later is sensible. Broader than
+/// [`is_connection_error`]: every dead-session error is retryable (the next
+/// call reconnects), and so are server-side transient states that leave the
+/// session alive — Dovecot's `[UNAVAILABLE]`/"Server Unavailable", mailbox
+/// `[INUSE]`, "try again". Feeds the `retryable` field every tool error
+/// carries: without it a caller cannot tell "folder doesn't exist" (never
+/// retry) from "temporarily unavailable" (retry) — field reports showed an
+/// unattended run skipping a folder for a day over exactly that.
+///
+/// Error text interpolates names the sender or the caller chose (folder
+/// names, attachment filenames), so the markers are full server phrases and
+/// RFC 5530 response codes, not bare words: a folder called "Temporary
+/// Projects" inside "Unknown Mailbox: …" must not read as transient — an
+/// unattended caller would retry a fact forever. The classification runs on
+/// the raw message, before [`clean_imap_error`] strips the `[CODE]` prefix,
+/// so the bracketed codes are reliably present.
+pub fn is_retryable_error(msg: &str) -> bool {
+    if is_connection_error(msg) {
+        return true;
+    }
+    let lower = msg.to_lowercase();
+    // RFC 5530 response codes, verbatim with brackets.
+    lower.contains("[unavailable]")
+        || lower.contains("[inuse]")
+        // Full server phrases (Dovecot, Office 365, Gmail wordings).
+        || lower.contains("server unavailable")
+        || lower.contains("service unavailable")
+        || lower.contains("temporarily")
+        || lower.contains("temporary error")
+        || lower.contains("temporary failure")
+        || lower.contains("temporary problem")
+        || lower.contains("mailbox is in use")
+        || lower.contains("try again")
+        || lower.contains("too many connections")
+}
+
 /// Heuristic to detect errors that mean the IMAP session is unusable and
 /// should be recycled via reconnect. This includes obvious transport errors
 /// (broken pipe, connection reset) but also cases where the session is alive
@@ -445,6 +481,51 @@ mod tests {
         assert!(is_connection_error("unable to parse response"));
         assert!(is_connection_error("invalid response from server"));
         assert!(is_connection_error("no mailbox selected"));
+    }
+
+    #[test]
+    fn is_retryable_error_classifies_transient_vs_permanent() {
+        // Transient: connection class plus alive-session server states.
+        for msg in [
+            "broken pipe",
+            "Server Unavailable. 15",
+            "[INUSE] Mailbox is in use",
+            "Temporary failure, try again later",
+            "too many connections",
+        ] {
+            assert!(is_retryable_error(msg), "{msg} should be retryable");
+        }
+        // Permanent: repeating these would hammer a fact.
+        for msg in [
+            "Unknown Mailbox: DoesNotExist",
+            "Email with UID 99999999 not found in INBOX",
+            "Account \"foo\" not found",
+            "Moving emails is disabled for this account (allow_move = false)",
+        ] {
+            assert!(!is_retryable_error(msg), "{msg} should not be retryable");
+        }
+    }
+
+    /// Error text interpolates sender- and caller-chosen names. A name that
+    /// happens to contain a transient-looking word must not flip the bit —
+    /// an unattended caller would retry a fact forever.
+    #[test]
+    fn is_retryable_error_ignores_transient_words_inside_names() {
+        for msg in [
+            "Unknown Mailbox: Temporary Projects",
+            "Attachment \"unavailable\" not found in email 42",
+            "Folder \"Machines in use\" not found",
+        ] {
+            assert!(!is_retryable_error(msg), "{msg} should not be retryable");
+        }
+        // The bracketed RFC 5530 codes stay reliable signals: they sit in
+        // the raw message (classification runs before clean_imap_error).
+        for msg in [
+            "[UNAVAILABLE] Temporary System Error (Failure)",
+            "no response: code: None, info: Some(\"[INUSE] Mailbox is in use\")",
+        ] {
+            assert!(is_retryable_error(msg), "{msg} should be retryable");
+        }
     }
 
     #[test]

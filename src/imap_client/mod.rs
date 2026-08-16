@@ -29,8 +29,8 @@ use crate::email::{self, EmailFull, EmailSummary};
 mod util;
 pub use util::{
     FORWARD_PREFIXES, REPLY_PREFIXES, build_or_criteria, clean_imap_error,
-    host_supports_unicode_search, imap_astring, iso_to_imap_date, sanitize_log_str,
-    starts_with_ignore_ascii_case,
+    host_supports_unicode_search, imap_astring, is_retryable_error, iso_to_imap_date,
+    sanitize_log_str, starts_with_ignore_ascii_case,
 };
 use util::{clean_message_id, is_connection_error, strip_email_prefixes};
 
@@ -78,13 +78,138 @@ const MAX_FOLDER_COUNT: usize = 10_000;
 // imap-proto (and by extension async-imap) to accept the missing-SP
 // form leniently. Kept as the existing full-body fetch below until
 // upstream relaxes the parse or we swap to a different IMAP crate.
-const SUMMARY_FETCH_ITEMS: &str = "(BODY.PEEK[] FLAGS UID)";
+// INTERNALDATE feeds the sub-day `since`/`before` cut: IMAP's own
+// SINCE/BEFORE are day-granular, so the exact bound is applied client-side
+// against the arrival timestamp (not the sender-controlled Date header).
+const SUMMARY_FETCH_ITEMS: &str = "(BODY.PEEK[] FLAGS UID INTERNALDATE)";
+
+/// Client-side full-text criteria for servers whose SEARCH cannot take them
+/// (Outlook 365 silently returns zero matches for `CHARSET UTF-8`). Applied
+/// in [`summarize_fetches`] against the parsed message — subject, the
+/// addressing headers and the full `body_text`, approximating RFC 3501's
+/// `TEXT` (which matches header OR body) — BEFORE the message is cut down
+/// to a 200-character snippet. Matching only the snippet (the original
+/// design) silently dropped every mail whose term appeared later in the
+/// body; matching only the body dropped mails carrying the term in their
+/// subject, which the server-side `TEXT` finds.
+///
+/// **Invariant: all stored needles are already lowercased** — the caller
+/// owns the `.to_lowercase()` so the per-mail work folds only the message.
+/// `all` terms are AND-combined; each `any` group must have at least one
+/// member present (groups themselves AND-combine).
+#[derive(Debug, Default)]
+pub struct BodyTextFilter {
+    pub all: Vec<String>,
+    pub any: Vec<Vec<String>>,
+}
+
+impl BodyTextFilter {
+    /// The no-op filter the plain list paths pass.
+    pub const EMPTY: Self = Self {
+        all: Vec::new(),
+        any: Vec::new(),
+    };
+
+    pub const fn is_empty(&self) -> bool {
+        self.all.is_empty() && self.any.is_empty()
+    }
+
+    fn matches(&self, email: &EmailFull) -> bool {
+        let hay = Self::haystack(email);
+        self.all.iter().all(|t| hay.contains(t.as_str()))
+            && self
+                .any
+                .iter()
+                .all(|group| group.iter().any(|t| hay.contains(t.as_str())))
+    }
+
+    /// One lowercased searchable text per message: subject and addressing
+    /// headers first, then the full body. Fields are newline-separated so a
+    /// term can never match by straddling two fields. The full-body fold is
+    /// a deliberate cost: it runs only on the fallback path, and any partial
+    /// view would reintroduce the silent false negatives this filter fixes.
+    fn haystack(email: &EmailFull) -> String {
+        let mut hay = String::with_capacity(email.body_text.len() + 256);
+        hay.push_str(&email.subject.to_lowercase());
+        hay.push('\n');
+        for addr in email
+            .from
+            .iter()
+            .chain(email.to.iter())
+            .chain(email.cc.iter())
+        {
+            if let Some(name) = &addr.name {
+                hay.push_str(&name.to_lowercase());
+                hay.push(' ');
+            }
+            hay.push_str(&addr.address.to_lowercase());
+            hay.push('\n');
+        }
+        hay.push_str(&email.body_text.to_lowercase());
+        hay
+    }
+}
+
+/// Everything applied to a fetched message AFTER the server's SEARCH:
+/// full-text criteria the server could not take, and the sub-day part of
+/// `since`/`before` (IMAP's own operators are day-granular; the widened
+/// server window is cut exactly here, against INTERNALDATE — the arrival
+/// time, deliberately not the sender-controlled `Date` header).
+#[derive(Debug, Default)]
+pub struct PostFetchFilter {
+    pub body: BodyTextFilter,
+    /// Keep messages whose INTERNALDATE is at or after this Unix second.
+    pub internal_since_unix: Option<i64>,
+    /// Keep messages whose INTERNALDATE is strictly before this Unix second.
+    pub internal_before_unix: Option<i64>,
+}
+
+impl PostFetchFilter {
+    /// The no-op filter the plain list paths pass.
+    pub const EMPTY: Self = Self {
+        body: BodyTextFilter::EMPTY,
+        internal_since_unix: None,
+        internal_before_unix: None,
+    };
+
+    pub const fn is_empty(&self) -> bool {
+        self.body.is_empty()
+            && self.internal_since_unix.is_none()
+            && self.internal_before_unix.is_none()
+    }
+
+    /// Whether any sub-day time bound is present — the part the server's
+    /// day-granular SINCE/BEFORE cannot express, resolved on a lightweight
+    /// `(UID INTERNALDATE)` round before counting and paging.
+    const fn has_time_bounds(&self) -> bool {
+        self.internal_since_unix.is_some() || self.internal_before_unix.is_some()
+    }
+
+    /// The time bounds alone. A message whose INTERNALDATE the server did
+    /// not report is KEPT — dropping it would silently lose mail over a
+    /// missing metadata field, and the day-granular server window already
+    /// bounds how wrong that can be.
+    fn time_matches(&self, internal_unix: Option<i64>) -> bool {
+        let Some(ts) = internal_unix else {
+            return true;
+        };
+        self.internal_since_unix.is_none_or(|since| ts >= since)
+            && self.internal_before_unix.is_none_or(|before| ts < before)
+    }
+}
 
 /// Turn a list of summary-shaped fetch responses into `EmailSummary`
-/// rows. Centralizes the UID-skip + bounded body + parse + summarize
-/// pipeline shared by `list_emails`, `list_unread_emails`, and
+/// rows. Centralizes the UID-skip + bounded body + parse + post-filter +
+/// summarize pipeline shared by `list_emails`, `list_unread_emails`, and
 /// `search_emails`.
-fn summarize_fetches(fetches: &[Fetch], folder: &str) -> Vec<EmailSummary> {
+fn summarize_fetches(
+    fetches: &[Fetch],
+    folder: &str,
+    post_filter: &PostFetchFilter,
+) -> Vec<EmailSummary> {
+    // Decoded once per call, not per row — display sugar for folder names
+    // that travel as modified UTF-7 (`Gel&APY-schte Elemente`).
+    let folder_display = safe_display_name(folder);
     let mut out = Vec::with_capacity(fetches.len());
     for fetch in fetches {
         // Skip responses without a UID rather than defaulting to 0 — two
@@ -94,9 +219,35 @@ fn summarize_fetches(fetches: &[Fetch], folder: &str) -> Vec<EmailSummary> {
         let Some(body) = bounded_body(fetch, uid) else {
             continue;
         };
+        // NOT redundant with the pre-paging INTERNALDATE cut in
+        // `search_emails_once`: an unsolicited FETCH row without
+        // INTERNALDATE (parallel flag update) rides through that cut on
+        // the KEEP policy — this second check catches it once the full
+        // fetch reports the real timestamp. It is also the only cut for
+        // callers that skip the prefetch.
+        if !post_filter.time_matches(fetch.internal_date().map(|d| d.timestamp())) {
+            continue;
+        }
         let flags = parse_flags(fetch);
         let full = email::parse_email_no_html(uid, folder, body, flags);
-        out.push(email::summarize(full, 200));
+        // Full-text criteria run here, on the complete message, while it
+        // still exists — `summarize` drops the body for the snippet right
+        // after.
+        if !post_filter.body.is_empty() && !post_filter.body.matches(&full) {
+            continue;
+        }
+        let mut summary = email::summarize(full, 200);
+        summary.folder_display.clone_from(&folder_display);
+        // Echo the arrival time exactly when a sub-day bound cut on it:
+        // `date` is the sender's header and may legitimately sit outside
+        // the requested window — without this field that looks like a
+        // filter bug and is unverifiable from the result.
+        if post_filter.has_time_bounds() {
+            summary.internal_date = fetch
+                .internal_date()
+                .and_then(|d| email::unix_to_utc_iso(d.timestamp()));
+        }
+        out.push(summary);
     }
     out
 }
@@ -750,7 +901,7 @@ impl ImapClient {
         // isn't formally guaranteed, and we want newest-first in the output.
         fetches.sort_by_key(|f| std::cmp::Reverse(f.message));
 
-        let summaries = summarize_fetches(&fetches, folder);
+        let summaries = summarize_fetches(&fetches, folder, &PostFetchFilter::EMPTY);
         Ok((summaries, total, total))
     }
 
@@ -784,7 +935,7 @@ impl ImapClient {
         let uid_set = uid_set_string(&paged_uids);
         let stream = session.uid_fetch(&uid_set, SUMMARY_FETCH_ITEMS).await?;
         let fetches: Vec<Fetch> = stream.try_collect().await?;
-        let summaries = summarize_fetches(&fetches, folder);
+        let summaries = summarize_fetches(&fetches, folder, &PostFetchFilter::EMPTY);
         Ok((summaries, total, matched))
     }
 
@@ -835,14 +986,23 @@ impl ImapClient {
     /// The count is taken before the cap: a caller that only sees `limit`
     /// results cannot otherwise tell "exactly this many" from "the first of
     /// many", and would silently report a partial answer as complete.
+    ///
+    /// `post_filter` carries what the server could not take. Its sub-day
+    /// time bounds are resolved on a lightweight `(UID INTERNALDATE)` round
+    /// BEFORE counting and paging, so `matched` and `offset` operate on
+    /// rows a caller can actually get. Its full-text criteria (Outlook
+    /// 365's broken `CHARSET UTF-8` SEARCH) need the fetched body and are
+    /// applied per fetched message, so for those `matched` stays an upper
+    /// bound, exactly as documented.
     pub async fn search_emails(
         &mut self,
         folder: &str,
         criteria: &str,
         limit: u32,
         offset: u32,
+        post_filter: &PostFetchFilter,
     ) -> Result<(Vec<EmailSummary>, u32)> {
-        retry_read!(self.search_emails_once(folder, criteria, limit, offset))
+        retry_read!(self.search_emails_once(folder, criteria, limit, offset, post_filter))
     }
 
     async fn search_emails_once(
@@ -851,14 +1011,52 @@ impl ImapClient {
         criteria: &str,
         limit: u32,
         offset: u32,
+        post_filter: &PostFetchFilter,
     ) -> Result<(Vec<EmailSummary>, u32)> {
         self.ensure_selected(folder).await?;
         let session = self.session()?;
 
         let uids_stream = session.uid_search(criteria).await?;
         let mut uids: Vec<u32> = uids_stream.into_iter().collect();
-        let matched = u32::try_from(uids.len()).unwrap_or(u32::MAX);
         uids.sort_unstable_by(|a, b| b.cmp(a));
+
+        // Resolve the sub-day time cut BEFORE counting and paging, on a
+        // lightweight `(UID INTERNALDATE)` round — tens of bytes per row.
+        // Cutting after the full fetch (the first design) transferred
+        // complete messages just to discard them: with `before`, the newest
+        // rows of the day-widened window all fall past the cut, so whole
+        // pages arrived, died, and `returned: 0` with `has_more: true` sent
+        // the caller into the next empty page. Cutting here also means
+        // `matched` and `offset` operate on rows a caller can actually get.
+        if post_filter.has_time_bounds() && !uids.is_empty() {
+            // Unlike every other uid_set_string call site this one covers
+            // the FULL match list, and a fragmented list (unread + time
+            // bound over a big mailbox) can compress badly — IMAP servers
+            // cap the command line (Dovecot defaults to 64 KiB). Past a
+            // conservative threshold, fall back to the covering range: the
+            // command shrinks to a constant, the response gains non-match
+            // rows (~tens of bytes each), and the `retain` below
+            // intersects against the match list either way.
+            let mut uid_set = uid_set_string(&uids);
+            if uid_set.len() > 4096
+                && let (Some(&newest), Some(&oldest)) = (uids.first(), uids.last())
+            {
+                uid_set = format!("{oldest}:{newest}");
+            }
+            let stream = session.uid_fetch(&uid_set, "(UID INTERNALDATE)").await?;
+            let fetches: Vec<Fetch> = stream.try_collect().await?;
+            // A missing INTERNALDATE keeps the row — same policy as
+            // `time_matches`. Rows absent from the response entirely
+            // (expunged since the SEARCH) drop out with the retain.
+            let keep: HashSet<u32> = fetches
+                .iter()
+                .filter(|f| post_filter.time_matches(f.internal_date().map(|d| d.timestamp())))
+                .filter_map(|f| f.uid)
+                .collect();
+            uids.retain(|uid| keep.contains(uid));
+        }
+
+        let matched = u32::try_from(uids.len()).unwrap_or(u32::MAX);
         // Page on the UID list, before fetching: SEARCH already returned every
         // match, so skipping costs nothing, while FETCH is the expensive part
         // and now only covers the requested window.
@@ -875,7 +1073,7 @@ impl ImapClient {
         let uid_set = uid_set_string(&uids);
         let stream = session.uid_fetch(&uid_set, SUMMARY_FETCH_ITEMS).await?;
         let fetches: Vec<Fetch> = stream.try_collect().await?;
-        Ok((summarize_fetches(&fetches, folder), matched))
+        Ok((summarize_fetches(&fetches, folder, post_filter), matched))
     }
 
     /// `strict=true` (recommended): match only via `Message-ID` /
@@ -1113,29 +1311,12 @@ impl ImapClient {
 
         let uid_set = uid_set_string(uids);
         let op = if add { "+FLAGS" } else { "-FLAGS" };
-        // Collect the STORE fetch responses — the server emits one per UID
-        // that actually existed and got updated. UIDs passed in but absent
-        // from the folder (stale after UIDVALIDITY rotation / external
-        // expunge / typo) produce no response. Returning those as
-        // "succeeded" would silently mislead the LLM.
-        //
-        // Also intersect with the caller's input set: a hostile or buggy
-        // server could echo UIDs we never asked about, which would inflate
-        // the LLM's view of "what got changed". Take only the overlap.
-        let input: HashSet<u32> = uids.iter().copied().collect();
         let fetches: Vec<Fetch> = session
             .uid_store(&uid_set, format!("{op} ({flag})"))
             .await?
             .try_collect()
             .await?;
-        let mut updated: Vec<u32> = fetches
-            .iter()
-            .filter_map(|f| f.uid)
-            .filter(|u| input.contains(u))
-            .collect();
-        updated.sort_unstable();
-        updated.dedup();
-        Ok(updated)
+        Ok(acknowledged_uids(&fetches, uids))
     }
 
     pub async fn move_emails(
@@ -1153,7 +1334,13 @@ impl ImapClient {
             anyhow::bail!("Target folder \"{target}\" is not in allowed_folders for this account");
         }
         self.ensure_selected(folder).await?;
-        let uid_set = uid_set_string(uids);
+        // Confirmation source for the response — see `existing_uids` for why
+        // this is a SEARCH up front rather than the STORE acknowledgements.
+        let existing = self.existing_uids(uids).await?;
+        if existing.is_empty() {
+            return Ok(existing);
+        }
+        let uid_set = uid_set_string(&existing);
         // COPY first. If it fails the source is unchanged — the caller may
         // safely retry. If it SUCCEEDS, any subsequent failure leaves the
         // messages in BOTH folders; we contextualize those errors so the
@@ -1191,7 +1378,59 @@ impl ImapClient {
         // so the next `list_emails` doesn't return a stale `total`.
         self.selected_folder = None;
         self.selected_exists = 0;
-        Ok(uids.to_vec())
+        Ok(existing)
+    }
+
+    /// The subset of `uids` that exists in the currently selected folder
+    /// right now, verified with a `UID SEARCH`.
+    ///
+    /// This is the confirmation source for destructive operations, replacing
+    /// the STORE acknowledgements: RFC 3501 only SHOULDs the untagged FETCH
+    /// response, and RFC 7162 explicitly allows omitting it when the STORE
+    /// changed nothing — e.g. `+FLAGS \Deleted` on a message another client
+    /// already flagged. An under-report on a move or delete invites the
+    /// caller to retry, and a retried move duplicates the message — the
+    /// exact outcome the surrounding error contexts warn against.
+    /// Existence-before-action cannot under-report a processed message.
+    /// (`mark_flags` keeps its STORE-based reply: "actually updated" is its
+    /// documented meaning, and retrying a flag write is harmless.)
+    ///
+    /// The result is intersected with the input — paranoia against a server
+    /// echoing UIDs that were never asked about — and normalized.
+    async fn existing_uids(&mut self, uids: &[u32]) -> Result<Vec<u32>> {
+        let query = format!("UID {}", uid_set_string(uids));
+        let session = self.session()?;
+        let found = session.uid_search(&query).await?;
+        let input: HashSet<u32> = uids.iter().copied().collect();
+        let mut existing: Vec<u32> = found.into_iter().filter(|u| input.contains(u)).collect();
+        existing.sort_unstable();
+        existing.dedup();
+        Ok(existing)
+    }
+
+    /// Flag the given UIDs `\Deleted` in the currently selected folder and
+    /// expunge exactly them, reporting the UIDs that existed when the
+    /// operation ran (see [`Self::existing_uids`]). Shared by
+    /// `delete_emails`' permanent branch and `delete_draft`, so the two can
+    /// never drift in how they report the same stale-UID case.
+    async fn expunge_uids_in_selected(&mut self, uids: &[u32]) -> Result<Vec<u32>> {
+        let existing = self.existing_uids(uids).await?;
+        if existing.is_empty() {
+            return Ok(existing);
+        }
+        let uid_set = uid_set_string(&existing);
+        {
+            let session = self.session()?;
+            session
+                .uid_store(&uid_set, "+FLAGS (\\Deleted)")
+                .await?
+                .try_collect::<Vec<_>>()
+                .await?;
+        }
+        self.scoped_expunge(&uid_set).await?;
+        self.selected_folder = None;
+        self.selected_exists = 0;
+        Ok(existing)
     }
 
     /// Remove `\Deleted`-flagged messages matching the given UID set, scoped
@@ -1286,18 +1525,7 @@ impl ImapClient {
         }
         if permanent {
             self.ensure_selected(folder).await?;
-            let uid_set = uid_set_string(uids);
-            {
-                let session = self.session()?;
-                session
-                    .uid_store(&uid_set, "+FLAGS (\\Deleted)")
-                    .await?
-                    .try_collect::<Vec<_>>()
-                    .await?;
-            }
-            self.scoped_expunge(&uid_set).await?;
-            self.selected_folder = None;
-            self.selected_exists = 0;
+            self.expunge_uids_in_selected(uids).await
         } else {
             let trash = self
                 .find_folder_by_role(TRASH_FOLDER_NAMES)
@@ -1305,9 +1533,8 @@ impl ImapClient {
                 .ok()
                 .flatten()
                 .unwrap_or_else(|| "Trash".to_string());
-            self.move_emails(folder, uids, &trash).await?;
+            self.move_emails(folder, uids, &trash).await
         }
-        Ok(uids.to_vec())
     }
 
     /// Expunge one or more drafts from the Drafts folder. Bypasses the
@@ -1337,19 +1564,10 @@ impl ImapClient {
         }
 
         self.ensure_selected(&drafts).await?;
-        let uid_set = uid_set_string(uids);
-        {
-            let session = self.session()?;
-            session
-                .uid_store(&uid_set, "+FLAGS (\\Deleted)")
-                .await?
-                .try_collect::<Vec<_>>()
-                .await?;
-        }
-        self.scoped_expunge(&uid_set).await?;
-        self.selected_folder = None;
-        self.selected_exists = 0;
-        Ok(uids.to_vec())
+        // Reports the UIDs that existed — an already-gone draft must not be
+        // reported as deleted; `note_replacement` turns exactly that case
+        // into its `replace_warning` instead of a false `replaced_uid`.
+        self.expunge_uids_in_selected(uids).await
     }
 
     /// Append a message to the Drafts folder and report the UID it landed on.
@@ -1639,9 +1857,15 @@ impl async_imap::Authenticator for XOAuth2Authenticator {
 
 // ========== Utility functions ==========
 
+/// Map IMAP flags to strings, dropping `\Recent`: it is session-scoped
+/// server bookkeeping (whether THIS connection is the first to see the
+/// message since the last session), obsolete enough that RFC 9051 removed
+/// it — and it reads like "new for me", which it is not. Surfacing it
+/// invited exactly that misread.
 fn parse_flags(fetch: &Fetch) -> Vec<String> {
     fetch
         .flags()
+        .filter(|f| !matches!(f, async_imap::types::Flag::Recent))
         .map(|f| match f {
             async_imap::types::Flag::Seen => "\\Seen".to_string(),
             async_imap::types::Flag::Answered => "\\Answered".to_string(),
@@ -1695,6 +1919,32 @@ fn uid_set_string(uids: &[u32]) -> String {
     }
     flush(&mut out, run_start, run_end, &mut first);
     out
+}
+
+/// The UIDs a `UID STORE` response actually acknowledged, intersected with
+/// the caller's input set and normalized (sorted, deduped).
+///
+/// The server emits one FETCH response per UID whose flags it updated; UIDs
+/// passed in but absent from the folder (stale after UIDVALIDITY rotation /
+/// external expunge / typo) produce no response, and echoing them as
+/// "succeeded" would silently mislead the LLM. The intersection also stops
+/// a hostile or buggy server from inflating the result with UIDs we never
+/// asked about.
+///
+/// Used by `mark_flags` only: "actually updated" is that tool's documented
+/// meaning, and a retried flag write is harmless. The destructive
+/// operations confirm via [`ImapClient::existing_uids`] instead — see there
+/// for why STORE acknowledgements can under-report a processed message.
+fn acknowledged_uids(fetches: &[Fetch], input: &[u32]) -> Vec<u32> {
+    let input: HashSet<u32> = input.iter().copied().collect();
+    let mut updated: Vec<u32> = fetches
+        .iter()
+        .filter_map(|f| f.uid)
+        .filter(|u| input.contains(u))
+        .collect();
+    updated.sort_unstable();
+    updated.dedup();
+    updated
 }
 
 /// For silent-fail paths (e.g. optional Sent-folder search in `get_thread`):
@@ -1835,5 +2085,92 @@ mod tests {
         // Build a test Fetch isn't worth the effort; parse_flags is
         // exercised transitively by all read ops in integration. Skip
         // direct unit test — the function is a pure 1-to-1 mapping.
+    }
+
+    /// Minimal message for the filter tests.
+    fn mail(subject: &str, from: &str, body: &str) -> EmailFull {
+        EmailFull {
+            uid: 1,
+            folder: "INBOX".to_string(),
+            from: Some(crate::email::EmailAddress {
+                name: None,
+                address: from.to_string(),
+            }),
+            to: vec![],
+            cc: vec![],
+            subject: subject.to_string(),
+            date: None,
+            date_original: None,
+            message_id: None,
+            in_reply_to: None,
+            references: vec![],
+            flags: vec![],
+            body_text: body.to_string(),
+            body_html: None,
+            attachments: vec![],
+            body_parts_diverge: false,
+        }
+    }
+
+    /// The reason this filter runs in the client layer at all: it must see
+    /// the FULL body. The previous snippet-level fallback silently dropped
+    /// every mail whose term sat past the first 200 characters.
+    #[test]
+    fn body_text_filter_matches_beyond_the_snippet_window() {
+        let mut body = "x".repeat(5_000);
+        body.push_str(" Bestätigung Ihrer Bestellung");
+        let filter = BodyTextFilter {
+            all: vec!["bestätigung".to_string()],
+            any: vec![],
+        };
+        assert!(
+            filter.matches(&mail("s", "a@b", &body)),
+            "term past 200 chars must match"
+        );
+        assert!(!filter.matches(&mail("s", "a@b", &"x".repeat(5_000))));
+    }
+
+    /// RFC 3501's `TEXT` matches header OR body; the fallback must not be
+    /// narrower, or a term sitting only in the subject or an address is a
+    /// silent false negative exactly on the servers that need the fallback.
+    #[test]
+    fn body_text_filter_matches_subject_and_addresses_like_imap_text() {
+        let filter = BodyTextFilter {
+            all: vec!["zahlungsbestätigung".to_string()],
+            any: vec![],
+        };
+        assert!(filter.matches(&mail(
+            "Zahlungsbestätigung Q3",
+            "a@b",
+            "no term in the body"
+        )));
+        assert!(!filter.matches(&mail("Unrelated", "a@b", "no term here either")));
+
+        let by_sender = BodyTextFilter {
+            all: vec!["müller@example.de".to_string()],
+            any: vec![],
+        };
+        assert!(by_sender.matches(&mail("s", "müller@example.de", "body")));
+        // Fields are joined with newlines: a term must not match by
+        // straddling the subject/body boundary.
+        let straddle = BodyTextFilter {
+            all: vec!["subjectbody".to_string()],
+            any: vec![],
+        };
+        assert!(!straddle.matches(&mail("subject", "a@b", "body")));
+    }
+
+    #[test]
+    fn body_text_filter_combines_all_and_any() {
+        let filter = BodyTextFilter {
+            all: vec!["praktikum".to_string()],
+            any: vec![vec!["akku".to_string(), "battery".to_string()]],
+        };
+        let m = |body: &str| mail("s", "a@b", body);
+        assert!(filter.matches(&m("Praktikum mit Battery-Testing")));
+        assert!(!filter.matches(&m("Praktikum ohne den zweiten Begriff")));
+        assert!(!filter.matches(&m("Nur Akku, kein erster Begriff")));
+        assert!(BodyTextFilter::EMPTY.matches(&m("anything")));
+        assert!(BodyTextFilter::EMPTY.is_empty());
     }
 }

@@ -20,7 +20,7 @@
 //! pure-Rust unit tests can't exercise.
 
 use imap_mcp_rs::config::{AccountConfig, AuthMethod};
-use imap_mcp_rs::imap_client::ImapClient;
+use imap_mcp_rs::imap_client::{BodyTextFilter, ImapClient, PostFetchFilter};
 
 fn greenmail_config() -> AccountConfig {
     AccountConfig {
@@ -37,6 +37,7 @@ fn greenmail_config() -> AccountConfig {
         read_only: false,
         allow_delete: true,
         allow_move: true,
+        allow_flag_change: true,
         allow_unsafe_expunge: false,
         accept_invalid_certs: true, // `GreenMail` self-signed cert
         allowed_folders: None,
@@ -112,6 +113,89 @@ async fn list_emails_inbox_returns_seeded_messages() {
         subjects.iter().any(|s| s.contains("Project Update Q2")),
         "expected Q2 subject in {subjects:?}"
     );
+    // Without a sub-day bound, `internal_date` stays absent — next to
+    // `date` it would be near-redundant noise in every listing row.
+    assert!(
+        emails.iter().all(|e| e.internal_date.is_none()),
+        "internal_date must only appear under a sub-day bound"
+    );
+    // `\Recent` is session-scoped server bookkeeping that reads like "new
+    // for me" — it must never surface in flags. GreenMail does set it on a
+    // fresh session, which makes this the one place to prove the filter.
+    assert!(
+        emails
+            .iter()
+            .all(|e| !e.flags.iter().any(|f| f == "\\Recent")),
+        "\\Recent leaked into flags: {:?}",
+        emails.iter().map(|e| &e.flags).collect::<Vec<_>>()
+    );
+    // Dates are UTC-normalized: every value ends in Z, none carries a
+    // sender offset.
+    assert!(
+        emails
+            .iter()
+            .filter_map(|e| e.date.as_deref())
+            .all(|d| d.ends_with('Z')),
+        "non-UTC date leaked: {:?}",
+        emails
+            .iter()
+            .filter_map(|e| e.date.as_deref())
+            .collect::<Vec<_>>()
+    );
+    client.disconnect().await;
+}
+
+#[tokio::test]
+#[ignore = "requires GreenMail via ./test-server.sh"]
+async fn search_time_bounds_cut_on_internaldate_over_the_wire() {
+    // The sub-day part of since/before cuts on INTERNALDATE, resolved on a
+    // lightweight (UID INTERNALDATE) round before counting and paging. The
+    // seeds arrived when the container started, i.e. within the last hour
+    // of running this test — so "since an hour ago" must keep them all and
+    // "before an hour ago" must drop them all, with `matched` reporting
+    // the count after the time cut (rows a caller can actually get).
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs()
+        .cast_signed();
+
+    let recent = PostFetchFilter {
+        body: BodyTextFilter::EMPTY,
+        internal_since_unix: Some(now - 3600),
+        internal_before_unix: None,
+    };
+    let (rows, matched) = client
+        .search_emails("INBOX", "ALL", 50, 0, &recent)
+        .await
+        .expect("search failed");
+    assert!(rows.len() >= 4, "seeds arrived within the hour: {rows:?}");
+    assert!(matched >= 4);
+    // Under a sub-day bound every row echoes the arrival time the cut ran
+    // on, UTC-shaped like `date` — the caller can verify the decision.
+    assert!(
+        rows.iter()
+            .all(|r| r.internal_date.as_deref().is_some_and(|d| d.ends_with('Z'))),
+        "rows under a sub-day bound must carry internal_date: {rows:?}"
+    );
+
+    let ancient = PostFetchFilter {
+        body: BodyTextFilter::EMPTY,
+        internal_since_unix: None,
+        internal_before_unix: Some(now - 3600),
+    };
+    let (rows, matched) = client
+        .search_emails("INBOX", "ALL", 50, 0, &ancient)
+        .await
+        .expect("search failed");
+    assert!(
+        rows.is_empty(),
+        "nothing arrived more than an hour ago: {rows:?}"
+    );
+    assert_eq!(matched, 0, "the time cut runs before the count");
     client.disconnect().await;
 }
 
@@ -150,7 +234,13 @@ async fn search_emails_from_bob() {
     };
     // `GreenMail` seeds a reply from bob@example.com.
     let (summaries, matched) = client
-        .search_emails("INBOX", "FROM \"bob@example.com\"", 10, 0)
+        .search_emails(
+            "INBOX",
+            "FROM \"bob@example.com\"",
+            10,
+            0,
+            &PostFetchFilter::EMPTY,
+        )
         .await
         .expect("search_emails failed");
     assert!(
@@ -168,7 +258,7 @@ async fn search_emails_from_bob() {
     // complete one. Reporting the delivered count here would make "the newest
     // one of several" indistinguishable from "the only one".
     let (capped, capped_matched) = client
-        .search_emails("INBOX", "ALL", 1, 0)
+        .search_emails("INBOX", "ALL", 1, 0, &PostFetchFilter::EMPTY)
         .await
         .expect("capped search failed");
     assert_eq!(capped.len(), 1, "limit must cap what is delivered");
@@ -181,7 +271,7 @@ async fn search_emails_from_bob() {
     // useless if the rest cannot be reached. Page two must continue where page
     // one stopped, not repeat it.
     let (page_two, page_two_matched) = client
-        .search_emails("INBOX", "ALL", 1, 1)
+        .search_emails("INBOX", "ALL", 1, 1, &PostFetchFilter::EMPTY)
         .await
         .expect("offset search failed");
     assert_eq!(page_two.len(), 1, "second page must deliver its row");
@@ -193,6 +283,60 @@ async fn search_emails_from_bob() {
         page_two[0].uid, capped[0].uid,
         "offset must advance past the first page, not repeat it"
     );
+    client.disconnect().await;
+}
+
+#[tokio::test]
+#[ignore = "requires GreenMail via ./test-server.sh"]
+async fn search_emails_applies_the_body_filter_to_full_bodies() {
+    // The client-side fallback path (Outlook 365 diverts non-ASCII terms
+    // there) must filter on each message's FULL body over the wire — the
+    // unit tests cover it only with synthetic strings. "room 4B" sits in the
+    // seeded meeting mail's body text and in no other message.
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let filter = PostFetchFilter {
+        body: BodyTextFilter {
+            all: vec!["room 4b".to_string()],
+            any: vec![],
+        },
+        internal_since_unix: None,
+        internal_before_unix: None,
+    };
+    let (rows, matched) = client
+        .search_emails("INBOX", "ALL", 50, 0, &filter)
+        .await
+        .expect("filtered search failed");
+    assert_eq!(rows.len(), 1, "exactly the meeting mail should pass");
+    assert!(
+        rows[0].subject.contains("Team Meeting"),
+        "wrong mail passed the body filter: {}",
+        rows[0].subject
+    );
+    // `matched` stays the server-side count (the documented upper bound) —
+    // the client-side filter must not shrink it to the delivered rows.
+    assert!(
+        matched >= 4,
+        "matched must report what the server saw, got {matched}"
+    );
+
+    // A term no seeded body carries filters everything out, while `matched`
+    // still says the server had candidates.
+    let none = PostFetchFilter {
+        body: BodyTextFilter {
+            all: vec!["definitely-not-in-any-seeded-body".to_string()],
+            any: vec![],
+        },
+        internal_since_unix: None,
+        internal_before_unix: None,
+    };
+    let (rows, matched) = client
+        .search_emails("INBOX", "ALL", 50, 0, &none)
+        .await
+        .expect("filtered search failed");
+    assert!(rows.is_empty(), "no body carries the term: {rows:?}");
+    assert!(matched >= 4);
     client.disconnect().await;
 }
 
@@ -424,11 +568,29 @@ async fn move_emails_lands_the_message_in_the_target_and_clears_the_source() {
         .expect("probe not in Drafts")
         .uid;
 
+    // Pre-flag the probe \Deleted, as a parallel client (phone, webmail)
+    // would: the move's own +FLAGS STORE is then a no-op for it, and RFC
+    // 7162 permits omitting the FETCH acknowledgement for no-ops — which is
+    // why `succeeded` is existence-verified up front rather than derived
+    // from STORE responses. A pre-flagged message that moves must be
+    // reported as moved; an under-report here invites a retry, and a
+    // retried move duplicates the message.
+    client
+        .mark_flags(&drafts, &[uid], "\\Deleted", true)
+        .await
+        .expect("pre-flagging failed");
+
+    // A stale UID rides along: it does not exist, and the response must not
+    // echo it as moved — succeeded is what existed when the operation ran.
     let moved = client
-        .move_emails(&drafts, &[uid], "Trash")
+        .move_emails(&drafts, &[uid, 99_999_999], "Trash")
         .await
         .expect("move failed");
-    assert_eq!(moved, vec![uid], "server must confirm the moved UID");
+    assert_eq!(
+        moved,
+        vec![uid],
+        "the pre-flagged message must be reported, the stale UID must not"
+    );
 
     let (source_after, _, _) = client
         .list_emails(&drafts, 50, 0, false)
@@ -503,10 +665,15 @@ async fn delete_emails_moves_to_trash_by_default_and_expunges_when_asked() {
 
     // Permanent delete expunges in place — gone from the source, and not
     // quietly relocated to Trash either.
-    client
-        .delete_emails(&drafts, &[hard], true)
+    let deleted = client
+        .delete_emails(&drafts, &[hard, 99_999_999], true)
         .await
         .expect("permanent delete failed");
+    assert_eq!(
+        deleted,
+        vec![hard],
+        "a stale UID must not be echoed as deleted"
+    );
     let (after, _, _) = client
         .list_emails(&drafts, 50, 0, false)
         .await
@@ -677,6 +844,18 @@ async fn draft_replacement_keeps_new_version_and_drops_the_old() {
         removed,
         vec![old_uid],
         "server did not report the old UID gone"
+    );
+
+    // Deleting it again (or any unknown UID) must come back empty — this is
+    // what turns note_replacement's "already gone" case into a warning
+    // instead of a false replaced_uid.
+    let again = client
+        .delete_draft(&[old_uid])
+        .await
+        .expect("re-deleting an absent draft is not an error");
+    assert!(
+        again.is_empty(),
+        "absent draft reported as deleted: {again:?}"
     );
 
     let (after, _, _) = client

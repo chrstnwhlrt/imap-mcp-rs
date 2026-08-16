@@ -2,6 +2,12 @@
 name = "imap-mcp-rs"
 version = "1.6.1"
 edition = "2024"
+# Determined empirically (1.91 compiles, 1.90 fails on then-unstable APIs:
+# Duration::from_mins, str::floor_char_boundary; File::lock needs 1.89).
+# Without this field an older toolchain fails with bare E0658 compiler
+# errors instead of cargo's one-line "requires rustc 1.91" message. The
+# flake pins latest stable and is unaffected.
+rust-version = "1.91"
 description = "IMAP MCP Server — email tools for LLM assistants"
 license = "MIT"
 repository = "https://github.com/chrstnwhlrt/imap-mcp-rs"

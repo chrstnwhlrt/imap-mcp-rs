@@ -102,6 +102,12 @@ pub const SUMMARY_TO_PREVIEW: usize = 3;
 pub struct EmailSummary {
     pub uid: u32,
     pub folder: String,
+    /// The folder name as a human reads it, when `folder` is modified-UTF-7
+    /// encoded (`Gel&APY-schte Elemente` → `Gelöschte Elemente`). Display
+    /// only — every tool takes `folder`. Mirrors `list_folders.display_name`
+    /// so a cross-folder hit from e.g. the trash is recognizable in place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub folder_display: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub message_id: Option<String>,
     /// Threading hints passed through so callers can cluster by
@@ -120,7 +126,22 @@ pub struct EmailSummary {
     /// keep the payload bounded — use `get_email` when you need them.
     pub cc_count: usize,
     pub subject: String,
+    /// UTC-normalized ISO 8601 — compare and sort on this. See
+    /// [`NormalizedDate`] for why the sender's offset is not passed through.
     pub date: Option<String>,
+    /// The sender's original `Date` rendition, only when its offset differs
+    /// from UTC — useful for quoting, never for comparing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_original: Option<String>,
+    /// Arrival time (INTERNALDATE) as UTC ISO 8601 — the value sub-day
+    /// `since`/`before` bounds cut against. Only present under such a
+    /// bound (best-effort there: a server that omits INTERNALDATE leaves
+    /// it absent), so a row whose `date` (the sender's header) sits
+    /// outside the requested window is explainable in place. Never set
+    /// otherwise: without the filter it is near-redundant noise next to
+    /// `date`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub internal_date: Option<String>,
     pub flags: Vec<String>,
     pub has_attachments: bool,
     pub snippet: String,
@@ -156,6 +177,11 @@ impl EmailSummary {
         if let Some(date) = &self.date {
             v["date"] = serde_json::json!(date);
         }
+        // Only ever set when a sub-day bound was active — there it explains
+        // the filter decision, so it survives the compact cut too.
+        if let Some(internal) = &self.internal_date {
+            v["internal_date"] = serde_json::json!(internal);
+        }
         if !self.flags.is_empty() {
             v["flags"] = serde_json::json!(self.flags);
         }
@@ -174,7 +200,11 @@ pub struct EmailFull {
     pub to: Vec<EmailAddress>,
     pub cc: Vec<EmailAddress>,
     pub subject: String,
+    /// UTC-normalized ISO 8601 — compare and sort on this.
     pub date: Option<String>,
+    /// The sender's original `Date` rendition when its offset differs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub date_original: Option<String>,
     pub message_id: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
@@ -194,6 +224,12 @@ pub struct EmailFull {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct AttachmentInfo {
+    /// Position within this message's attachment list — the unambiguous
+    /// handle for `download_attachment(index: …)`. Filenames are sender-
+    /// controlled and neither guaranteed present nor unique: nameless parts
+    /// all render as the placeholder `"attachment"`, so a name alone cannot
+    /// address them.
+    pub index: usize,
     pub filename: String,
     pub content_type: String,
     pub size: usize,
@@ -227,6 +263,7 @@ fn parse_email_inner(
             cc: vec![],
             subject: String::new(),
             date: None,
+            date_original: None,
             message_id: None,
             in_reply_to: None,
             references: vec![],
@@ -258,7 +295,11 @@ fn parse_email_inner(
     // list. Same class of defense as `filename` / `content_type`.
     let subject = sanitize_external_str(message.subject().unwrap_or(""));
 
-    let date = message.date().map(format_datetime);
+    let normalized_date = message.date().map(format_datetime);
+    let (date, date_original) = match normalized_date {
+        Some(n) => (Some(n.utc), n.original),
+        None => (None, None),
+    };
 
     // Message-ID / In-Reply-To / References echo back to the LLM and are
     // ALSO reused when composing replies (for threading headers). Sanitize
@@ -296,7 +337,9 @@ fn parse_email_inner(
 
     let attachments = message
         .attachments()
-        .map(|att| AttachmentInfo {
+        .enumerate()
+        .map(|(index, att)| AttachmentInfo {
+            index,
             // Sanitize the attacker-controlled filename before it lands in the
             // JSON response read by the LLM — bidi overrides here would
             // otherwise let a sender disguise a `.exe` as `.jpg` in the
@@ -315,6 +358,7 @@ fn parse_email_inner(
         cc,
         subject,
         date,
+        date_original,
         message_id,
         in_reply_to,
         references,
@@ -412,20 +456,59 @@ fn significant_words(s: &str) -> std::collections::HashSet<String> {
         .collect()
 }
 
-/// Format a `mail_parser` `DateTime` as ISO 8601 with correct timezone offset.
-fn format_datetime(d: &mail_parser::DateTime) -> String {
-    if d.tz_hour == 0 && d.tz_minute == 0 && !d.tz_before_gmt {
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
-            d.year, d.month, d.day, d.hour, d.minute, d.second
-        )
-    } else {
-        let sign = if d.tz_before_gmt { '-' } else { '+' };
-        format!(
-            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{sign}{:02}:{:02}",
-            d.year, d.month, d.day, d.hour, d.minute, d.second, d.tz_hour, d.tz_minute,
-        )
-    }
+/// The `Date` header rendered twice: normalized to UTC, plus the sender's
+/// original offset when it differs.
+///
+/// `utc` is what every consumer should compare and sort on. Passing the
+/// sender's offset through as the primary value (the previous design) made
+/// one response mix `+02:00`, `-07:00` and `Z` rows: lexicographic ordering
+/// — which the cross-folder merge and the thread-representative choice rely
+/// on — silently ranked `11:02-07:00` before `13:20Z` although it is five
+/// hours younger, and a reader skimming the rows drew the same wrong
+/// conclusion. `original` is kept for quoting (a reply cites the sender's
+/// clock), and omitted when it says nothing beyond `utc`.
+struct NormalizedDate {
+    utc: String,
+    original: Option<String>,
+}
+
+/// Format a `mail_parser` `DateTime` as UTC ISO 8601, keeping the sender's
+/// original rendition alongside when it carried a non-zero offset.
+fn format_datetime(d: &mail_parser::DateTime) -> NormalizedDate {
+    let original = format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
+        d.year,
+        d.month,
+        d.day,
+        d.hour,
+        d.minute,
+        d.second,
+        if d.tz_hour == 0 && d.tz_minute == 0 && !d.tz_before_gmt {
+            "Z".to_string()
+        } else {
+            let sign = if d.tz_before_gmt { '-' } else { '+' };
+            format!("{sign}{:02}:{:02}", d.tz_hour, d.tz_minute)
+        },
+    );
+    // `to_timestamp` folds the offset into epoch seconds (calendar-safe
+    // across day boundaries); jiff renders it back as UTC. A date so
+    // malformed that this fails keeps the original as the primary value —
+    // wrong-looking beats absent.
+    let utc = jiff::Timestamp::from_second(d.to_timestamp()).map_or_else(
+        |_| original.clone(),
+        |ts| ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
+    );
+    let original = (original != utc).then_some(original);
+    NormalizedDate { utc, original }
+}
+
+/// Unix seconds → `%Y-%m-%dT%H:%M:%SZ`, the same shape [`EmailSummary::date`]
+/// uses. `None` for out-of-range values (a hostile server's INTERNALDATE) —
+/// the caller omits the field rather than inventing a timestamp.
+pub fn unix_to_utc_iso(secs: i64) -> Option<String> {
+    jiff::Timestamp::from_second(secs)
+        .ok()
+        .map(|ts| ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
 /// Extract plain text body. If only HTML exists, strip tags and decode entities.
@@ -440,16 +523,57 @@ fn extract_body_text(message: &mail_parser::Message<'_>) -> String {
 }
 
 /// Strip HTML tags and decode common HTML entities.
+///
+/// `<img>` `alt` texts are kept as text: they are what a reader sees when
+/// images are blocked or read aloud, so they belong to the message's textual
+/// content. This also keeps [`parts_diverge`] honest for mail whose plain
+/// part carries image placeholders — our own drafts write `[alt]` where the
+/// HTML has an `<img alt="…">`, and dropping the attribute made exactly that
+/// legitimate shape look like a hidden-text injection.
 fn strip_html(html: &str) -> String {
+    // Tag content is buffered for the alt lookup, capped so an unterminated
+    // `<` cannot mirror the whole remaining body into a second allocation.
+    // Real-world tags (style-laden spans included) stay far below this;
+    // anything longer merely loses its alt text.
+    const MAX_TAG_BUF: usize = 16 * 1024;
+
     let mut result = String::with_capacity(html.len());
     let mut in_tag = false;
+    // Quote state INSIDE a tag: a `>` within a quoted attribute value is
+    // legal HTML (`alt="Umsatz > Vorjahr"`) and must not end the tag —
+    // quote-blind parsing lost exactly the alt this function extracts and
+    // leaked the attribute tail into the text. Once the tag buffer hits its
+    // cap the quote state is dropped, so a stray unterminated quote in
+    // broken mail HTML can swallow at most that much before the next `>`
+    // closes the tag again.
+    let mut tag_quote: Option<char> = None;
     let mut last_was_space = false;
+    let mut tag_buf = String::new();
 
     for ch in html.chars() {
         match ch {
-            '<' => in_tag = true,
-            '>' => {
+            '<' if !in_tag => {
+                in_tag = true;
+                tag_quote = None;
+                tag_buf.clear();
+            }
+            '>' if in_tag && tag_quote.is_none() => {
                 in_tag = false;
+                if let Some(alt) = img_alt_text(&tag_buf) {
+                    // Alt text is reader-visible content — emit it with the
+                    // same whitespace collapsing as ordinary text.
+                    for c in alt.chars() {
+                        if c.is_whitespace() {
+                            if !last_was_space {
+                                result.push(' ');
+                                last_was_space = true;
+                            }
+                        } else {
+                            result.push(c);
+                            last_was_space = false;
+                        }
+                    }
+                }
                 if !last_was_space {
                     result.push(' ');
                     last_was_space = true;
@@ -466,11 +590,82 @@ fn strip_html(html: &str) -> String {
                     last_was_space = false;
                 }
             }
-            _ => {}
+            _ => {
+                match (tag_quote, ch) {
+                    (None, '"' | '\'') => tag_quote = Some(ch),
+                    (Some(q), c) if c == q => tag_quote = None,
+                    _ => {}
+                }
+                if tag_buf.len() + ch.len_utf8() <= MAX_TAG_BUF {
+                    tag_buf.push(ch);
+                } else {
+                    // Buffer overrun: give up on this tag's attributes and
+                    // let the next `>` terminate it (see note above).
+                    tag_quote = None;
+                }
+            }
         }
     }
 
     decode_html_entities(result.trim())
+}
+
+/// The `alt` attribute value of an `<img …>` tag, given the text between the
+/// tag's `<` and `>`. Only quoted values (`"` or `'`) are recognized —
+/// unquoted attributes are vanishingly rare in real mail. Entities inside
+/// the value are decoded later by the caller's `decode_html_entities` pass.
+///
+/// The scan skips over quoted attribute VALUES: an `alt=` lookalike inside
+/// another attribute's value (`data-caption="… alt='x' …"`) is that value's
+/// text, not this tag's alt — matching it injected foreign text or shadowed
+/// the real alt behind an early return.
+fn img_alt_text(tag: &str) -> Option<&str> {
+    let t = tag.trim_start();
+    let bytes = t.as_bytes();
+    // `img` followed by whitespace — `<imgx>` is a different (unknown) tag.
+    if bytes.len() < 4
+        || !bytes[..3].eq_ignore_ascii_case(b"img")
+        || !bytes[3].is_ascii_whitespace()
+    {
+        return None;
+    }
+    let mut i = 3;
+    while i + 3 <= bytes.len() {
+        // Entering a quoted value: jump past it (or give up when it never
+        // closes — `strip_html`'s quote tracking makes that rare).
+        if bytes[i] == b'"' || bytes[i] == b'\'' {
+            let quote = bytes[i];
+            let len = bytes[i + 1..].iter().position(|&b| b == quote)?;
+            i += len + 2;
+            continue;
+        }
+        // Attribute-name boundary: preceded by whitespace.
+        if bytes[i..i + 3].eq_ignore_ascii_case(b"alt") && bytes[i - 1].is_ascii_whitespace() {
+            let mut j = i + 3;
+            while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                j += 1;
+            }
+            if j < bytes.len() && bytes[j] == b'=' {
+                j += 1;
+                while j < bytes.len() && bytes[j].is_ascii_whitespace() {
+                    j += 1;
+                }
+                if j < bytes.len() && (bytes[j] == b'"' || bytes[j] == b'\'') {
+                    let quote = bytes[j];
+                    let start = j + 1;
+                    if let Some(len) = bytes[start..].iter().position(|&b| b == quote) {
+                        // Both boundaries sit on ASCII quote bytes, so the
+                        // slice is always on char boundaries.
+                        return Some(&t[start..start + len]);
+                    }
+                }
+                return None; // `alt=` without a usable quoted value
+            }
+            // Name merely starts with "alt" (`alto=`): keep scanning.
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Decode common HTML entities.
@@ -565,6 +760,7 @@ pub fn summarize(email: EmailFull, snippet_len: usize) -> EmailSummary {
     EmailSummary {
         uid: email.uid,
         folder: email.folder,
+        folder_display: None,
         message_id: email.message_id,
         in_reply_to: email.in_reply_to,
         references: email.references,
@@ -574,6 +770,10 @@ pub fn summarize(email: EmailFull, snippet_len: usize) -> EmailSummary {
         cc_count,
         subject: email.subject,
         date: email.date,
+        date_original: email.date_original,
+        // Filled by `summarize_fetches` when a sub-day bound was active —
+        // the parsed message doesn't carry INTERNALDATE, the FETCH does.
+        internal_date: None,
         flags: email.flags,
         has_attachments: !email.attachments.is_empty(),
         snippet,
@@ -619,6 +819,7 @@ mod tests {
         EmailSummary {
             uid: 42,
             folder: "INBOX".into(),
+            folder_display: None,
             message_id: Some("<a@b>".into()),
             in_reply_to: Some("<parent@b>".into()),
             references: vec!["<r1@b>".into(), "<r2@b>".into()],
@@ -634,6 +835,8 @@ mod tests {
             cc_count: 3,
             subject: "Quarterly report".into(),
             date: Some("2026-07-28T10:00:00Z".into()),
+            date_original: None,
+            internal_date: None,
             flags: vec!["\\Seen".into()],
             has_attachments: true,
             snippet: "x".repeat(200),
@@ -666,6 +869,16 @@ mod tests {
         assert_eq!(compact["uid"], 42);
         assert_eq!(compact["folder"], "INBOX");
 
+        // `internal_date` explains a sub-day filter decision, so when set
+        // it survives the compact cut; unset it stays absent, not null.
+        assert!(compact.get("internal_date").is_none());
+        let mut with_internal = summary_fixture();
+        with_internal.internal_date = Some("2026-07-28T10:30:00Z".into());
+        assert_eq!(
+            with_internal.compact()["internal_date"],
+            "2026-07-28T10:30:00Z"
+        );
+
         let full = serde_json::to_value(summary_fixture()).unwrap();
         let (a, b) = (compact.to_string().len(), full.to_string().len());
         assert!(a * 3 < b, "compact {a} should be far below full {b}");
@@ -695,6 +908,62 @@ mod tests {
 
     use super::*;
 
+    fn dt(hour: u8, tz_hour: u8, before_gmt: bool) -> mail_parser::DateTime {
+        mail_parser::DateTime {
+            year: 2026,
+            month: 8,
+            day: 14,
+            hour,
+            minute: 2,
+            second: 2,
+            tz_before_gmt: before_gmt,
+            tz_hour,
+            tz_minute: 0,
+        }
+    }
+
+    /// One response used to mix `+02:00`, `-07:00` and `Z` rows straight
+    /// from the senders. That was not only hard to read — the cross-folder
+    /// merge and the thread-representative pick sort these strings
+    /// lexicographically, and `11:02-07:00` ranks before `13:20Z` although
+    /// it is five hours YOUNGER. Normalizing to UTC makes the string order
+    /// the true order.
+    #[test]
+    fn format_datetime_normalizes_to_utc_and_keeps_the_original() {
+        let west = format_datetime(&dt(11, 7, true)); // 11:02:02-07:00
+        assert_eq!(west.utc, "2026-08-14T18:02:02Z");
+        assert_eq!(west.original.as_deref(), Some("2026-08-14T11:02:02-07:00"));
+
+        let utc = format_datetime(&dt(13, 0, false)); // 13:02:02Z
+        assert_eq!(utc.utc, "2026-08-14T13:02:02Z");
+        assert!(utc.original.is_none(), "Z adds nothing beyond utc");
+
+        // The report's exact trap: -07:00 late morning vs. early-afternoon
+        // Z. Lexicographic order over the normalized strings is the true
+        // order — the sort sites rely on exactly this.
+        assert!(west.utc > utc.utc, "{} vs {}", west.utc, utc.utc);
+    }
+
+    #[test]
+    fn format_datetime_crosses_day_boundaries_correctly() {
+        // 20:02-07:00 is 03:02Z the NEXT day — offset folding is calendar
+        // arithmetic, not string surgery.
+        let n = format_datetime(&dt(20, 7, true));
+        assert_eq!(n.utc, "2026-08-15T03:02:02Z");
+    }
+
+    #[test]
+    fn parse_email_reports_utc_date_with_original_alongside() {
+        let raw = b"From: a@example.com\r\nTo: b@example.com\r\nSubject: T\r\n\
+                    Date: Fri, 14 Aug 2026 11:02:02 -0700\r\n\r\nbody";
+        let email = parse_email(1, "INBOX", raw, vec![]);
+        assert_eq!(email.date.as_deref(), Some("2026-08-14T18:02:02Z"));
+        assert_eq!(
+            email.date_original.as_deref(),
+            Some("2026-08-14T11:02:02-07:00")
+        );
+    }
+
     #[test]
     fn format_content_type_none_falls_back() {
         assert_eq!(format_content_type(None), "application/octet-stream");
@@ -712,6 +981,106 @@ mod tests {
     #[test]
     fn strip_html_handles_nested_tags() {
         assert_eq!(strip_html("<div><p>a<span>b</span>c</p></div>"), "a b c");
+    }
+
+    #[test]
+    fn strip_html_keeps_img_alt_text() {
+        // The alt text is what the reader sees with images blocked — it is
+        // message content, not markup.
+        assert_eq!(
+            strip_html("<p>Vor</p><img src=\"cid:x\" alt=\"Bild Beschreibung\"><p>nach</p>"),
+            "Vor Bild Beschreibung nach"
+        );
+        // Single quotes, attribute order, casing.
+        assert_eq!(strip_html("<IMG ALT='shot one' src='cid:y'>"), "shot one");
+        // Entities in the value decode with the rest of the text.
+        assert_eq!(strip_html("<img alt=\"a &amp; b\">"), "a & b");
+    }
+
+    #[test]
+    fn strip_html_keeps_bare_gt_in_prose() {
+        // `>` outside a tag is visible text and legal in HTML prose (only
+        // `<` needs escaping). It used to be swallowed into a space because
+        // the tag-closing arm matched unconditionally; the `if in_tag` guard
+        // keeps it.
+        assert_eq!(strip_html("5 > 3"), "5 > 3");
+        assert_eq!(strip_html("<p>a > b</p>"), "a > b");
+    }
+
+    #[test]
+    fn strip_html_alt_only_from_img_tags() {
+        // `alt` on other tags is not display text; a tag merely starting
+        // with "img" is a different tag.
+        assert_eq!(strip_html("<div alt=\"nope\">x</div>"), "x");
+        assert_eq!(strip_html("<imgfoo alt=\"nope\">x"), "x");
+        // Broken shapes must not panic and must not invent text.
+        assert_eq!(strip_html("<img alt=>x"), "x");
+        assert_eq!(strip_html("<img alt>x"), "x");
+        // An unterminated quote consumes to end-of-input, matching the HTML5
+        // tokenizer: inside a quoted value a `>` is data, not a tag end.
+        assert_eq!(strip_html("<img alt=\"unterminated>x"), "");
+        // …but once the quote closes, the next `>` ends the tag as usual.
+        assert_eq!(strip_html("<img alt=\"a>b\">x"), "a>b x");
+    }
+
+    #[test]
+    fn strip_html_alt_scan_is_quote_aware() {
+        // A `>` inside a quoted attribute value is legal HTML and must not
+        // end the tag — quote-blind parsing lost the alt AND leaked the
+        // attribute tail into the visible text.
+        assert_eq!(
+            strip_html("<p>Vor</p><img src=\"cid:x\" alt=\"Umsatz > Vorjahr\"><p>nach</p>"),
+            "Vor Umsatz > Vorjahr nach"
+        );
+        // An `alt=` lookalike inside ANOTHER attribute's value is that
+        // value's text, not this tag's alt: the real alt must win, the
+        // foreign text must not leak.
+        assert_eq!(
+            strip_html("<img data-caption=\"1 alt='evil words'\" alt=\"real caption\">x"),
+            "real caption x"
+        );
+        assert_eq!(strip_html("<img title=\"use alt=\" alt='real'>x"), "real x");
+    }
+
+    /// The shape our own drafts produce: the plain part carries `[alt]`
+    /// placeholders whose words sit in the HTML only inside `alt`
+    /// attributes. Dropping those attributes made the plain part look like
+    /// it carried hidden extra text — the exact signature [`parts_diverge`]
+    /// flags — so reading back a freshly saved draft reported it as a
+    /// possible injection.
+    #[test]
+    fn parse_email_does_not_flag_own_drafts_with_inline_image_alts() {
+        let alt = "Rollenübersicht mit sämtlichen zugewiesenen Benutzertypen \
+                   innerhalb der vierten Spalte der dargestellten Verwaltung \
+                   fehlende Einträge deutlich markiert";
+        let plain = format!("{NEWSLETTER_BODY} [{alt}]");
+        let html = format!(
+            "<html><body><p>{NEWSLETTER_BODY}</p><img src=\"cid:x\" alt=\"{alt}\"></body></html>"
+        );
+        // Without alt extraction this pair trips every threshold: the plain
+        // part fully covers the HTML text and adds 12+ significant words.
+        let raw = format!(
+            "From: a@example.com\r\nTo: b@example.com\r\nSubject: Draft\r\n\
+             MIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=\"BOUND\"\r\n\r\n\
+             --BOUND\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{plain}\r\n\
+             --BOUND\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n\
+             --BOUND--\r\n"
+        );
+        let email = parse_email(1, "Drafts", raw.as_bytes(), vec![]);
+        assert!(
+            !email.body_parts_diverge,
+            "a draft's own [alt] placeholders must not read as hidden text"
+        );
+
+        // Control: with the alt attribute removed, the same pair DOES trip
+        // the heuristic — proving the fixture actually crosses the
+        // thresholds and this test isn't vacuously green.
+        let without_alt = raw.replace(&format!(" alt=\"{alt}\""), "");
+        assert!(
+            parse_email(1, "Drafts", without_alt.as_bytes(), vec![]).body_parts_diverge,
+            "control fixture no longer crosses the thresholds — the main assertion proves nothing"
+        );
     }
 
     #[test]
