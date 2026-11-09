@@ -6,7 +6,7 @@ podman rm -f imap-test 2>/dev/null || true
 podman run -d --name imap-test \
   -p 3025:3025 -p 3143:3143 -p 3993:3993 \
   -e GREENMAIL_OPTS="-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=test:password@localhost -Dgreenmail.verbose" \
-  greenmail/standalone:2.1.2
+  docker.io/greenmail/standalone:2.1.15
 
 sleep 3
 
@@ -25,6 +25,8 @@ m.login('test', 'password')
 m.create('Drafts')
 m.create('Sent')
 m.create('Trash')
+# A name outside ASCII travels modified-UTF-7 encoded: B&APw-cher is Bücher.
+m.create('B&APw-cher')
 m.logout()
 
 msg1 = MIMEText('Hello, this is test email body for testing the IMAP MCP server.')
@@ -81,6 +83,6 @@ echo ""
 echo "GreenMail ready:"
 echo "  IMAPS: 127.0.0.1:3993 (user: test, pass: password)"
 echo "  SMTP:  127.0.0.1:3025"
-echo "  Folders: INBOX (4 emails), Drafts, Sent, Trash"
+echo "  Folders: INBOX (4 emails), Drafts, Sent, Trash, B&APw-cher (Bücher)"
 echo ""
 echo "Stop with: podman rm -f imap-test"

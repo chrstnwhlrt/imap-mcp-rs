@@ -70,10 +70,13 @@
           # Build
           package = self.packages.${system}.default;
 
-          # Clippy
+          # Clippy — exactly the CI gate (all targets, pedantic + nursery,
+          # warnings denied), so a green `nix flake check` means a green CI
+          # lint job. Overriding the args replaces crane's own
+          # `--all-targets` default, hence it is spelled out here.
           clippy = s.craneLib.cargoClippy (s.commonArgs // {
             inherit (s) cargoArtifacts;
-            cargoClippyExtraArgs = "-- -W clippy::all -W clippy::pedantic -A clippy::module_name_repetitions -A clippy::must_use_candidate -A clippy::missing_errors_doc -A clippy::missing_panics_doc -A clippy::doc_markdown";
+            cargoClippyExtraArgs = "--all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery";
           });
 
           # Formatting
@@ -85,6 +88,7 @@
         default = {
           type = "app";
           program = "${self.packages.${system}.default}/bin/imap-mcp-rs";
+          meta.description = "IMAP MCP Server — email tools for LLM assistants";
         };
       });
 

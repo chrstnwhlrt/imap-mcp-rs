@@ -3,6 +3,318 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## Unreleased
+
+Dependency update, a review pass over code and docs, and a tool surface for
+a small model behind a voice assistant (`tool_set = "voice"`), measured with
+Gemma 4 E4B together with the server changes it led to. Most fixes below
+concern behaviour that predates the update.
+
+### Security
+
+- **A `.env` file could choose the config.** Before resolving the config
+  path the server loaded `.env` from its working directory and every parent
+  directory. Such a file could set `IMAP_MCP_CONFIG`, or the XDG variables
+  that place the token state and the attachment directory, and so inject the
+  very config the working directory is deliberately not searched for.
+  Nothing ever read a credential from the environment, so `dotenvy` is gone,
+  along with the sample config's hint at a `.env` file.
+- **The startup prune could delete the user's own files.** It removed every
+  entry older than seven days in the first `allowed_attachment_dirs` entry,
+  subdirectories recursively, and the sample config suggests a Documents
+  folder for that list. It now removes only the per-download UUID
+  directories that `download_attachment` creates.
+- **The attachment directory is verified after it is prepared.** A directory
+  another user created beforehand (possible with the `/tmp` fallback) was
+  accepted although the chmod to 0700 failed silently, so that user could
+  read every download or swap a file before a draft attached it. The check
+  now runs after creation and chmod, at startup and before every download,
+  and refuses a symlink or anything still open to other users.
+- **Unknown command-line arguments are refused.** A misspelled `--config`
+  started the server on the default config, which may grant permissions the
+  intended one withholds. `--config` without a path did the same.
+- `reauth` strips control characters from the provider error it prints. Any
+  web page open during the flow can send a request to the loopback listener,
+  and terminal escape sequences in its `error` parameter reached the
+  terminal unfiltered. The error code of a token-endpoint response is now
+  stripped as well, as its description already was.
+
+### Fixed
+
+- **Gmail OAuth2 did not work.** Google's token endpoint answers HTTP/1.1
+  with `Transfer-Encoding: chunked`, and the minimal HTTPS client parsed the
+  raw body, chunk sizes included, as JSON. Every token refresh and every
+  `reauth` code exchange failed, and an `invalid_grant` was never recognized
+  as one. The client now decodes chunked bodies and honours
+  `Content-Length`. Outlook 365 was unaffected because Microsoft sends a
+  `Content-Length`.
+- **Failed tool calls are flagged as errors.** Every error came back as an
+  ordinary tool result with `isError: false`, the `{"error", "retryable"}`
+  object only in its text. The MCP specification reports a failed tool
+  execution with `isError: true`, so a client going by the flag saw every
+  refusal and every IMAP failure as a success. The flag is set now, the text
+  is unchanged.
+- **`list_emails` missed mail that arrived while its folder stayed
+  selected.** The page window came from the message count of the folder's
+  last SELECT. A server reports new mail in the selected folder only as an
+  untagged `EXISTS` next to a later command, which async-imap queues where
+  nothing reads it. As long as nothing else selected a folder in between,
+  as with an assistant watching a single inbox, new mail stayed out of the
+  listing and `total` kept the old count. Listings now select afresh.
+- **`get_thread` missed sibling branches.** It looked for replies to the
+  requested message and for its ancestors, so another reply to one of those
+  ancestors was left out of the "full thread". It now also collects
+  everything that descends from the thread's root.
+- **A search across all folders turned a lost connection into "no
+  matches".** Every per-folder error was logged and skipped, so with the
+  connection gone each remaining folder made its own reconnect attempt and
+  the call returned a partial result, down to `matched: 0`. Transient
+  errors now fail the call with `retryable: true`. A folder that refuses
+  every search (a `\Noselect` parent such as `[Gmail]`) is still skipped,
+  unless no folder could be searched at all. That case also came back as an
+  empty result, for example from a server refusing the criteria everywhere.
+- **Developer notes reached every client in the draft tools' schemas.**
+  schemars turns doc comments into schema descriptions, so 1.3 KB of notes
+  on serde and schemars stood in `tools/list` three times, in the
+  `attachments` entries of the three draft tools. The entry type now has a
+  one-line description of its own, and `tools/list` is 3.8 KB smaller.
+- **Text after an inline image was missing from `body_text`**, which held
+  only the first text part. Phone clients put a photo between two text
+  parts. All text parts are now joined in reading order.
+- **Text-only mail reported an HTML body it does not have.** mail-parser
+  stands the text part in for a missing HTML alternative and converts it on
+  the fly. `get_email(include_html: true)` returned that conversion, replies
+  quoted it instead of taking the plain-text path built for text-only
+  originals, and the divergence check compared the conversion with itself.
+  `body_html` now carries only an HTML part the sender wrote.
+- **Moving messages into the folder they are in is refused**, and so is a
+  non-permanent `delete_email` from the Trash folder, the `dry_run` preview
+  included. Both copied the messages onto themselves and expunged the
+  originals, so nothing moved while every UID changed. The delete from
+  Trash reported success with the messages still in place.
+- **Draft recipients are validated.** mail-builder writes any string between
+  `<` and `>`, so `Alice <alice@example.com>` became
+  `<Alice <alice@example.com>>`, a comma-separated list turned into one
+  broken mailbox and an entry that sanitized to nothing became `<>`.
+  Recipients now take a bare address or the `Name <address>` form, anything
+  else is refused with the entry named, and `draft_forward` and
+  `draft_email` require at least one `to`, as their schema always said.
+  Reply-all no longer lists an address twice, and an original recipient
+  without an address no longer turns into an empty `<>`.
+- **XOAUTH2 answers the server's error challenge with an empty response**,
+  as the mechanism defines it. Sending the credentials a second time left
+  the outcome of a failed login to however the server treats that protocol
+  violation.
+- **TCP keepalive gives up after three unanswered probes.** The README
+  promised about 60 seconds to notice a dead connection, and the Linux
+  default of nine probes made it two minutes.
+- **`body_parts_diverge` misread German HTML.** The HTML side of the
+  comparison decoded only six named entities, so `Gr&uuml;&szlig;e` fell
+  apart into fragments and every word with an umlaut counted as text the
+  HTML part lacked. All named entities are decoded now (through
+  mail-parser's table), and text that is no entity stays as written. Before,
+  a long run after a lone `&` gained a second `&`, `&;` vanished, and a lone
+  `&` kept the entity after it from being decoded (`Müller & S&ouml;hne`).
+- **The text signature derived from `signature_html` showed raw entities.**
+  It decoded six of them, so a signature with `Gr&uuml;&szlig;e` in its
+  markup put exactly that into the text part of every draft. It now uses
+  the full entity table.
+- `draft_email` caps the subject at 2 KiB, as the comment on the body cap
+  always claimed it did.
+- `since` and `before` refuse dates that do not exist. `2026-02-30` went to
+  the server as `30-Feb-2026`, and the caller got whatever the server's
+  parser made of it.
+- An `expires_in` from the token endpoint is capped at a day. The value
+  came off the network unchecked, and an absurd one overflowed the
+  computation of the token's deadline, which panics.
+- `reauth` refuses a repeated `--config` or `--port`. The last value used
+  to win silently.
+- `allowed_attachment_dirs` refuses entries starting with `~`. Nothing
+  expands it, so `"~/Downloads"` created a literal `~` directory wherever
+  the MCP client started the server, and downloads landed in it. Other
+  relative paths still load, with a warning.
+- `RUST_LOG` sets the log level. INFO was added on top of it and overwrote
+  any global level, so `RUST_LOG=debug` and `RUST_LOG=warn` both logged at
+  INFO.
+- `is_retryable_error` matched the bare word "temporarily", so a folder
+  named "Temporarily Archived" made "Unknown Mailbox" look retryable.
+- The UIDVALIDITY warning compared folder names case-insensitively, so two
+  distinct folders differing only in case set it off. Only `INBOX` is
+  case-insensitive.
+- `download_attachment` releases the account while it decodes and writes
+  the file, instead of blocking every other call on that account until the
+  write finished.
+- The `reauth` hint for `AADSTS50011` recommended the portal's "Mobile and
+  desktop applications" platform, which rejects the loopback URI. It now
+  points at the manifest entry the README describes.
+- Downloaded attachment names longer than 200 bytes are shortened, keeping
+  the extension. Longer names hit the file system's 255-byte limit and the
+  download failed.
+- An unknown account name now lists the configured accounts, like the error
+  for a missing one already did.
+- Error texts from Dovecot no longer end in its command timing
+  (`(0.001 + 0.041 + 0.040 secs)`), which says nothing about the error.
+- Server error texts keep brackets that belong to them. Stripping the
+  leading `[CODE]` also cut at any later `] `, so
+  `Unknown Mailbox: [Kunden] Projekte` came out as `Projekte`.
+- `get_email` and `download_attachment` take the server's answer for the
+  requested UID. They took the first FETCH response, and an unsolicited
+  flag update for another message, which servers send when a parallel
+  client changes one, made the call fail with "no body" or "not found".
+- `account_health` names a startup connect that timed out. The timeout was
+  only logged, so the account showed as offline without a reason.
+- `account_health` leaves out the token fields for password accounts and
+  `last_error` when there is none, as documented. Both came as `null`.
+- Snippets keep the lines of a mail apart. Line breaks went out with the
+  other control characters, so a listing read "Liebe GrüßeMama"; they now
+  become single spaces.
+- A `replaces_uid` that equals the UID the new draft was saved under
+  deletes nothing. It named no older draft, and the deletion threw away the
+  draft just written.
+- An extra `cc` on a reply that names someone the reply already addresses
+  is not listed a second time.
+- The MCP end-to-end script removes its working directory when it exits;
+  every run used to leave one behind.
+
+### Added
+
+- **Tool annotations.** Every tool carries the MCP hints, so a client that
+  asks before risky calls knows where to ask. The eight reading tools are
+  read-only, and only `delete_email` and `delete_draft` are destructive.
+  Without annotations MCP treats every tool as destructive, and such a
+  client asked before each `list_emails`. The flag tools are marked
+  idempotent, and `list_accounts` and `account_health`, which answer from
+  the configuration, as closed-world.
+- **`tool_set = "voice"`** serves a surface for a small model behind a
+  voice assistant, measured with Gemma 4 E4B behind the Otomo voice
+  assistant (kit in `mcp-tool-test/gemma`). Its descriptions begin with
+  what a tool does for the user, because such an assistant decides from the
+  first 140 characters whether a request needs the tool, and its
+  instructions stay within the 1000 characters it keeps. Parameters a spoken
+  request hardly needs are left out (`dry_run`, paging, `compact`,
+  attachments and a few more, `account` with a single account), and so is
+  schema detail that changes nothing for the caller, which shrinks
+  `tools/list` from 48 to 16 KB. `dry_run` goes because such an assistant
+  asks before destructive calls itself, and with earlier descriptions the
+  preview made the model ask a second time. Where every account has a
+  signature, the draft texts say that the server adds it, since the model
+  signed the message itself. A search for words that finds nothing lists the
+  ten newest INBOX emails, with the sender's name, to pick from. Hidden
+  parameters still work when a call sends them, and the default `full` is
+  unchanged.
+
+  Measured against the built binary, Gemma 4 E4B in Otomo handled 84 of 99
+  spoken requests (33 requests, three runs each), where the texts of 2.0.0
+  managed 34 of 62 (31 requests, two runs), and 25 of 28 held-out requests
+  that were never used for tuning, against 11 of 28. The prompt per model
+  call fell from 15.6k to 8.8k tokens (median). Claude Sonnet 5.5 with
+  `full` and every other change of this release handled 28 of 28 requests
+  (27 before) and 12 of 12 held-out ones. The texts carry the gain: the
+  server-side help below (folder names, the folder list in errors, local
+  dates, the recipient error, hiding `dry_run`) made no measurable
+  difference for Gemma once these texts say what to do, and it stays
+  because it is right for every client. Details, including what was tried
+  and dropped, are in `mcp-tool-test/gemma/EMPFEHLUNG.md`.
+- **Measurement kit** in `mcp-tool-test/gemma`: a Dovecot container with an
+  invented mailbox, reset before every conversation, a catalog of spoken
+  requests checked against the resulting mailbox, runners for Gemma behind
+  Otomo and for Claude, and the text variants with their ablation. It never
+  talks to a real mailbox.
+- **Folder names as people say them.** Every tool that takes `folder` or
+  `target_folder` accepts the readable name from `list_folders`
+  (`Entwürfe` for `Entw&APw-rfe`), the name in another case when only one
+  folder fits, and role words such as `Papierkorb`, `Trash`, `Gesendet` or
+  `Posteingang` for the folder with that role. Models pass the name they
+  showed the user or the one the user said, and the server refused both:
+  Dovecot rejects a readable name as invalid modified UTF-7. Responses name
+  the folder as the server knows it, and a name outside ASCII that fits no
+  folder is refused with the folder list before it reaches the server. The
+  `dry_run` previews keep the name as given, since they make no IMAP call.
+  With the voice texts, which say which name to pass, Gemma did as well
+  without it (8 of 12 requests either way).
+
+### Changed
+
+- **All dependencies updated to their latest releases.** mail-parser 1.0 is
+  a rewrite with a new API and requires Rust 1.98, so `rust-version` moves
+  from 1.91 to 1.98. mail-builder 2.0, dirs 7 and rmcp 3.9 needed no code
+  changes beyond a renamed type. async-imap 0.12 words errors from SELECT,
+  STATUS and SEARCH differently from every other command, and the cleanup
+  that reduces them to the server's own text handles both forms.
+  mail-builder no longer pulls in `gethostname`, since every draft sets its
+  own Message-ID; the fallback that once put the machine's name there now
+  writes "localhost". The direct `schemars` dependency is gone as well,
+  since the code only ever used rmcp's re-export, which keeps the two in
+  lockstep. Flake inputs refreshed, which brings Rust 1.99.1.
+- **Dates are shown in the machine's local time**, with its offset
+  (`2026-11-09T00:16:00+01:00`), in `date` and `internal_date`. They were
+  UTC (`...Z`), and a model telling the user when a mail came read the hour
+  off that: "23:19" for a mail that arrived at 00:16. The server still sorts
+  on UTC internally, and any ISO 8601 parser reads both forms.
+  `date_original` now appears where the sender's offset differs from the
+  machine's, no longer wherever it differs from UTC. Gemma got the hour
+  right with UTC dates too (4 of 4), because it took `date_original`, which
+  carried the local offset of the test mails. Mail from another zone or with
+  a UTC `Date` header has no such fallback.
+- A folder that does not exist is refused with the names of the folders
+  there are, for reading and as a move target, so the next call can take the
+  right one. The move refuses before anything is copied. With the voice
+  texts it made no measurable difference for Gemma (9 of 12 either way); it
+  and the folder names stand in for each other, and with either of them a
+  move "to the Papierkorb" worked 4 of 4 times.
+- A search for words that finds nothing says what to try instead (`hint`).
+  Searches by date or flags only get none, since there an empty result is
+  the answer.
+- A recipient given as a bare name ("Ben") is refused with the way to its
+  address (search the sender) instead of the address format alone. Once
+  the voice texts say to look the address up, Gemma no longer needed it.
+- `delete_email` on an account without a trash folder under a known name
+  refuses and says why. It used to move to a guessed folder named "Trash".
+- `text` and `subject` in `search_emails` take several words, all of
+  which must occur. Before, the whole value had to occur as written, so
+  "Stadtwerke Rechnung" found nothing and a model reported the mail
+  missing. "Quoted words" stay one phrase, and filler words (der, vom, the,
+  Mail and a few dozen more) are left out. A word joined by hyphens counts
+  as its parts when each has at least three letters, so "Telekom-Rechnung"
+  also finds "Rechnung der Telekom" ("E-Mail" stays whole), and a hyphen at
+  the edge of a word ("Telekom- und Stromrechnung") is dropped. Only ever
+  adds matches: every mail the old phrase found contains all its words. The
+  hyphen rule came from a held-out request of the Gemma measurement ("Leg
+  die Telekom-Rechnung zurück in den Posteingang"), which went from 0 of 2
+  to 4 of 4 with it. It changes how the server searches, not what a text
+  says; two new requests with hyphenated words went 8 of 8 with and without
+  it, since Gemma did not search for the whole word there.
+- Non-ASCII attachment names in drafts are written as RFC 2231 parameters
+  (`filename*=UTF-8''...`), the form RFC 2183 prescribes, instead of RFC 2047
+  encoded words.
+- A client speaking protocol `2026-07-28` no longer sends `initialize`, and
+  rmcp 3.9 answers an `initialize` naming that version with `2025-11-25`,
+  the newest version that has the handshake. The handshake-free `tools/list`
+  still carries `ttlMs` and `cacheScope`.
+- The MCP layer dispatches through the tool router built at startup. The
+  macro default it relied on rebuilt the router, all 19 tool schemas
+  included, on every `tools/list` and `tools/call`; the stored router it
+  was meant to use sat unread behind an `allow(dead_code)`.
+- Cargo.toml declares every tokio feature the code uses (`time`, `net`,
+  `sync`, `io-util` were only enabled through other crates before).
+- Both TLS clients hand rustls its crypto provider (aws-lc-rs) explicitly.
+  `ClientConfig::builder()` resolved it from the enabled crate features and
+  would panic at runtime once a second provider entered the dependency
+  tree.
+- `nix flake check` runs the same clippy gate as CI (all targets, pedantic
+  and nursery, warnings denied). It used to skip the tests and pass with
+  warnings.
+- `test-server.sh` uses GreenMail 2.1.15 under its fully qualified image
+  name, which podman needs when no registries are configured.
+- The GreenMail integration tests run one at a time. They share one
+  mailbox, and GreenMail fails a FETCH that races another session's
+  EXPUNGE, so parallel runs failed at random.
+
+339 unit tests (up from 283), 22 GreenMail integration tests (up from 17)
+and 45 checks in the MCP end-to-end script (up from 35). `test-server.sh`
+also creates `B&APw-cher` (Bücher), a folder whose name is encoded on the
+wire.
+
 ## 2.0.0
 
 Ergonomics release, driven by a field report from an LLM assistant using the

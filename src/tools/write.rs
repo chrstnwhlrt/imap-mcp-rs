@@ -1,14 +1,14 @@
 //! Mutating MCP tools: flag, mark read/unread, move, delete.
 //!
 //! Each tool checks `account_config.read_only` and the per-account
-//! `allow_move` / `allow_delete` switches before issuing IMAP commands —
-//! defense-in-depth so an LLM that ignores the schema description can't
-//! corrupt mailboxes that the user marked off-limits.
+//! `allow_move` / `allow_delete` / `allow_flag_change` switches before
+//! issuing IMAP commands — defense-in-depth so an LLM that ignores the schema
+//! description can't corrupt mailboxes that the user marked off-limits.
 
 use rmcp::schemars;
 use serde::Deserialize;
 
-use super::{ImapMcpServer, error_json};
+use super::{ImapMcpServer, ToolResult, error_json};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MoveEmailRequest {
@@ -118,20 +118,20 @@ pub struct DeleteEmailRequest {
     pub dry_run: Option<bool>,
 }
 
-/// Build the standard write-response. `account` is always included so the LLM
+/// Response of the four flag tools. `account` is always included so the LLM
 /// can disambiguate when calling tools on multiple accounts in parallel.
-/// IMAP STORE/COPY/EXPUNGE are atomic at the server — operations either
-/// fully succeed or return an error, so there is no `failed` field. What
-/// `succeeded` CAN legitimately be is a subset of the input: UIDs the server
-/// did not acknowledge (stale after UIDVALIDITY rotation, externally
-/// expunged, typos) are omitted rather than echoed — see
-/// `imap_client::acknowledged_uids`.
-fn write_ok(account: &str, succeeded: &[u32]) -> String {
+/// `succeeded` lists the UIDs whose flags the server acknowledged changing
+/// (see `imap_client::acknowledged_uids`); a UID already in the target state
+/// or unknown (stale after UIDVALIDITY rotation, externally expunged, typo)
+/// is omitted rather than echoed. There is deliberately no `failed` field
+/// here — see [`write_result`] for why the destructive tools have one and
+/// these do not.
+fn write_ok(account: &str, succeeded: &[u32]) -> ToolResult {
     serde_json::to_string(&serde_json::json!({
         "account": account,
         "succeeded": succeeded,
     }))
-    .unwrap()
+    .map_err(|e| error_json(&e.to_string()))
 }
 
 /// Result shape for the existence-verified destructive tools (move/delete):
@@ -141,7 +141,7 @@ fn write_ok(account: &str, succeeded: &[u32]) -> String {
 /// the two-field shape: for them the difference means "already in the
 /// target state OR unknown", and calling that `failed` would be the next
 /// misdirection.
-fn write_result(account: &str, succeeded: &[u32], input: &[u32]) -> String {
+pub(super) fn write_result(account: &str, succeeded: &[u32], input: &[u32]) -> ToolResult {
     let done: std::collections::HashSet<u32> = succeeded.iter().copied().collect();
     let mut failed: Vec<u32> = input
         .iter()
@@ -155,7 +155,7 @@ fn write_result(account: &str, succeeded: &[u32], input: &[u32]) -> String {
         "succeeded": succeeded,
         "failed": failed,
     }))
-    .unwrap()
+    .map_err(|e| error_json(&e.to_string()))
 }
 
 /// Upper bound on UIDs per write call. A prompt-injected LLM passing a
@@ -166,10 +166,10 @@ fn write_result(account: &str, succeeded: &[u32], input: &[u32]) -> String {
 /// more than any legitimate batch operation.
 const MAX_UIDS_PER_CALL: usize = 1000;
 
-fn uid_cap_error() -> String {
-    error_json(&format!(
+fn uid_cap_error() -> ToolResult {
+    Err(error_json(&format!(
         "uids list exceeds {MAX_UIDS_PER_CALL}-item cap — batch into smaller calls"
-    ))
+    )))
 }
 
 // Shared head of the four flag tools (mark read/unread, flag/unflag):
@@ -183,35 +183,48 @@ macro_rules! resolve_write {
         }
         let (config, client_arc) = match $server.resolve_client($req.account.as_deref()) {
             Ok(r) => r,
-            Err(e) => return error_json(&e),
+            Err(e) => return Err(error_json(&e)),
         };
         if config.read_only {
-            return error_json("Account is configured as read-only");
+            return Err(error_json("Account is configured as read-only"));
         }
         if !config.allow_flag_change {
-            return error_json(
+            return Err(error_json(
                 "Flag changes are disabled for this account (allow_flag_change = false)",
-            );
+            ));
         }
         (config.name.clone(), client_arc)
     }};
 }
 
-pub async fn move_email(server: &ImapMcpServer, req: MoveEmailRequest) -> String {
+pub async fn move_email(server: &ImapMcpServer, req: MoveEmailRequest) -> ToolResult {
     if req.uids.len() > MAX_UIDS_PER_CALL {
         return uid_cap_error();
     }
     let (config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     if config.read_only {
-        return error_json("Account is configured as read-only");
+        return Err(error_json("Account is configured as read-only"));
     }
     if !config.allow_move {
-        return error_json("Moving emails is disabled for this account (allow_move = false)");
+        return Err(error_json(
+            "Moving emails is disabled for this account (allow_move = false)",
+        ));
     }
     let account_name = config.name.clone();
+    // Checked before the preview too: a dry run must not promise a move the
+    // real call refuses (see `ImapClient::move_emails`). By the names as
+    // given — the preview makes no IMAP call, so a role word the real call
+    // resolves to the source folder ("Posteingang" for INBOX) is caught only
+    // there.
+    if crate::imap_client::same_folder(&req.folder, &req.target_folder) {
+        return Err(error_json(&format!(
+            "Source and target folder are the same (\"{}\") — there is nothing to move",
+            crate::email::sanitize_external_str(&req.folder)
+        )));
+    }
     if req.dry_run.unwrap_or(false) {
         // No IMAP roundtrip — returns the LLM a preview it can show before
         // calling the real op. Permission checks above still fired, so this
@@ -224,19 +237,18 @@ pub async fn move_email(server: &ImapMcpServer, req: MoveEmailRequest) -> String
             "uids": req.uids,
             "would_move": req.uids.len(),
         }))
-        .unwrap_or_else(|e| error_json(&e.to_string()));
+        .map_err(|e| error_json(&e.to_string()));
     }
     let mut client = client_arc.lock().await;
-    match client
-        .move_emails(&req.folder, &req.uids, &req.target_folder)
-        .await
-    {
+    let folder = super::folder_for(&mut client, &req.folder).await?;
+    let target = super::folder_for(&mut client, &req.target_folder).await?;
+    match client.move_emails(&folder, &req.uids, &target).await {
         Ok(succeeded) => write_result(&account_name, &succeeded, &req.uids),
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
-pub async fn mark_as_read(server: &ImapMcpServer, req: MarkReadRequest) -> String {
+pub async fn mark_as_read(server: &ImapMcpServer, req: MarkReadRequest) -> ToolResult {
     let (account_name, client_arc) = resolve_write!(server, req);
     if req.dry_run.unwrap_or(false) {
         // No IMAP roundtrip; the gates above still fired, so the preview
@@ -248,19 +260,17 @@ pub async fn mark_as_read(server: &ImapMcpServer, req: MarkReadRequest) -> Strin
             "uids": req.uids,
             "would_mark_read": req.uids.len(),
         }))
-        .unwrap_or_else(|e| error_json(&e.to_string()));
+        .map_err(|e| error_json(&e.to_string()));
     }
     let mut client = client_arc.lock().await;
-    match client
-        .mark_flags(&req.folder, &req.uids, "\\Seen", true)
-        .await
-    {
+    let folder = super::folder_for(&mut client, &req.folder).await?;
+    match client.mark_flags(&folder, &req.uids, "\\Seen", true).await {
         Ok(succeeded) => write_ok(&account_name, &succeeded),
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
-pub async fn mark_as_unread(server: &ImapMcpServer, req: MarkUnreadRequest) -> String {
+pub async fn mark_as_unread(server: &ImapMcpServer, req: MarkUnreadRequest) -> ToolResult {
     let (account_name, client_arc) = resolve_write!(server, req);
     if req.dry_run.unwrap_or(false) {
         // No IMAP roundtrip; the gates above still fired, so the preview
@@ -272,19 +282,17 @@ pub async fn mark_as_unread(server: &ImapMcpServer, req: MarkUnreadRequest) -> S
             "uids": req.uids,
             "would_mark_unread": req.uids.len(),
         }))
-        .unwrap_or_else(|e| error_json(&e.to_string()));
+        .map_err(|e| error_json(&e.to_string()));
     }
     let mut client = client_arc.lock().await;
-    match client
-        .mark_flags(&req.folder, &req.uids, "\\Seen", false)
-        .await
-    {
+    let folder = super::folder_for(&mut client, &req.folder).await?;
+    match client.mark_flags(&folder, &req.uids, "\\Seen", false).await {
         Ok(succeeded) => write_ok(&account_name, &succeeded),
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
-pub async fn flag_email(server: &ImapMcpServer, req: FlagEmailRequest) -> String {
+pub async fn flag_email(server: &ImapMcpServer, req: FlagEmailRequest) -> ToolResult {
     let (account_name, client_arc) = resolve_write!(server, req);
     if req.dry_run.unwrap_or(false) {
         // No IMAP roundtrip; the gates above still fired, so the preview
@@ -296,19 +304,20 @@ pub async fn flag_email(server: &ImapMcpServer, req: FlagEmailRequest) -> String
             "uids": req.uids,
             "would_flag": req.uids.len(),
         }))
-        .unwrap_or_else(|e| error_json(&e.to_string()));
+        .map_err(|e| error_json(&e.to_string()));
     }
     let mut client = client_arc.lock().await;
+    let folder = super::folder_for(&mut client, &req.folder).await?;
     match client
-        .mark_flags(&req.folder, &req.uids, "\\Flagged", true)
+        .mark_flags(&folder, &req.uids, "\\Flagged", true)
         .await
     {
         Ok(succeeded) => write_ok(&account_name, &succeeded),
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
-pub async fn unflag_email(server: &ImapMcpServer, req: UnflagEmailRequest) -> String {
+pub async fn unflag_email(server: &ImapMcpServer, req: UnflagEmailRequest) -> ToolResult {
     let (account_name, client_arc) = resolve_write!(server, req);
     if req.dry_run.unwrap_or(false) {
         // No IMAP roundtrip; the gates above still fired, so the preview
@@ -320,34 +329,49 @@ pub async fn unflag_email(server: &ImapMcpServer, req: UnflagEmailRequest) -> St
             "uids": req.uids,
             "would_unflag": req.uids.len(),
         }))
-        .unwrap_or_else(|e| error_json(&e.to_string()));
+        .map_err(|e| error_json(&e.to_string()));
     }
     let mut client = client_arc.lock().await;
+    let folder = super::folder_for(&mut client, &req.folder).await?;
     match client
-        .mark_flags(&req.folder, &req.uids, "\\Flagged", false)
+        .mark_flags(&folder, &req.uids, "\\Flagged", false)
         .await
     {
         Ok(succeeded) => write_ok(&account_name, &succeeded),
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
-pub async fn delete_email(server: &ImapMcpServer, req: DeleteEmailRequest) -> String {
+pub async fn delete_email(server: &ImapMcpServer, req: DeleteEmailRequest) -> ToolResult {
     if req.uids.len() > MAX_UIDS_PER_CALL {
         return uid_cap_error();
     }
     let (config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     if config.read_only {
-        return error_json("Account is configured as read-only");
+        return Err(error_json("Account is configured as read-only"));
     }
     if !config.allow_delete {
-        return error_json("Deleting emails is disabled for this account (allow_delete = false)");
+        return Err(error_json(
+            "Deleting emails is disabled for this account (allow_delete = false)",
+        ));
     }
     let account_name = config.name.clone();
     let permanent = req.permanent.unwrap_or(false);
+    // The refusal the real call makes for the Trash folder itself (see
+    // `ImapClient::delete_emails`), decided from the folder name here so the
+    // preview stays IMAP-free and does not promise a move the call refuses.
+    // A name only the real call resolves to the trash (a role word such as
+    // "Müll") is refused there.
+    if !permanent && crate::imap_client::detect_folder_role(&req.folder) == Some("trash") {
+        return Err(error_json(&format!(
+            "\"{}\" is the Trash folder — moving its messages to Trash changes nothing. Pass \
+             `permanent: true` to delete them for good",
+            crate::email::sanitize_external_str(&req.folder)
+        )));
+    }
     if req.dry_run.unwrap_or(false) {
         // No IMAP roundtrip. Clear preview of whether this would move to
         // Trash (recoverable) or EXPUNGE permanently.
@@ -364,15 +388,13 @@ pub async fn delete_email(server: &ImapMcpServer, req: DeleteEmailRequest) -> St
             "permanent": permanent,
             action: req.uids.len(),
         }))
-        .unwrap_or_else(|e| error_json(&e.to_string()));
+        .map_err(|e| error_json(&e.to_string()));
     }
     let mut client = client_arc.lock().await;
-    match client
-        .delete_emails(&req.folder, &req.uids, permanent)
-        .await
-    {
+    let folder = super::folder_for(&mut client, &req.folder).await?;
+    match client.delete_emails(&folder, &req.uids, permanent).await {
         Ok(succeeded) => write_result(&account_name, &succeeded, &req.uids),
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
@@ -472,6 +494,26 @@ mod tests {
         }
     }
 
+    /// The text of an error result — the call must have failed, i.e. reached
+    /// the client as `isError: true`.
+    fn refused(out: ToolResult) -> String {
+        out.expect_err("expected an error result")
+    }
+
+    /// The parsed JSON of a success result — the call must have succeeded.
+    fn ok_json(out: ToolResult) -> serde_json::Value {
+        serde_json::from_str(&out.expect("expected a success result")).expect("valid json")
+    }
+
+    /// The text of either outcome, for checks that a gate did NOT fire: with
+    /// the gate open the call goes on to the (closed) server port and fails
+    /// there, which is fine — only the gate's own refusal is ruled out.
+    fn text(out: &ToolResult) -> &str {
+        match out {
+            Ok(s) | Err(s) => s,
+        }
+    }
+
     /// `read_only` is the switch a user sets to make an account observable but
     /// untouchable. It has to hold for *every* mutating tool — one that
     /// forgets to consult it would silently write to a mailbox declared safe.
@@ -486,10 +528,11 @@ mod tests {
             flag_email(&s, flag_req(vec![1])).await,
             unflag_email(&s, unflag_req(vec![1])).await,
         ];
-        for (i, out) in refusals.iter().enumerate() {
+        for (i, out) in refusals.into_iter().enumerate() {
+            let err = refused(out);
             assert!(
-                out.contains("read-only"),
-                "tool #{i} did not refuse a read-only account: {out}"
+                err.contains("read-only"),
+                "tool #{i} did not refuse a read-only account: {err}"
             );
         }
     }
@@ -500,20 +543,21 @@ mod tests {
     #[tokio::test]
     async fn move_and_delete_honour_their_own_switches() {
         let no_move = server_with("allow_move = false\nallow_delete = true");
-        let out = move_email(&no_move, move_req(vec![1])).await;
-        assert!(out.contains("allow_move"), "{out}");
+        let err = refused(move_email(&no_move, move_req(vec![1])).await);
+        assert!(err.contains("allow_move"), "{err}");
 
         let no_delete = server_with("allow_move = true\nallow_delete = false");
-        let out = delete_email(&no_delete, delete_req(vec![1], false)).await;
-        assert!(out.contains("allow_delete"), "{out}");
+        let err = refused(delete_email(&no_delete, delete_req(vec![1], false)).await);
+        assert!(err.contains("allow_delete"), "{err}");
 
         // With the switch on, the refusal must be gone — otherwise the gate
         // would be indistinguishable from the feature being broken.
         let allowed = server_with("allow_move = true\nallow_delete = true");
         let out = move_email(&allowed, move_req(vec![1])).await;
+        let t = text(&out);
         assert!(
-            !out.contains("allow_move") && !out.contains("read-only"),
-            "an enabled account must not be refused: {out}"
+            !t.contains("allow_move") && !t.contains("read-only"),
+            "an enabled account must not be refused: {t}"
         );
     }
 
@@ -532,7 +576,8 @@ mod tests {
             delete_email(&s, delete_req(too_many.clone(), false)).await,
             mark_as_read(&s, mark_read_req(too_many)).await,
         ] {
-            assert!(out.contains("cap"), "oversized list not refused: {out}");
+            let err = refused(out);
+            assert!(err.contains("cap"), "oversized list not refused: {err}");
         }
     }
 
@@ -545,19 +590,16 @@ mod tests {
 
         let mut req = move_req(vec![7, 8]);
         req.dry_run = Some(true);
-        let out = move_email(&s, req).await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["dry_run"], true, "{out}");
-        assert_eq!(v["would_move"], 2, "{out}");
-        assert_eq!(v["target_folder"], "Archive", "{out}");
-        assert!(v.get("error").is_none(), "preview must not error: {out}");
+        let v = ok_json(move_email(&s, req).await);
+        assert_eq!(v["dry_run"], true, "{v}");
+        assert_eq!(v["would_move"], 2, "{v}");
+        assert_eq!(v["target_folder"], "Archive", "{v}");
 
         let mut req = delete_req(vec![7], true);
         req.dry_run = Some(true);
-        let out = delete_email(&s, req).await;
-        let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-        assert_eq!(v["dry_run"], true, "{out}");
-        assert_eq!(v["would_expunge_permanently"], 1, "{out}");
+        let v = ok_json(delete_email(&s, req).await);
+        assert_eq!(v["dry_run"], true, "{v}");
+        assert_eq!(v["would_expunge_permanently"], 1, "{v}");
     }
 
     /// A preview must still respect the gates: previewing an action the
@@ -567,17 +609,17 @@ mod tests {
         let s = server_with("read_only = true");
         let mut req = move_req(vec![1]);
         req.dry_run = Some(true);
-        assert!(move_email(&s, req).await.contains("read-only"));
+        assert!(refused(move_email(&s, req).await).contains("read-only"));
 
         let s = server_with("allow_delete = false");
         let mut req = delete_req(vec![1], false);
         req.dry_run = Some(true);
-        assert!(delete_email(&s, req).await.contains("allow_delete"));
+        assert!(refused(delete_email(&s, req).await).contains("allow_delete"));
 
         let s = server_with("allow_flag_change = false");
         let mut req = mark_read_req(vec![1]);
         req.dry_run = Some(true);
-        assert!(mark_as_read(&s, req).await.contains("allow_flag_change"));
+        assert!(refused(mark_as_read(&s, req).await).contains("allow_flag_change"));
     }
 
     /// The unread state is often a human's work queue: a bulk `mark_as_read`
@@ -593,16 +635,17 @@ mod tests {
             flag_email(&s, flag_req(vec![1])).await,
             unflag_email(&s, unflag_req(vec![1])).await,
         ] {
-            assert!(out.contains("allow_flag_change"), "{out}");
+            let err = refused(out);
+            assert!(err.contains("allow_flag_change"), "{err}");
         }
         // …and it must not block the unrelated tools.
         let out = move_email(&s, move_req(vec![1])).await;
-        assert!(!out.contains("allow_flag_change"), "{out}");
+        assert!(!text(&out).contains("allow_flag_change"), "{out:?}");
 
         // Enabled (the default): the refusal must be gone.
         let s = server_with("");
         let out = mark_as_read(&s, mark_read_req(vec![1])).await;
-        assert!(!out.contains("allow_flag_change"), "{out}");
+        assert!(!text(&out).contains("allow_flag_change"), "{out:?}");
     }
 
     /// Every flag tool previews without touching IMAP — against a closed
@@ -645,26 +688,55 @@ mod tests {
                 "would_unflag",
             ),
         ] {
-            let v: serde_json::Value = serde_json::from_str(&out).expect("valid json");
-            assert_eq!(v["dry_run"], true, "{out}");
-            assert!(v.get(field).is_some(), "{field} missing: {out}");
-            assert!(v.get("error").is_none(), "preview must not error: {out}");
+            let v = ok_json(out);
+            assert_eq!(v["dry_run"], true, "{v}");
+            assert!(v.get(field).is_some(), "{field} missing: {v}");
         }
+    }
+
+    /// Moving a folder into itself re-creates its messages under new UIDs
+    /// while nothing moves; refused before any IMAP traffic — the preview
+    /// included, which would otherwise promise a move the real call refuses.
+    #[tokio::test]
+    async fn move_into_the_source_folder_is_refused_even_as_preview() {
+        let s = server_with("");
+        let mut req = move_req(vec![1]);
+        req.target_folder = "INBOX".into();
+        assert!(refused(move_email(&s, req).await).contains("same"));
+        let mut req = move_req(vec![1]);
+        req.target_folder = "inbox".into();
+        req.dry_run = Some(true);
+        assert!(refused(move_email(&s, req).await).contains("same"));
+    }
+
+    /// A soft delete from the Trash would move its messages onto themselves;
+    /// the preview refuses it like the real call, without IMAP.
+    #[tokio::test]
+    async fn soft_delete_from_trash_is_refused_even_as_preview() {
+        let s = server_with("");
+        let mut req = delete_req(vec![1], false);
+        req.folder = "Papierkorb".into();
+        req.dry_run = Some(true);
+        assert!(refused(delete_email(&s, req).await).contains("permanent"));
+        // Permanent deletion from the Trash stays possible.
+        let mut req = delete_req(vec![1], true);
+        req.folder = "Trash".into();
+        req.dry_run = Some(true);
+        let v = ok_json(delete_email(&s, req).await);
+        assert_eq!(v["would_expunge_permanently"], 1, "{v}");
     }
 
     /// `failed` spells out the difference so a partial success can never be
     /// read as a full one by a caller that only checks for an error.
     #[test]
     fn write_result_reports_the_failed_difference() {
-        let v: serde_json::Value =
-            serde_json::from_str(&write_result("A", &[1, 3], &[1, 2, 3, 4])).unwrap();
+        let v = ok_json(write_result("A", &[1, 3], &[1, 2, 3, 4]));
         assert_eq!(v["succeeded"], serde_json::json!([1, 3]));
         assert_eq!(v["failed"], serde_json::json!([2, 4]));
 
         // Full success: failed is PRESENT and empty — an empty array is a
         // statement, an absent field is not.
-        let v: serde_json::Value =
-            serde_json::from_str(&write_result("A", &[1, 2], &[1, 2])).unwrap();
+        let v = ok_json(write_result("A", &[1, 2], &[1, 2]));
         assert_eq!(v["failed"], serde_json::json!([]));
     }
 }

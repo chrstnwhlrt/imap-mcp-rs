@@ -222,30 +222,38 @@ struct CliOptions {
 
 impl CliOptions {
     /// Hand-rolled argument parsing, matching the project's no-clap
-    /// dependency stance. Rejects anything ambiguous rather than guessing.
+    /// dependency stance. Rejects anything ambiguous rather than guessing —
+    /// a repeated `--config` or `--port` included, where the last one used
+    /// to win silently.
     fn parse(args: &[String]) -> Result<Self> {
         let mut account = None;
         let mut config = None;
-        let mut port = DEFAULT_PORT;
+        let mut port = None;
         let mut no_browser = false;
         let mut it = args.iter();
         while let Some(arg) = it.next() {
             match arg.as_str() {
                 "--config" => {
-                    config = Some(it.next().with_context(|| USAGE)?.clone());
+                    let path = it.next().with_context(|| USAGE)?.clone();
+                    if config.replace(path).is_some() {
+                        bail!("--config was given more than once\n{USAGE}");
+                    }
                 }
                 "--port" => {
                     let raw = it.next().with_context(|| USAGE)?;
                     // Port 0 would bind an OS-chosen port while the redirect
                     // URI still says ":0" — the browser would never reach us
                     // and the command would just sit there. Reject it.
-                    port = match raw.parse::<u16>() {
+                    let parsed = match raw.parse::<u16>() {
                         Ok(0) | Err(_) => bail!(
                             "--port must be a number between 1 and 65535 (got \"{raw}\"); \
                              the port has to match a redirect URI registered on the app"
                         ),
                         Ok(p) => p,
                     };
+                    if port.replace(parsed).is_some() {
+                        bail!("--port was given more than once\n{USAGE}");
+                    }
                 }
                 "--no-browser" => no_browser = true,
                 other if other.starts_with('-') => bail!("Unknown flag {other}\n{USAGE}"),
@@ -259,7 +267,7 @@ impl CliOptions {
         Ok(Self {
             account: account.with_context(|| USAGE)?,
             config,
-            port,
+            port: port.unwrap_or(DEFAULT_PORT),
             no_browser,
         })
     }
@@ -420,9 +428,11 @@ async fn handle_connection(mut stream: TcpStream, expected_state: &str) -> Optio
             )
             .await;
             let hint = if description.contains("AADSTS50011") || error == "redirect_uri_mismatch" {
-                "\nHint: the redirect URI is not registered on the app. For Entra, add the \
-                 \"Mobile and desktop applications\" platform (loopback on any port) or the \
-                 exact web redirect that reauth used (printed above)."
+                "\nHint: the redirect URI reauth used (printed above) is not registered on the \
+                 app. Entra: add it to `publicClient.redirectUris` in the app manifest — the \
+                 portal's Redirect URIs form rejects http loopback addresses (README, Outlook \
+                 365 setup step 2). Google: create the OAuth client as type \"Desktop app\", \
+                 which accepts loopback redirects on any port."
             } else {
                 ""
             };
@@ -473,14 +483,29 @@ enum RedirectError {
 }
 
 /// Decide what a redirect's query means. Pure for testability.
+///
+/// The provider's `error` fields end up on the operator's terminal, and any
+/// web page open during the flow can make the browser send a request to the
+/// loopback listener — so they are stripped of control characters (terminal
+/// escape sequences included) and capped before anyone prints them.
 fn validate_redirect(
     params: &BTreeMap<String, String>,
     expected_state: &str,
 ) -> std::result::Result<String, RedirectError> {
+    const MAX_ERROR_CHARS: usize = 500;
+    let printable = |s: &str| {
+        crate::email::sanitize_external_str(s)
+            .chars()
+            .take(MAX_ERROR_CHARS)
+            .collect::<String>()
+    };
     if let Some(error) = params.get("error") {
         return Err(RedirectError::Provider {
-            error: error.clone(),
-            description: params.get("error_description").cloned().unwrap_or_default(),
+            error: printable(error),
+            description: params
+                .get("error_description")
+                .map(|d| printable(d))
+                .unwrap_or_default(),
         });
     }
     let Some(code) = params.get("code") else {
@@ -685,6 +710,14 @@ mod tests {
             (vec!["Office", "--port", "99999"], "between 1 and 65535"),
             (vec!["Office", "--port", "abc"], "between 1 and 65535"),
             (vec!["Office", "--config"], "usage"),
+            (
+                vec!["Office", "--config", "/a", "--config", "/b"],
+                "more than once",
+            ),
+            (
+                vec!["Office", "--port", "9000", "--port", "9001"],
+                "more than once",
+            ),
         ] {
             let err = parse_args(&args).unwrap_err().to_string().to_lowercase();
             assert!(
@@ -920,6 +953,23 @@ mod tests {
             validate_redirect(&p, "st"),
             Err(RedirectError::Provider { .. })
         ));
+    }
+
+    /// Any web page open during the flow can send a request to the loopback
+    /// listener; what it puts in `error` lands on the operator's terminal.
+    #[test]
+    fn validate_redirect_strips_terminal_escapes_from_provider_errors() {
+        let params = parse_query("error=%1B%5D0%3Bpwned%07x&error_description=a%1B%5B2Jb");
+        let Err(RedirectError::Provider { error, description }) = validate_redirect(&params, "st")
+        else {
+            panic!("expected a provider error");
+        };
+        assert!(
+            !error.contains('\u{1b}') && !error.contains('\u{7}'),
+            "{error:?}"
+        );
+        assert!(!description.contains('\u{1b}'), "{description:?}");
+        assert_eq!(description, "a[2Jb");
     }
 
     #[test]

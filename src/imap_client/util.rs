@@ -62,14 +62,21 @@ pub fn imap_astring(value: &str) -> String {
 }
 
 /// Convert ISO 8601 date (YYYY-MM-DD) to IMAP date format (DD-Mon-YYYY).
+///
+/// The date has to exist: `2026-02-30` used to go out as `30-Feb-2026`, and
+/// the caller got back whatever the server's parser made of it instead of a
+/// plain "no such date".
 pub fn iso_to_imap_date(iso: &str) -> Result<String> {
     let parts: Vec<&str> = iso.split('-').collect();
     if parts.len() != 3 {
         anyhow::bail!("Invalid date format: {iso}. Expected YYYY-MM-DD");
     }
-    let year = parts[0];
-    let month_num: u32 = parts[1].parse().context("Invalid month")?;
-    let day: u32 = parts[2].parse().context("Invalid day")?;
+    let year: i16 = parts[0].parse().context("Invalid year")?;
+    let month_num: i8 = parts[1].parse().context("Invalid month")?;
+    let day: i8 = parts[2].parse().context("Invalid day")?;
+    if jiff::civil::Date::new(year, month_num, day).is_err() {
+        anyhow::bail!("Invalid date: {iso} does not exist");
+    }
 
     let month_name = match month_num {
         1 => "Jan",
@@ -87,7 +94,7 @@ pub fn iso_to_imap_date(iso: &str) -> Result<String> {
         _ => anyhow::bail!("Invalid month: {month_num}"),
     };
 
-    Ok(format!("{day}-{month_name}-{year}"))
+    Ok(format!("{day}-{month_name}-{year:04}"))
 }
 
 /// Build an IMAP OR chain from multiple search criteria.
@@ -136,7 +143,7 @@ pub fn sanitize_log_str(s: &str) -> String {
 }
 
 /// Whether retrying the same call later is sensible. Broader than
-/// [`is_connection_error`]: every dead-session error is retryable (the next
+/// `is_connection_error`: every dead-session error is retryable (the next
 /// call reconnects), and so are server-side transient states that leave the
 /// session alive — Dovecot's `[UNAVAILABLE]`/"Server Unavailable", mailbox
 /// `[INUSE]`, "try again". Feeds the `retryable` field every tool error
@@ -162,7 +169,7 @@ pub fn is_retryable_error(msg: &str) -> bool {
         // Full server phrases (Dovecot, Office 365, Gmail wordings).
         || lower.contains("server unavailable")
         || lower.contains("service unavailable")
-        || lower.contains("temporarily")
+        || lower.contains("temporarily unavailable")
         || lower.contains("temporary error")
         || lower.contains("temporary failure")
         || lower.contains("temporary problem")
@@ -220,8 +227,9 @@ pub(super) fn clean_message_id(id: &str) -> String {
 ///
 /// IMAP encodes non-ASCII folder names so that `Entwürfe` travels the wire as
 /// `Entw&APw-rfe` and `Gelöschte Elemente` as `Gel&APY-schte Elemente`. That
-/// wire form is the only name the server accepts, so it stays authoritative —
-/// this is purely for display.
+/// wire form is the only name the server accepts, so it stays authoritative:
+/// the decoded one is shown to the user and recognized when a caller passes
+/// it back (see `resolve_folder_name`), never sent to the server.
 ///
 /// Returns `None` when the name is plain ASCII (nothing gained) or when the
 /// encoding is malformed, so callers can simply omit the field.
@@ -248,13 +256,11 @@ pub(super) fn decode_modified_utf7(name: &str) -> Option<String> {
             let bytes = STANDARD_NO_PAD
                 .decode(after[..end].replace(',', "/"))
                 .ok()?;
-            if bytes.len() % 2 != 0 {
+            let (pairs, remainder) = bytes.as_chunks::<2>();
+            if !remainder.is_empty() {
                 return None; // not whole UTF-16 code units
             }
-            let units: Vec<u16> = bytes
-                .chunks_exact(2)
-                .map(|p| u16::from_be_bytes([p[0], p[1]]))
-                .collect();
+            let units: Vec<u16> = pairs.iter().map(|&pair| u16::from_be_bytes(pair)).collect();
             out.push_str(&String::from_utf16(&units).ok()?);
         }
         rest = &after[end + 1..];
@@ -296,6 +302,13 @@ pub(super) fn extract_message_id(message_bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// Whether two folder names address the same mailbox. `INBOX` is
+/// case-insensitive (RFC 3501 §5.1); every other name compares exactly, as
+/// servers treat it.
+pub fn same_folder(a: &str, b: &str) -> bool {
+    a == b || (a.eq_ignore_ascii_case("INBOX") && b.eq_ignore_ascii_case("INBOX"))
+}
+
 /// Locale-aware reply prefixes, lowercase. Shared between subject-stripping
 /// (for thread search) and reply-subject detection (for draft composition)
 /// so the two can never drift apart.
@@ -333,9 +346,11 @@ pub(super) fn strip_email_prefixes(subject: &str) -> &str {
 /// Reformat a raw async-imap error string into a concise user-facing message.
 ///
 /// async-imap's `Display` for `Error::No` / `Error::Bad` emits its own
-/// `Option`-debug shape:
-/// `no response: code: None, info: Some("[NONEXISTENT] Unknown Mailbox: X (now in authenticated state) (Failure)")`
-/// which leaks internal framing to the LLM. Extract the actual server
+/// `Option`-debug shape, in two wordings: most commands give
+/// `no response: code: None, info: Some("[NONEXISTENT] Unknown Mailbox: X (now in authenticated state) (Failure)")`,
+/// while SELECT, STATUS and SEARCH (since async-imap 0.12) give
+/// `no response: outcome: Outcome { code: None, information: Some("…") }`.
+/// Either leaks internal framing to the LLM. Extract the actual server
 /// response text, strip the `[CODE]` prefix and the trailing `(Failure)` /
 /// `(now in ... state)` noise, and return just the useful part.
 ///
@@ -343,16 +358,24 @@ pub(super) fn strip_email_prefixes(subject: &str) -> &str {
 /// error message (including our own static strings) at the `error_json`
 /// boundary.
 pub fn clean_imap_error(raw: &str) -> String {
-    let info = raw
-        .split_once("info: Some(\"")
+    // Neither marker is a substring of the other ("information" does not
+    // contain "info: "), so the order of the two does not matter.
+    let info = ["info: Some(\"", "information: Some(\""]
+        .iter()
+        .find_map(|marker| raw.split_once(marker))
         .and_then(|(_, rest)| rest.rsplit_once("\")"))
         .map(|(inner, _)| inner);
     let Some(info) = info else {
         return raw.to_string();
     };
 
-    // Strip a well-known response-code prefix: "[NONEXISTENT] ", "[TRYCREATE] ", etc.
-    let info = info.find("] ").map_or(info, |end| &info[end + 2..]);
+    // Strip a leading response code ("[NONEXISTENT] ", "[TRYCREATE] ", …).
+    // Only at the start: a folder name such as `[Kunden] Projekte` further
+    // on is part of the message, and an unanchored search cut it in half.
+    let info = info
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once("] "))
+        .map_or(info, |(_, message)| message);
 
     // Drop trailing framing noise that async-imap / Dovecot / Cyrus append.
     let info = info
@@ -361,7 +384,32 @@ pub fn clean_imap_error(raw: &str) -> String {
         .unwrap_or(info);
     let info = info.trim_end_matches(" (Failure)");
 
-    info.to_string()
+    strip_command_timing(info).to_string()
+}
+
+/// Drop the command timing Dovecot appends to its tagged responses, as in
+/// `Mailbox doesn't exist: X (0.001 + 0.041 + 0.040 secs).` It says how long
+/// the command took, nothing about what went wrong. Any other parenthesis
+/// stays.
+fn strip_command_timing(text: &str) -> &str {
+    let trimmed = text.strip_suffix('.').unwrap_or(text);
+    let Some(inner) = trimmed.strip_suffix(" secs)") else {
+        return text;
+    };
+    let Some(open) = inner.rfind(" (") else {
+        return text;
+    };
+    let timing = &inner[open + 2..];
+    if !timing.is_empty()
+        && timing
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | '+' | ' '))
+    {
+        // `inner` is a prefix of `text`, so `open` indexes both.
+        &text[..open]
+    } else {
+        text
+    }
 }
 
 #[cfg(test)]
@@ -421,6 +469,12 @@ mod tests {
         assert!(iso_to_imap_date("2026-13-01").is_err());
         assert!(iso_to_imap_date("not-a-date").is_err());
         assert!(iso_to_imap_date("2026").is_err());
+        // Shaped right, but no such day: refused before it reaches a server.
+        assert!(iso_to_imap_date("2026-02-30").is_err());
+        assert!(iso_to_imap_date("2026-04-31").is_err());
+        assert!(iso_to_imap_date("2026-00-10").is_err());
+        assert!(iso_to_imap_date("abcd-01-01").is_err());
+        assert_eq!(iso_to_imap_date("2028-02-29").unwrap(), "29-Feb-2028");
     }
 
     #[test]
@@ -513,6 +567,7 @@ mod tests {
     fn is_retryable_error_ignores_transient_words_inside_names() {
         for msg in [
             "Unknown Mailbox: Temporary Projects",
+            "Unknown Mailbox: Temporarily Archived",
             "Attachment \"unavailable\" not found in email 42",
             "Folder \"Machines in use\" not found",
         ] {
@@ -537,7 +592,6 @@ mod tests {
         assert!(!is_connection_error(""));
     }
 
-    /// Real folder names as Gmail and Outlook send them over the wire.
     /// Parsers see hostile input: folder names come from the server, MIME from
     /// whoever sent the mail. None of these may panic, whatever they are fed.
     #[test]
@@ -594,6 +648,7 @@ mod tests {
         let _ = extract_message_id(&[0xff, 0xfe, b'\n', b'\n', 0x80]);
     }
 
+    /// Real folder names as Gmail and Outlook send them over the wire.
     #[test]
     fn decode_modified_utf7_handles_real_folder_names() {
         assert_eq!(
@@ -704,6 +759,15 @@ mod tests {
     }
 
     #[test]
+    fn same_folder_is_exact_except_for_inbox() {
+        assert!(same_folder("Archive", "Archive"));
+        assert!(same_folder("INBOX", "inbox"));
+        assert!(!same_folder("Archive", "archive"));
+        assert!(!same_folder("INBOX/Sub", "inbox/Sub"));
+        assert!(!same_folder("INBOX", "Trash"));
+    }
+
+    #[test]
     fn strip_email_prefixes_removes_known_variants() {
         assert_eq!(strip_email_prefixes("Re: Hello"), "Hello");
         assert_eq!(strip_email_prefixes("RE: Hello"), "Hello");
@@ -764,6 +828,52 @@ mod tests {
         let raw =
             r#"no response: code: None, info: Some("Server temporarily unavailable (Failure)")"#;
         assert_eq!(clean_imap_error(raw), "Server temporarily unavailable");
+    }
+
+    /// async-imap 0.12 frames errors from SELECT, STATUS and SEARCH as an
+    /// `Outcome` debug print. A missing folder (the most common caller
+    /// mistake) arrives in exactly this shape and must read as the server's
+    /// own text, not as the client library's framing.
+    #[test]
+    fn clean_imap_error_handles_the_outcome_framing() {
+        let raw = r#"no response: outcome: Outcome { code: None, information: Some("SELECT failed. No such mailbox") }"#;
+        assert_eq!(clean_imap_error(raw), "SELECT failed. No such mailbox");
+        let raw = r#"no response: outcome: Outcome { code: None, information: Some("[NONEXISTENT] Unknown Mailbox: X (now in authenticated state) (Failure)") }"#;
+        assert_eq!(clean_imap_error(raw), "Unknown Mailbox: X");
+        let raw = r#"bad response: outcome: Outcome { code: Some(Parse), information: Some("Could not parse command") }"#;
+        assert_eq!(clean_imap_error(raw), "Could not parse command");
+        // The retryable classification runs on the raw text and still sees
+        // the bracketed RFC 5530 code inside the framing.
+        assert!(is_retryable_error(
+            r#"no response: outcome: Outcome { code: None, information: Some("[UNAVAILABLE] Backend down") }"#
+        ));
+    }
+
+    /// Dovecot appends how long the command took. That is noise for a
+    /// caller; a parenthesis that is part of the message stays.
+    #[test]
+    fn clean_imap_error_drops_dovecot_command_timing() {
+        let raw = r#"no response: outcome: Outcome { code: None, information: Some("Mailbox doesn't exist: Papierkorb (0.001 + 0.041 + 0.040 secs).") }"#;
+        assert_eq!(clean_imap_error(raw), "Mailbox doesn't exist: Papierkorb");
+        let raw = r#"no response: code: None, info: Some("[NONEXISTENT] Mailbox doesn't exist: X (0.000 + 0.000 secs).")"#;
+        assert_eq!(clean_imap_error(raw), "Mailbox doesn't exist: X");
+        let raw = r#"no response: code: None, info: Some("Unknown Mailbox: Archiv (2024)")"#;
+        assert_eq!(clean_imap_error(raw), "Unknown Mailbox: Archiv (2024)");
+        let raw = r#"no response: code: None, info: Some("Quota exceeded (mailbox for user is full secs)")"#;
+        assert_eq!(
+            clean_imap_error(raw),
+            "Quota exceeded (mailbox for user is full secs)"
+        );
+    }
+
+    /// Brackets later in the text belong to the message (a folder name), not
+    /// to a response code — only a leading `[CODE] ` is stripped.
+    #[test]
+    fn clean_imap_error_keeps_brackets_inside_the_message() {
+        let raw = r#"no response: code: None, info: Some("Unknown Mailbox: [Kunden] Projekte (Failure)")"#;
+        assert_eq!(clean_imap_error(raw), "Unknown Mailbox: [Kunden] Projekte");
+        let raw = r#"no response: code: None, info: Some("[NONEXISTENT] Unknown Mailbox: [Kunden] Projekte (Failure)")"#;
+        assert_eq!(clean_imap_error(raw), "Unknown Mailbox: [Kunden] Projekte");
     }
 
     #[test]

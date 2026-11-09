@@ -1,18 +1,19 @@
 //! Draft composition: reply, forward, and fresh-compose.
 //!
 //! All three follow the same skeleton:
-//! 1. Resolve account + check `read_only`.
+//! 1. Resolve account + check `read_only`, then validate the caller's input
+//!    (size caps, recipients) — before any IMAP traffic.
 //! 2. (Reply / forward only) fetch the original — under a short mutex hold.
-//! 3. Build sanitized recipient lists and the plaintext + HTML bodies — pure
-//!    CPU work, mutex released.
+//! 3. Read the attachments and build the plaintext + HTML bodies — pure CPU
+//!    work, mutex released.
 //! 4. APPEND to the account's Drafts folder.
 //!
 //! Sanitization runs at the boundary between untrusted input (parsed mail
 //! headers, LLM tool args) and `mail-builder`: every recipient and
-//! Message-ID passes through [`sanitize_header_value`] to strip CR/LF that
+//! Message-ID passes through `sanitize_header_value` to strip CR/LF that
 //! would otherwise inject extra headers (e.g. a silent `Bcc:`).
 //!
-//! Rendering helpers (Locale presets, Outlook Web HTML) live in [`render`].
+//! Rendering helpers (Locale presets, Outlook Web HTML) live in `render`.
 
 use std::sync::Arc;
 
@@ -27,7 +28,7 @@ use tokio::sync::Mutex;
 use crate::email::EmailFull;
 use crate::imap_client::ImapClient;
 
-use super::{ImapMcpServer, error_json};
+use super::{ImapMcpServer, ToolResult, error_json};
 
 mod render;
 use render::{
@@ -59,10 +60,16 @@ use render::{
 /// it to emit the `anyOf` schema. Removing it would flip the served schema
 /// to an externally-tagged `oneOf` and break every currently valid
 /// `attachments` array against strict client-side validation — the incident
-/// class the 2026-07-28 handshake replay exists to catch.
+/// class of the 2026-07-28 handshake, which `draft_request_schemas_are_ref_free`
+/// pins.
+///
+/// The schema carries a short description of its own: schemars would
+/// otherwise serve this entire comment, serde notes included, to every client
+/// in all three draft tools.
 #[derive(Debug, schemars::JsonSchema)]
 #[serde(untagged)]
 #[schemars(inline)]
+#[schemars(description = "A file path, or {path, inline, cid} for an image shown inside the body.")]
 pub enum AttachmentSpec {
     /// Bare absolute path — a regular attachment.
     Path(String),
@@ -182,10 +189,11 @@ impl DraftAccount {
 /// Stamp explicit `Message-ID` and `Date` headers on the builder.
 ///
 /// Without these, `mail-builder` generates both at write time — the
-/// Message-ID domain falling back to the **machine's hostname** (leaking the
-/// local machine name into every draft) and the Date to UTC, while desktop
-/// clients write their sending domain and the local UTC offset. Setting them
-/// explicitly makes the draft indistinguishable from a hand-written one.
+/// Message-ID on `localhost` (on the **machine's hostname** with its default
+/// `gethostname` feature, which Cargo.toml disables for exactly that leak)
+/// and the Date in UTC, while desktop clients write their sending domain and
+/// the local UTC offset. Setting them explicitly makes the draft
+/// indistinguishable from a hand-written one.
 fn stamp_identity_headers<'a>(
     builder: MessageBuilder<'a>,
     message_id_domain: &str,
@@ -224,7 +232,7 @@ pub struct DraftReplyRequest {
     )]
     pub reply_all: Option<bool>,
     #[schemars(
-        description = "Additional CC email addresses, e.g. [\"alice@example.com\"]. Appended to any recipients from reply_all."
+        description = "Additional CC recipients, one per entry — a bare address or `Name <address>`, e.g. [\"alice@example.com\", \"Bob Example <bob@example.com>\"]. Appended to any recipients from reply_all."
     )]
     pub cc: Option<Vec<String>>,
     #[schemars(
@@ -248,14 +256,16 @@ pub struct DraftForwardRequest {
     #[schemars(description = "Email UID to forward (from list_emails or search_emails results)")]
     pub uid: u32,
     #[schemars(
-        description = "Recipient email addresses, e.g. [\"alice@example.com\"]. At least one required — forwarding never auto-selects recipients."
+        description = "Recipients, one per entry — a bare address or `Name <address>`, e.g. [\"alice@example.com\", \"Bob Example <bob@example.com>\"]. At least one required — forwarding never auto-selects recipients."
     )]
     pub to: Vec<String>,
     #[schemars(
         description = "Optional plain-text message placed ABOVE the forwarded content. If omitted, only the forwarded content is included."
     )]
     pub body: Option<String>,
-    #[schemars(description = "Optional CC email addresses, e.g. [\"alice@example.com\"]")]
+    #[schemars(
+        description = "Optional CC recipients, one per entry — a bare address or `Name <address>`."
+    )]
     pub cc: Option<Vec<String>>,
     #[schemars(
         description = "Files to attach. Each entry is either an absolute path (e.g. from download_attachment's `saved_to`) or an object `{path, inline, cid}`. With `inline: true` the file is embedded in the body instead of appended: reference it from `body` as `![alt](cid:<id>)` and it appears exactly there. Paths must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
@@ -284,17 +294,17 @@ pub struct DraftEmailRequest {
     )]
     pub account: Option<String>,
     #[schemars(
-        description = "Recipient email addresses, e.g. [\"alice@example.com\"]. At least one required."
+        description = "Recipients, one per entry — a bare address or `Name <address>`, e.g. [\"alice@example.com\", \"Bob Example <bob@example.com>\"]. At least one required."
     )]
     pub to: Vec<String>,
     #[schemars(description = "Email subject line (plain text)")]
     pub subject: String,
     #[schemars(description = "Plain-text email body. Rendered to HTML automatically.")]
     pub body: String,
-    #[schemars(description = "CC email addresses, e.g. [\"alice@example.com\"]")]
+    #[schemars(description = "CC recipients, one per entry — a bare address or `Name <address>`.")]
     pub cc: Option<Vec<String>>,
     #[schemars(
-        description = "BCC email addresses (hidden from other recipients), e.g. [\"alice@example.com\"]"
+        description = "BCC recipients (hidden from other recipients), one per entry — a bare address or `Name <address>`."
     )]
     pub bcc: Option<Vec<String>>,
     #[schemars(
@@ -309,25 +319,61 @@ pub struct DraftEmailRequest {
 
 // ========== Tool implementations ==========
 
+/// Fetch the message a reply or forward is based on. The error side is the
+/// finished tool response.
+///
+/// Locks only for the fetch — CPU work (HTML escape, quote building, MIME
+/// serialization) happens outside the mutex so parallel tool calls on the
+/// same account aren't blocked on this draft.
+async fn fetch_original(
+    client_arc: &Arc<Mutex<ImapClient>>,
+    folder: &str,
+    uid: u32,
+) -> Result<EmailFull, String> {
+    let mut client = client_arc.lock().await;
+    let folder = super::folder_for(&mut client, folder).await?;
+    match client.get_email(&folder, uid).await {
+        Ok(Some(email)) => Ok(email),
+        Ok(None) => Err(error_json(&format!(
+            "Email with UID {uid} not found in {}",
+            crate::email::sanitize_external_str(&folder)
+        ))),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
+    }
+}
+
 /// Common tail of all three draft tools: report the new draft's UID, honour
 /// `replaces_uid` (if given) and serialize. Keeping it here means the
 /// append-then-expunge order is implemented once rather than three times.
 ///
 /// `uid` is absent when the server did not let us identify the appended
 /// message; the draft was still saved, so it is omitted rather than nulled.
+///
+/// A `replaces_uid` equal to the new draft's own UID deletes nothing: the
+/// UID did not exist when the call came in (the server hands out the next
+/// free one), so it named no older draft, and deleting it would throw away
+/// the draft just written.
 async fn finish_draft(
     client_arc: &Arc<Mutex<ImapClient>>,
     uid: Option<u32>,
     replaces_uid: Option<u32>,
     mut response: serde_json::Value,
-) -> String {
+) -> ToolResult {
     if let Some(uid) = uid {
         response["uid"] = serde_json::json!(uid);
     }
-    if let Some(old_uid) = replaces_uid {
-        remove_replaced_draft(client_arc, old_uid, &mut response).await;
+    match replaces_uid {
+        Some(old_uid) if uid == Some(old_uid) => {
+            response["replace_warning"] = serde_json::json!(format!(
+                "replaces_uid {old_uid} is the UID this new draft was saved under, so it named \
+                 no older draft and nothing was deleted — check list_drafts for the version \
+                 you meant to replace"
+            ));
+        }
+        Some(old_uid) => remove_replaced_draft(client_arc, old_uid, &mut response).await,
+        None => {}
     }
-    serde_json::to_string(&response).unwrap_or_else(|e| error_json(&e.to_string()))
+    serde_json::to_string(&response).map_err(|e| error_json(&e.to_string()))
 }
 
 /// Delete the draft a newly saved one replaces. Called *after* the save
@@ -380,42 +426,34 @@ fn note_replacement(
     }
 }
 
-pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> String {
+pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     if account_config.read_only {
-        return error_json("Account is configured as read-only");
+        return Err(error_json("Account is configured as read-only"));
     }
     if req.body.len() > MAX_BODY_BYTES {
-        return error_json(&format!("Reply body exceeds {MAX_BODY_BYTES}-byte cap"));
+        return Err(error_json(&format!(
+            "Reply body exceeds {MAX_BODY_BYTES}-byte cap"
+        )));
     }
+    // Validated before the original is fetched: a malformed address is the
+    // caller's to fix, no IMAP round trip needed to say so.
+    let extra_cc = match parse_recipients(req.cc.as_deref()) {
+        Ok(list) => list,
+        Err(e) => return Err(error_json(&e)),
+    };
     let acct = DraftAccount::from_config(account_config);
 
-    // Lock only for the fetch — CPU work (HTML escape, quote building, MIME
-    // serialization) happens outside the mutex so parallel tool calls on the
-    // same account aren't blocked on this draft.
-    let original = {
-        let mut client = client_arc.lock().await;
-        match client.get_email(&req.folder, req.uid).await {
-            Ok(Some(email)) => email,
-            Ok(None) => {
-                return error_json(&format!(
-                    "Email with UID {} not found in {}",
-                    req.uid,
-                    crate::email::sanitize_external_str(&req.folder)
-                ));
-            }
-            Err(e) => return error_json(&client.check_error(e).to_string()),
-        }
-    };
+    let original = fetch_original(&client_arc, &req.folder, req.uid).await?;
 
     let reply_all = req.reply_all.unwrap_or(false);
     let (to_list, cc_list) =
-        match build_reply_recipients(&original, reply_all, &acct.from, req.cc.as_deref()) {
+        match build_reply_recipients(&original, reply_all, &acct.from, extra_cc) {
             Ok(pair) => pair,
-            Err(e) => return error_json(e),
+            Err(e) => return Err(error_json(e)),
         };
 
     let subject_raw = if has_reply_prefix(&original.subject) {
@@ -437,7 +475,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
     .await
     {
         Ok(v) => v,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
 
     // Scoped so the borrows of `prepared` end before it is moved into the
@@ -471,7 +509,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
 
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
-        Err(e) => return error_json(&format!("Failed to build MIME message: {e}")),
+        Err(e) => return Err(error_json(&format!("Failed to build MIME message: {e}"))),
     };
 
     let save_result = {
@@ -505,39 +543,36 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Stri
             }
             finish_draft(&client_arc, new_uid, req.replaces_uid, response).await
         }
-        Err(e) => error_json(&format!("Failed to save draft: {e}")),
+        Err(e) => Err(error_json(&format!("Failed to save draft: {e}"))),
     }
 }
 
-pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> String {
+pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     if account_config.read_only {
-        return error_json("Account is configured as read-only");
+        return Err(error_json("Account is configured as read-only"));
     }
     if let Some(b) = &req.body
         && b.len() > MAX_BODY_BYTES
     {
-        return error_json(&format!("Forward body exceeds {MAX_BODY_BYTES}-byte cap"));
+        return Err(error_json(&format!(
+            "Forward body exceeds {MAX_BODY_BYTES}-byte cap"
+        )));
     }
+    // Before the original is fetched — see draft_reply.
+    let (to, cc) = match (
+        required_recipients(&req.to),
+        parse_recipients(req.cc.as_deref()),
+    ) {
+        (Ok(to), Ok(cc)) => (to, cc),
+        (Err(e), _) | (_, Err(e)) => return Err(error_json(&e)),
+    };
     let acct = DraftAccount::from_config(account_config);
 
-    let original = {
-        let mut client = client_arc.lock().await;
-        match client.get_email(&req.folder, req.uid).await {
-            Ok(Some(email)) => email,
-            Ok(None) => {
-                return error_json(&format!(
-                    "Email with UID {} not found in {}",
-                    req.uid,
-                    crate::email::sanitize_external_str(&req.folder)
-                ));
-            }
-            Err(e) => return error_json(&client.check_error(e).to_string()),
-        }
-    };
+    let original = fetch_original(&client_arc, &req.folder, req.uid).await?;
 
     let subject_raw = if has_forward_prefix(&original.subject) {
         original.subject.clone()
@@ -557,7 +592,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     .await
     {
         Ok(v) => v,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
 
     let (plain_body, html_body) = {
@@ -575,25 +610,21 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
     builder = stamp_identity_headers(builder, &acct.message_id_domain);
 
-    // Collect into a Vec and pass once; `.to()` / `.cc()` overwrite on repeat
-    // calls (same bug that affected draft_reply before the fix). Clones go to
-    // the builder; the originals are echoed in the response below — echoing
-    // the RAW request values instead would claim recipients the saved
-    // headers do not carry (e.g. with an injected `\r\nBcc:` stripped out).
-    let to_clean = clean_recipients(Some(&req.to));
-    if !to_clean.is_empty() {
-        builder = builder.to(to_clean.clone());
-    }
-    let cc_clean = clean_recipients(req.cc.as_deref());
-    if !cc_clean.is_empty() {
-        builder = builder.cc(cc_clean.clone());
+    // Pass each list once; `.to()` / `.cc()` overwrite on repeat calls (same
+    // bug that affected draft_reply before the fix). The response below
+    // echoes the parsed addresses — echoing the RAW request values instead
+    // would claim recipients the saved headers do not carry (e.g. with an
+    // injected `\r\nBcc:` stripped out).
+    builder = builder.to(to_address_list(&to));
+    if !cc.is_empty() {
+        builder = builder.cc(to_address_list(&cc));
     }
 
     builder = apply_bodies_and_attachments(builder, &plain_body, &html_body, prepared);
 
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
-        Err(e) => return error_json(&format!("Failed to build MIME message: {e}")),
+        Err(e) => return Err(error_json(&format!("Failed to build MIME message: {e}"))),
     };
 
     let save_result = {
@@ -609,8 +640,8 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
                 "status": "ok",
                 "account": acct.name,
                 "from": acct.from,
-                "to": to_clean,
-                "cc": cc_clean,
+                "to": addresses_only(&to),
+                "cc": addresses_only(&cc),
                 "subject": subject,
                 "body_preview": truncate(&plain_body, 500),
             });
@@ -619,21 +650,36 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
             }
             finish_draft(&client_arc, new_uid, req.replaces_uid, response).await
         }
-        Err(e) => error_json(&format!("Failed to save draft: {e}")),
+        Err(e) => Err(error_json(&format!("Failed to save draft: {e}"))),
     }
 }
 
-pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> String {
+pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     if account_config.read_only {
-        return error_json("Account is configured as read-only");
+        return Err(error_json("Account is configured as read-only"));
     }
     if req.body.len() > MAX_BODY_BYTES {
-        return error_json(&format!("Draft body exceeds {MAX_BODY_BYTES}-byte cap"));
+        return Err(error_json(&format!(
+            "Draft body exceeds {MAX_BODY_BYTES}-byte cap"
+        )));
     }
+    if req.subject.len() > MAX_SUBJECT_BYTES {
+        return Err(error_json(&format!(
+            "Draft subject exceeds {MAX_SUBJECT_BYTES}-byte cap"
+        )));
+    }
+    let (to, cc, bcc) = match (
+        required_recipients(&req.to),
+        parse_recipients(req.cc.as_deref()),
+        parse_recipients(req.bcc.as_deref()),
+    ) {
+        (Ok(to), Ok(cc), Ok(bcc)) => (to, cc, bcc),
+        (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return Err(error_json(&e)),
+    };
     let acct = DraftAccount::from_config(account_config);
 
     // Read before rendering — see the note in draft_reply.
@@ -646,7 +692,7 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
     .await
     {
         Ok(v) => v,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
 
     let (plain_body, html_body) = {
@@ -660,29 +706,23 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
     builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
     builder = stamp_identity_headers(builder, &acct.message_id_domain);
 
-    // Collect recipients into Vecs and pass once each — mail-builder's
-    // `.to()` / `.cc()` / `.bcc()` OVERWRITE on repeat calls, so the per-
-    // address loop silently dropped every recipient except the last. Clones
-    // go to the builder; the originals are echoed in the response so it
-    // reports the values the saved headers actually carry.
-    let to_clean = clean_recipients(Some(&req.to));
-    if !to_clean.is_empty() {
-        builder = builder.to(to_clean.clone());
+    // Pass each list once — mail-builder's `.to()` / `.cc()` / `.bcc()`
+    // OVERWRITE on repeat calls, so the per-address loop silently dropped
+    // every recipient except the last. The response echoes the parsed
+    // addresses, i.e. what the saved headers actually carry.
+    builder = builder.to(to_address_list(&to));
+    if !cc.is_empty() {
+        builder = builder.cc(to_address_list(&cc));
     }
-    let cc_clean = clean_recipients(req.cc.as_deref());
-    if !cc_clean.is_empty() {
-        builder = builder.cc(cc_clean.clone());
-    }
-    let bcc_clean = clean_recipients(req.bcc.as_deref());
-    if !bcc_clean.is_empty() {
-        builder = builder.bcc(bcc_clean.clone());
+    if !bcc.is_empty() {
+        builder = builder.bcc(to_address_list(&bcc));
     }
 
     builder = apply_bodies_and_attachments(builder, &plain_body, &html_body, prepared);
 
     let message_bytes = match builder.write_to_vec() {
         Ok(bytes) => bytes,
-        Err(e) => return error_json(&format!("Failed to build MIME message: {e}")),
+        Err(e) => return Err(error_json(&format!("Failed to build MIME message: {e}"))),
     };
 
     let save_result = {
@@ -701,9 +741,9 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
                 // The sanitized values that went into the headers, matching
                 // reply — echoing the raw input would claim recipients or a
                 // subject the saved draft does not carry.
-                "to": to_clean,
-                "cc": cc_clean,
-                "bcc": bcc_clean,
+                "to": addresses_only(&to),
+                "cc": addresses_only(&cc),
+                "bcc": addresses_only(&bcc),
                 "subject": subject,
                 // The rendered text, not the raw input — matching reply and
                 // forward. With inline images the two differ: the input still
@@ -717,11 +757,11 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Stri
             }
             finish_draft(&client_arc, new_uid, req.replaces_uid, response).await
         }
-        Err(e) => error_json(&format!("Failed to save draft: {e}")),
+        Err(e) => Err(error_json(&format!("Failed to save draft: {e}"))),
     }
 }
 
-pub async fn delete_draft(server: &ImapMcpServer, req: DeleteDraftRequest) -> String {
+pub async fn delete_draft(server: &ImapMcpServer, req: DeleteDraftRequest) -> ToolResult {
     // Deliberately far below `tools/write.rs::MAX_UIDS_PER_CALL` (1000):
     // deleting drafts bypasses `allow_delete` (the Drafts folder is the
     // user's workspace) and uses EXPUNGE, so there is no Trash to recover
@@ -730,80 +770,70 @@ pub async fn delete_draft(server: &ImapMcpServer, req: DeleteDraftRequest) -> St
     // legitimate use and is exactly what a prompt-injected model would try.
     const MAX_DRAFT_UIDS_PER_CALL: usize = 25;
     if req.uids.len() > MAX_DRAFT_UIDS_PER_CALL {
-        return error_json(&format!(
+        return Err(error_json(&format!(
             "uids list exceeds {MAX_DRAFT_UIDS_PER_CALL}-item cap for draft deletion — \
              delete in smaller batches (drafts are expunged, not moved to Trash)"
-        ));
+        )));
     }
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     if account_config.read_only {
-        return error_json("Account is configured as read-only");
+        return Err(error_json("Account is configured as read-only"));
     }
     let account_name = account_config.name.clone();
     let mut client = client_arc.lock().await;
     match client.delete_draft(&req.uids).await {
-        Ok(succeeded) => {
-            // `failed` = input − existing, same honesty as move/delete: an
-            // empty array is a statement, a gap in `succeeded` is not.
-            let done: std::collections::HashSet<u32> = succeeded.iter().copied().collect();
-            let mut failed: Vec<u32> = req
-                .uids
-                .iter()
-                .copied()
-                .filter(|u| !done.contains(u))
-                .collect();
-            failed.sort_unstable();
-            failed.dedup();
-            serde_json::to_string(&serde_json::json!({
-                "account": account_name,
-                "succeeded": succeeded,
-                "failed": failed,
-            }))
-            .unwrap_or_else(|e| error_json(&e.to_string()))
-        }
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        // `failed` = input − existing, the same shape (and the same code) as
+        // move/delete: an empty array is a statement, a gap in `succeeded`
+        // is not.
+        Ok(succeeded) => super::write::write_result(&account_name, &succeeded, &req.uids),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
 // ========== Reply / draft helpers ==========
 
-/// Build `(to_list, cc_list)` for a reply. All addresses pass through
-/// `sanitize_header_value` to strip `\r\n` header-injection payloads that could
-/// come from the parsed original email or LLM-provided `extra_cc`.
-/// Excludes the user's own `from` address from both lists in reply-all to
-/// avoid self-addressed drafts.
+/// Build `(to_list, cc_list)` for a reply. Addresses from the original pass
+/// through `sanitize_header_value` to strip `\r\n` header-injection payloads;
+/// `extra_cc` arrives already parsed and validated ([`parse_recipients`]).
+///
+/// In reply-all, the user's own `from` address is excluded (no self-addressed
+/// drafts) and entries without an address (a bare group name, a display name
+/// with nothing behind it) are skipped rather than written as an empty `<>`.
+/// An address appears only once across To and Cc, `extra_cc` included: a
+/// sender who copied themselves, or an extra CC naming someone already
+/// addressed, would otherwise be listed twice.
 fn build_reply_recipients(
     original: &EmailFull,
     reply_all: bool,
     from: &str,
-    extra_cc: Option<&[String]>,
+    extra_cc: Vec<Recipient>,
 ) -> Result<(Vec<Recipient>, Vec<Recipient>), &'static str> {
     let to_recipient = match original.from.as_ref() {
         Some(a) if !a.address.is_empty() => recipient_from(a),
         _ => return Err("Cannot reply: original email has no sender address"),
     };
 
-    // `eq_ignore_ascii_case` is allocation-free — preferred over `to_lowercase`.
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(to_recipient.1.to_ascii_lowercase());
+    let mut keep = |addr: &crate::email::EmailAddress| {
+        !addr.address.is_empty()
+            && !addr.address.eq_ignore_ascii_case(from)
+            && seen.insert(addr.address.to_ascii_lowercase())
+    };
     let mut to_list = vec![to_recipient];
     let mut cc_list: Vec<Recipient> = Vec::new();
     if reply_all {
-        for addr in &original.to {
-            if !addr.address.eq_ignore_ascii_case(from) {
-                to_list.push(recipient_from(addr));
-            }
-        }
-        for addr in &original.cc {
-            if !addr.address.eq_ignore_ascii_case(from) {
-                cc_list.push(recipient_from(addr));
-            }
-        }
+        to_list.extend(original.to.iter().filter(|a| keep(a)).map(recipient_from));
+        cc_list.extend(original.cc.iter().filter(|a| keep(a)).map(recipient_from));
     }
-    if let Some(cc) = extra_cc {
-        cc_list.extend(cc.iter().map(|s| (None, sanitize_header_value(s))));
-    }
+    cc_list.extend(
+        extra_cc
+            .into_iter()
+            .filter(|(_, addr)| seen.insert(addr.to_ascii_lowercase())),
+    );
     Ok((to_list, cc_list))
 }
 
@@ -910,9 +940,12 @@ pub(super) fn sanitize_header_value(s: &str) -> String {
 
 /// Caps on user-supplied composition input — a prompt-injected LLM could
 /// otherwise pass a 100 MiB subject or body and generate a huge MIME
-/// APPEND, wasting server storage and bandwidth. RFC 5322 line limit is 998;
-/// 10 MiB body fits every realistic email including formatted ones.
+/// APPEND, wasting server storage and bandwidth. 10 MiB fits every
+/// realistic body including formatted ones; a subject is one header line
+/// (RFC 5322 caps a line at 998 characters, folding allows more), and no
+/// legitimate one comes near 2 KiB even in a multi-byte script.
 const MAX_BODY_BYTES: usize = 10 * 1024 * 1024;
+const MAX_SUBJECT_BYTES: usize = 2 * 1024;
 
 fn truncate(s: &str, max_len: usize) -> String {
     if s.len() <= max_len {
@@ -1239,14 +1272,67 @@ fn inline_identity(
     Ok((cid, content_id))
 }
 
-/// Sanitize an LLM-supplied recipient list: `\r\n` in any address would inject
-/// extra headers (a silent `Bcc:`, for instance) into the saved draft.
-fn clean_recipients(addrs: Option<&[String]>) -> Vec<String> {
+/// Parse a caller-supplied recipient list ([`parse_recipient`] per entry).
+fn parse_recipients(addrs: Option<&[String]>) -> Result<Vec<Recipient>, String> {
     addrs
         .unwrap_or_default()
         .iter()
-        .map(|a| sanitize_header_value(a))
+        .map(|a| parse_recipient(a))
         .collect()
+}
+
+/// [`parse_recipients`] for the `to` of a forward or a fresh mail, which
+/// must name at least one recipient — the schema says so, and a draft without
+/// one is not what the caller asked for.
+fn required_recipients(addrs: &[String]) -> Result<Vec<Recipient>, String> {
+    let list = parse_recipients(Some(addrs))?;
+    if list.is_empty() {
+        return Err("At least one `to` recipient is required".to_string());
+    }
+    Ok(list)
+}
+
+/// Parse one caller-supplied recipient: a bare `alice@example.com`, or the
+/// `Alice <alice@example.com>` form callers naturally reach for. Sanitized
+/// against header injection first (`\r\n` in an address would smuggle a
+/// silent `Bcc:` into the saved draft).
+///
+/// Validated, because mail-builder writes whatever it is handed between `<`
+/// and `>`: `Alice <a@b>` passed as a bare address became `<Alice <a@b>>`,
+/// a comma-joined list became one broken mailbox, and an entry that
+/// sanitized down to nothing became an empty `<>` — each a draft that cannot
+/// be sent as is, noticed only when the user opens it.
+fn parse_recipient(raw: &str) -> Result<Recipient, String> {
+    let clean = sanitize_header_value(raw);
+    let entry = clean.trim();
+    let (name, addr) = match entry.strip_suffix('>').and_then(|s| s.rsplit_once('<')) {
+        Some((name, addr)) => {
+            let name = name.trim().trim_matches('"').trim();
+            ((!name.is_empty()).then(|| name.to_string()), addr.trim())
+        }
+        None => (None, entry),
+    };
+    let well_formed = addr.split_once('@').is_some_and(|(local, domain)| {
+        !local.is_empty() && !domain.is_empty() && !domain.contains('@')
+    }) && !addr
+        .chars()
+        .any(|c| c.is_whitespace() || matches!(c, '<' | '>' | ',' | ';' | '"'));
+    if !well_formed {
+        // A bare name is what a model passes when it only heard the name:
+        // say where the address comes from, not just how one looks.
+        if name.is_none() && !addr.is_empty() && !addr.contains('@') {
+            return Err(format!(
+                "Invalid recipient \"{entry}\": a name alone is not an address. Look it up first \
+                 (search_emails with from: \"{entry}\" shows the address of the sender), then pass \
+                 \"{entry} <address>\""
+            ));
+        }
+        return Err(format!(
+            "Invalid recipient \"{entry}\": expected an address like alice@example.com or \
+             \"Alice <alice@example.com>\", one recipient per list entry"
+        ));
+    }
+    Ok((name, addr.to_string()))
 }
 
 /// Read the attachments and cross-check the body's inline markers in one step.
@@ -1630,15 +1716,15 @@ mod tests {
             vec!["me@example.com"],
             vec![],
         );
-        let (to, cc) = build_reply_recipients(&original, false, "me@example.com", None).unwrap();
+        let (to, cc) = build_reply_recipients(&original, false, "me@example.com", vec![]).unwrap();
         assert_eq!(addresses_only(&to), vec!["alice@example.com"]);
-        assert!(cc.is_empty());
+        assert_eq!(cc, vec![]);
     }
 
     #[test]
     fn build_reply_recipients_no_sender_errors() {
         let original = email("Test", None, vec!["me@example.com"], vec![]);
-        let result = build_reply_recipients(&original, false, "me@example.com", None);
+        let result = build_reply_recipients(&original, false, "me@example.com", vec![]);
         assert!(result.is_err());
     }
 
@@ -1650,7 +1736,7 @@ mod tests {
             vec!["me@example.com", "bob@example.com"],
             vec!["carol@example.com", "ME@example.COM"],
         );
-        let (to, cc) = build_reply_recipients(&original, true, "me@example.com", None).unwrap();
+        let (to, cc) = build_reply_recipients(&original, true, "me@example.com", vec![]).unwrap();
         assert_eq!(
             addresses_only(&to),
             vec!["alice@example.com", "bob@example.com"]
@@ -1661,16 +1747,262 @@ mod tests {
     #[test]
     fn build_reply_recipients_extra_cc_appended() {
         let original = email("Test", Some("alice@example.com"), vec![], vec![]);
-        let extra = vec!["dave@example.com".to_string()];
-        let (_to, cc) =
-            build_reply_recipients(&original, false, "me@example.com", Some(&extra)).unwrap();
+        let extra = parse_recipients(Some(&["dave@example.com".to_string()])).unwrap();
+        let (_to, cc) = build_reply_recipients(&original, false, "me@example.com", extra).unwrap();
         assert_eq!(addresses_only(&cc), vec!["dave@example.com"]);
+    }
+
+    /// An extra CC naming someone the reply already addresses is not listed a
+    /// second time; one naming the user stays, since it was asked for.
+    #[test]
+    fn build_reply_recipients_extra_cc_skips_who_is_already_addressed() {
+        let original = email(
+            "Test",
+            Some("alice@example.com"),
+            vec!["bob@example.com"],
+            vec![],
+        );
+        let extra = parse_recipients(Some(&[
+            "Alice <ALICE@example.com>".to_string(),
+            "bob@example.com".to_string(),
+            "dave@example.com".to_string(),
+            "Dave <dave@example.com>".to_string(),
+            "me@example.com".to_string(),
+        ]))
+        .unwrap();
+        let (to, cc) = build_reply_recipients(&original, true, "me@example.com", extra).unwrap();
+        assert_eq!(
+            addresses_only(&to),
+            vec!["alice@example.com", "bob@example.com"]
+        );
+        assert_eq!(
+            addresses_only(&cc),
+            vec!["dave@example.com", "me@example.com"]
+        );
+    }
+
+    /// A `replaces_uid` that turns out to be the UID the new draft was saved
+    /// under names no older draft; deleting it would throw away the draft
+    /// just written. Nothing may reach the server (the port is closed: an
+    /// attempt would come back as a failed deletion instead).
+    #[tokio::test]
+    async fn finish_draft_never_deletes_the_draft_it_just_saved() {
+        let config: crate::config::ServerConfig = toml::from_str(
+            "[[accounts]]\nname = \"T\"\nhost = \"127.0.0.1\"\nport = 1\n\
+             username = \"u@h\"\nauth_method = \"password\"\npassword = \"p\"\n",
+        )
+        .unwrap();
+        let client = Arc::new(Mutex::new(ImapClient::new(config.accounts[0].clone())));
+        let out = finish_draft(
+            &client,
+            Some(9),
+            Some(9),
+            serde_json::json!({"status": "ok"}),
+        )
+        .await
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["uid"], 9);
+        assert!(v.get("replaced_uid").is_none(), "{v}");
+        let warning = v["replace_warning"].as_str().unwrap();
+        assert!(warning.contains("nothing was deleted"), "{warning}");
+    }
+
+    /// Reply-all must address everyone once: a sender who copied themselves
+    /// (or appears in To and Cc) is not listed twice, and an entry without
+    /// an address is skipped instead of becoming an empty `<>`.
+    #[test]
+    fn build_reply_recipients_reply_all_dedupes_and_skips_empty_addresses() {
+        let original = email(
+            "Test",
+            Some("alice@example.com"),
+            vec!["ALICE@example.com", "bob@example.com", ""],
+            vec!["bob@example.com", "carol@example.com"],
+        );
+        let (to, cc) = build_reply_recipients(&original, true, "me@example.com", vec![]).unwrap();
+        assert_eq!(
+            addresses_only(&to),
+            vec!["alice@example.com", "bob@example.com"]
+        );
+        assert_eq!(addresses_only(&cc), vec!["carol@example.com"]);
+    }
+
+    #[test]
+    fn parse_recipient_accepts_bare_and_named_addresses() {
+        assert_eq!(
+            parse_recipient("alice@example.com").unwrap(),
+            (None, "alice@example.com".to_string())
+        );
+        assert_eq!(
+            parse_recipient("  Alice Example <alice@example.com> ").unwrap(),
+            (
+                Some("Alice Example".to_string()),
+                "alice@example.com".to_string()
+            )
+        );
+        assert_eq!(
+            parse_recipient("\"Müller, Jörg\" <j@example.de>").unwrap(),
+            (Some("Müller, Jörg".to_string()), "j@example.de".to_string())
+        );
+        // Header injection is stripped before parsing, as everywhere else.
+        assert_eq!(
+            parse_recipient("a@example.com\r\n").unwrap().1,
+            "a@example.com"
+        );
+    }
+
+    /// A display name with a comma must reach the header quoted, or the
+    /// recipient's client reads `Doe, John <j@…>` as two addresses.
+    #[test]
+    fn display_names_with_specials_are_quoted_in_the_header() {
+        for (name, expected) in [
+            ("Doe, John", "\"Doe, John\" <j@example.com>"),
+            (
+                "Dr. A. Smith (Sales)",
+                "\"Dr. A. Smith (Sales)\" <j@example.com>",
+            ),
+        ] {
+            let recipients = vec![parse_recipient(&format!("\"{name}\" <j@example.com>")).unwrap()];
+            let bytes = MessageBuilder::new()
+                .from("me@example.com")
+                .to(to_address_list(&recipients))
+                .subject("s")
+                .text_body("b")
+                .write_to_vec()
+                .unwrap();
+            let raw = String::from_utf8(bytes).unwrap();
+            let to_line = raw
+                .lines()
+                .find(|l| l.starts_with("To: "))
+                .expect("To header");
+            assert_eq!(to_line, format!("To: {expected}"), "{raw}");
+        }
+    }
+
+    /// Everything mail-builder would have written as a broken mailbox.
+    #[test]
+    fn parse_recipient_rejects_what_would_break_the_header() {
+        for bad in [
+            "",
+            "\r\n",
+            "Alice Example",
+            "a@example.com, b@example.com",
+            "a@example.com; b@example.com",
+            "@example.com",
+            "alice@",
+            "a@b@c",
+            "Alice <>",
+            "<alice@example.com",
+        ] {
+            let err = parse_recipient(bad).expect_err(bad);
+            assert!(err.contains("Invalid recipient"), "{bad:?}: {err}");
+        }
+    }
+
+    /// A bare name gets the next step, not an address format lesson: a
+    /// model that only heard "Ben" asked the user for the address instead of
+    /// looking it up in Ben's mail.
+    #[test]
+    fn parse_recipient_names_the_lookup_for_a_bare_name() {
+        for name in ["Ben", "Selin Kaya"] {
+            let err = parse_recipient(name).unwrap_err();
+            assert!(err.contains("a name alone is not an address"), "{err}");
+            assert!(err.contains(&format!("from: \"{name}\"")), "{err}");
+        }
+        // A broken address keeps the format hint.
+        let err = parse_recipient("a@b@c").unwrap_err();
+        assert!(err.contains("expected an address like"), "{err}");
+    }
+
+    /// An account on a closed port: a check that ran after the first IMAP
+    /// command would surface as a connection error instead of its own.
+    fn offline_server() -> ImapMcpServer {
+        let config: crate::config::ServerConfig = toml::from_str(
+            "[[accounts]]\nname = \"T\"\nhost = \"127.0.0.1\"\nport = 1\n\
+             username = \"u@h\"\nauth_method = \"password\"\npassword = \"p\"\n",
+        )
+        .expect("test config");
+        let clients = config
+            .accounts
+            .iter()
+            .map(|a| {
+                (
+                    a.name.to_lowercase(),
+                    Arc::new(Mutex::new(ImapClient::new(a.clone()))),
+                )
+            })
+            .collect();
+        ImapMcpServer::new(config, clients)
+    }
+
+    /// Malformed input is the caller's to fix and is reported before any
+    /// IMAP traffic — before the original is even fetched for a forward.
+    #[tokio::test]
+    async fn draft_input_errors_come_before_any_imap_traffic() {
+        let s = offline_server();
+        let email = |to: &[&str], subject: String| DraftEmailRequest {
+            account: None,
+            to: to.iter().map(|t| (*t).to_string()).collect(),
+            subject,
+            body: "b".into(),
+            cc: None,
+            bcc: None,
+            attachments: None,
+            replaces_uid: None,
+        };
+        // Each refusal must reach the client as an error result
+        // (`isError: true`), not as a success that happens to say "error".
+        let err = draft_email(&s, email(&[], "s".into())).await.unwrap_err();
+        assert!(err.contains("At least one"), "{err}");
+        let err = draft_email(&s, email(&["Alice Example"], "s".into()))
+            .await
+            .unwrap_err();
+        assert!(err.contains("Invalid recipient"), "{err}");
+        let err = draft_email(
+            &s,
+            email(&["a@example.com"], "x".repeat(MAX_SUBJECT_BYTES + 1)),
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("subject exceeds"), "{err}");
+
+        let err = draft_forward(
+            &s,
+            DraftForwardRequest {
+                account: None,
+                folder: "INBOX".into(),
+                uid: 1,
+                to: vec![],
+                body: None,
+                cc: None,
+                attachments: None,
+                replaces_uid: None,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(err.contains("At least one"), "{err}");
+    }
+
+    #[test]
+    fn required_recipients_needs_at_least_one() {
+        assert!(
+            required_recipients(&[])
+                .unwrap_err()
+                .contains("At least one")
+        );
+        assert_eq!(
+            required_recipients(&["a@example.com".to_string()])
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn build_reply_recipients_sanitizes_addresses() {
         let original = email("Test", Some("alice\r\nBcc: evil@evil.com"), vec![], vec![]);
-        let (to, _) = build_reply_recipients(&original, false, "me@example.com", None).unwrap();
+        let (to, _) = build_reply_recipients(&original, false, "me@example.com", vec![]).unwrap();
         assert!(!to[0].1.contains('\r'));
         assert!(!to[0].1.contains('\n'));
     }
@@ -1818,6 +2150,14 @@ mod tests {
                 !text.contains("$ref"),
                 "{name} schema must be inline: {text}"
             );
+            // Doc comments become schema descriptions; developer notes must
+            // not reach the model (they once did, 1.3 KB per draft tool).
+            for internal in ["serde", "schemars", "untagged", "\\n\\n"] {
+                assert!(
+                    !text.contains(internal),
+                    "{name} leaks {internal:?}: {text}"
+                );
+            }
             // Both accepted attachment spellings are visible to the client.
             assert!(text.contains("anyOf"), "{name}: {text}");
             assert!(text.contains("path"), "{name}: {text}");
@@ -2255,8 +2595,14 @@ mod tests {
             !mime.contains("\u{89}PNG"),
             "binary leaked into the message unencoded: {mime}"
         );
-        // Header stays 7-bit clean: the umlaut is encoded, not passed through.
+        // Header stays 7-bit clean: the umlaut is encoded, not passed through
+        // — as an RFC 2231 extended parameter, the form RFC 2183 prescribes
+        // for parameter values (an RFC 2047 encoded-word inside a quoted
+        // parameter is forbidden by RFC 2047 §5).
         assert!(!mime.contains("Rollenübersicht.png"), "{mime}");
-        assert!(mime.contains("Rollen=C3=BCbersicht.png"), "{mime}");
+        assert!(
+            mime.contains("filename*=UTF-8''Rollen%C3%BCbersicht.png"),
+            "{mime}"
+        );
     }
 }

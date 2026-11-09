@@ -69,6 +69,10 @@ The server finds `~/.config/imap-mcp-rs/config.toml` automatically. Override wit
 
 ## Tools
 
+Every tool carries MCP annotations, so a client that asks before risky calls knows where to ask. The eight reading tools are marked read-only, and only `delete_email` and `delete_draft` are marked destructive.
+
+With `tool_set = "voice"` in the config the server presents itself to a small model behind a voice assistant, measured with Gemma 4 E4B behind the Otomo voice assistant. Descriptions begin with what a tool does for the user, because such an assistant decides from their first 140 characters whether a request needs the tool, and the instructions stay within the 1000 characters it keeps. Parameters a spoken request hardly needs are not offered, `dry_run` among them, since such an assistant asks before destructive calls itself. `account` goes as well when only one account is configured, and so does schema detail that changes nothing for the caller, which shrinks `tools/list` from 48 to 16 KB. Where every account has a signature, the draft texts say that the server adds it. A search for words that finds nothing comes with the ten newest INBOX emails to pick from. A hidden parameter still works when a call sends it, and the default `full` serves everything.
+
 ### Accounts
 
 | Tool | Description |
@@ -80,11 +84,11 @@ The server finds `~/.config/imap-mcp-rs/config.toml` automatically. Override wit
 
 | Tool | Description |
 |------|-------------|
-| `list_folders` | List all email folders with total and unread message counts. Well-known folders (Drafts, Sent, Trash) include a `role` field set to `"drafts"` / `"sent"` / `"trash"` so the LLM can pick the right folder without heuristically matching localized names. Names arrive in IMAP's modified UTF-7; when that differs from the readable form, `display_name` carries the decoded version (`Entw&APw-rfe` → `Entwürfe`) **for display only** — `name` is what every other tool accepts. `prefix` (matches the decoded name too) and `unread_only` narrow a large mailbox; `total` still reports the unfiltered count. |
+| `list_folders` | List all email folders with total and unread message counts. Well-known folders (Drafts, Sent, Trash) include a `role` field set to `"drafts"` / `"sent"` / `"trash"` so the LLM can pick the right folder without heuristically matching localized names. Names arrive in IMAP's modified UTF-7; when that differs from the readable form, `display_name` carries the decoded version (`Entw&APw-rfe` → `Entwürfe`). `name` is what the server accepts, and the other tools also take the readable form and role words (see [Folder Names](#folder-names)). `prefix` (matches the decoded name too) and `unread_only` narrow a large mailbox; `total` still reports the unfiltered count. |
 | `list_emails` | List emails in a folder with preview snippets (~200 chars). Supports pagination via `limit`/`offset`, filtering with `unread_only`, and conversation collapsing via `group_by_thread: true` (annotates `thread_message_count`, fetches 3× the limit internally). Summary rows include `to` truncated to 3 addresses plus `to_count` / `cc_count` for the real sizes — mass-mails don't inflate the response. Returns `total` (folder count) and `matched` (filter count, counted in messages even when grouping); if collapsing left more threads than `limit`, `threads_truncated_from` says how many there were. `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` when grouping; ~80% smaller) for large scans. |
-| `get_email` | Get a single email with full content: headers, body text, attachment metadata (each with its `index` for `download_attachment`), and flags. `date` is UTC-normalized, `date_original` keeps the sender's offset when it differs. Uses `BODY.PEEK[]` so it does **not** mark the email as read. The response carries `content_warning` (bodies are untrusted input) and, if the message's plain-text and HTML parts disagree in a suspicious way, `body_parts_diverge`. Pass `include_html: true` to include `body_html` (off by default — HTML bodies of marketing/order emails are typically 40–60 KB of inlined CSS). |
-| `get_thread` | Reconstruct a full conversation thread from any email in it. Searches by Message-ID, References, and In-Reply-To headers, with a subject-line fallback. Automatically includes your own replies from the Sent folder and deduplicates across folders by Message-ID. `include_html: true` to include HTML bodies. |
-| `search_emails` | Search with multiple criteria combined via AND: `from`/`from_any`/`from_all`, `to`, `subject`/`subject_all`, `text`/`text_any`/`text_all`, `since`/`before`, `is_read`, `is_flagged`, `is_answered`, `has_attachments`, `min_size`/`max_size` (bytes, IMAP-native). `_any` variants OR within a field (`["amazon.de", "paypal.com"]`); `_all` variants AND within a field. `since`/`before` also take a time of day (`2026-08-15T12:20`, local; or with `Z`/`±HH:MM`) — the sub-day part is cut client-side against INTERNALDATE (arrival time), and result rows then carry it as `internal_date`, so a `date` outside the bound (the sender's header) is explainable in place. `group_by_thread: true` collapses into conversations exactly as in `list_emails`, so "unread since 12:20, grouped" is one call. `unread_only` is accepted as an alias for `is_read`. Non-ASCII search terms automatically use `CHARSET UTF-8`. At least one criterion required. Omit `folder` to search all folders — every folder is searched, and Gmail's label duplicates (including the `[Gmail]/All Mail` mirror) are deduplicated by Message-ID afterwards, so archived mail that exists only in All Mail is still found. Returns `matched` (server-side count), `returned`, and `has_more` — check `has_more` instead of doing arithmetic; client-side filters (`has_attachments`, diverted non-ASCII terms) can push `returned` below `matched` without anything missing, while sub-day time bounds are already inside the count. `offset` pages within a single folder (across folders it would skip in each one, so that combination is refused). `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` / `internal_date` when applicable). |
+| `get_email` | Get a single email with full content: headers, body text, attachment metadata (each with its `index` for `download_attachment`), and flags. `date` is the machine's local time with its offset, `date_original` keeps the sender's own rendition when its offset differs. Uses `BODY.PEEK[]` so it does **not** mark the email as read. The response carries `content_warning` (bodies are untrusted input) and, if the message's plain-text and HTML parts disagree in a suspicious way, `body_parts_diverge`. Pass `include_html: true` to include `body_html` (off by default — HTML bodies of marketing/order emails are typically 40–60 KB of inlined CSS); it stays `null` for a message without an HTML part. `body_text` joins all text parts in reading order, so text after an inline photo is not lost, and HTML-only mail arrives converted to text. Inline images (a phone's photo between two text parts, a logo referenced by the HTML) are listed in `attachments` like any other file. |
+| `get_thread` | Reconstruct a full conversation thread from any email in it. Searches by Message-ID, References, and In-Reply-To headers, sibling branches of the thread root included, with an opt-in subject-line fallback (`strict: false`). Automatically includes your own replies from the Sent folder and deduplicates across folders by Message-ID. `include_html: true` to include HTML bodies. |
+| `search_emails` | Search with multiple criteria combined via AND: `from`/`from_any`/`from_all`, `to`, `subject`/`subject_all`, `text`/`text_any`/`text_all`, `since`/`before`, `is_read`, `is_flagged`, `is_answered`, `has_attachments`, `min_size`/`max_size` (bytes, IMAP-native). `_any` variants OR within a field (`["amazon.de", "paypal.com"]`); `_all` variants AND within a field. Several words in `text` or `subject` must all occur, `"quoted words"` stay one phrase, and filler words (der, vom, the, Mail …) are left out, so `"Newsletter vom Radhaus"` finds the newsletter. A word joined by hyphens counts as its parts when each has three letters or more, so `Telekom-Rechnung` also finds "Rechnung der Telekom". `since`/`before` also take a time of day (`2026-08-15T12:20`, local; or with `Z`/`±HH:MM`) — the sub-day part is cut client-side against INTERNALDATE (arrival time), and result rows then carry it as `internal_date`, so a `date` outside the bound (the sender's header) is explainable in place. `group_by_thread: true` collapses into conversations exactly as in `list_emails`, so "unread since 12:20, grouped" is one call. `unread_only` is accepted as an alias for `is_read`. Non-ASCII search terms automatically use `CHARSET UTF-8`. At least one criterion required. Omit `folder` to search all folders — every folder is searched, and Gmail's label duplicates (including the `[Gmail]/All Mail` mirror) are deduplicated by Message-ID afterwards, so archived mail that exists only in All Mail is still found. A folder that refuses a search, such as the `\Noselect` parent `[Gmail]`, is skipped, while a dropped connection fails the whole call with `retryable: true`. A search for words that finds nothing says what to try instead (`hint`). Returns `matched` (server-side count), `returned`, and `has_more` — check `has_more` instead of doing arithmetic; client-side filters (`has_attachments`, diverted non-ASCII terms) can push `returned` below `matched` without anything missing, while sub-day time bounds are already inside the count. `offset` pages within a single folder (across folders it would skip in each one, so that combination is refused). `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` / `internal_date` when applicable). |
 | `download_attachment` | Download an email attachment to a local file under an allowed attachment directory. Pick it by `index` (from `get_email`'s `attachments[].index` — the unambiguous handle) or by `filename`; an ambiguous name (nameless parts all render as `"attachment"`) errors with the candidate indices instead of silently picking one. Each download gets its own UUID subdirectory containing the file under its **original sanitized filename** (e.g. `<base>/<uuid>/Lebenslauf.pdf`) — so re-attaching via `draft_*(attachments=[...])` preserves the original filename for the recipient. |
 
 ### Organizing
@@ -97,8 +101,8 @@ All organizing tools support **batch operations** — pass an array of UIDs to o
 | `mark_as_unread` | Remove the `\Seen` flag from one or more emails. Supports `dry_run: true`; blocked by `allow_flag_change = false`. |
 | `flag_email` | Set the `\Flagged` flag (star in Gmail, flag in Outlook/Apple Mail). Supports `dry_run: true`; blocked by `allow_flag_change = false`. |
 | `unflag_email` | Remove the `\Flagged` flag. Supports `dry_run: true`; blocked by `allow_flag_change = false`. |
-| `move_email` | Move one or more emails from a source folder to a destination folder. Requires `allow_move = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, target_folder, uids, would_move}`; permission checks still fire so the preview also confirms the action would be allowed. Uses IMAP COPY + `\Deleted` + UID EXPUNGE; on partial failure surfaces a structured error so the caller doesn't retry into a duplicated message. `succeeded` lists only UIDs that actually existed in the source folder when the operation ran (verified with a `UID SEARCH` up front); `failed` spells out the rest, so a partial success can never be read as a full one. |
-| `delete_email` | Delete one or more emails. Moves to Trash by default (`permanent: false`); `permanent: true` uses UID EXPUNGE scoped to just these UIDs. Requires `allow_delete = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, uids, permanent, would_move_to_trash \| would_expunge_permanently}` (which field is present depends on `permanent`). `succeeded`/`failed` report exactly what existed and what didn't, like `move_email`. |
+| `move_email` | Move one or more emails from a source folder to a different destination folder (a move into the source folder itself is refused, it would only renumber the messages). Requires `allow_move = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, target_folder, uids, would_move}`; permission checks still fire so the preview also confirms the action would be allowed. Uses IMAP COPY + `\Deleted` + UID EXPUNGE; on partial failure surfaces a structured error so the caller doesn't retry into a duplicated message. `succeeded` lists only UIDs that actually existed in the source folder when the operation ran (verified with a `UID SEARCH` up front); `failed` spells out the rest, so a partial success can never be read as a full one. |
+| `delete_email` | Delete one or more emails. Moves to Trash by default (`permanent: false`); `permanent: true` uses UID EXPUNGE scoped to just these UIDs. Messages already in the Trash folder need `permanent: true`, since moving them there would change nothing. Requires `allow_delete = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, uids, permanent, would_move_to_trash \| would_expunge_permanently}` (which field is present depends on `permanent`). `succeeded`/`failed` report exactly what existed and what didn't, like `move_email`. |
 
 ### Composing
 
@@ -146,11 +150,13 @@ Only raster images can be inlined (`image/*` minus SVG). A marker always renders
 
 Every `draft_*` response also carries the new draft's own `uid`, so a revision loop can feed it straight back as the next `replaces_uid` without a `list_drafts` in between. `APPEND` does not return the UID through the IMAP client library, so it is looked up by `Message-ID` right after saving; on a server where that lookup finds nothing the field is simply absent — the draft is saved either way.
 
+**Recipients** (`to`, `cc`, `bcc`) take one entry per recipient, either a bare `alice@example.com` or `Alice Example <alice@example.com>`. Entries that would end up as a broken header (a comma-separated list in one entry, a name without an address, an empty string) are refused with an error naming the entry, and `draft_forward` and `draft_email` need at least one `to`. Reply-all addresses everyone once and leaves out your own address.
+
 **All drafts** are saved to the Drafts folder for manual review and sending. Nothing is ever sent automatically.
 
 Every tool (except `list_accounts` and `account_health`, which cover all accounts) takes an `account` parameter. With a single configured account it may be omitted; with several it is **required** — the old silent first-account fallback could compose drafts from the wrong mailbox under the wrong sender, so an omitted name now errors and lists the available accounts.
 
-Error responses always carry `retryable`: `true` marks transient conditions (server temporarily unavailable, dropped connection — retrying is sensible), `false` marks facts (folder doesn't exist, UID unknown, permission denied — fix the call instead). Timestamps in results are UTC-normalized (`date`), with the sender's original rendition in `date_original` when its offset differs — sort and compare on `date` directly.
+A failed call returns a tool result flagged `isError: true` whose text is the JSON object `{"error": "...", "retryable": bool}`. A folder that does not exist is refused with the names of the folders there are. Error responses always carry `retryable`: `true` marks transient conditions (server temporarily unavailable, dropped connection — retrying is sensible), `false` marks facts (folder doesn't exist, UID unknown, permission denied — fix the call instead). Timestamps in results (`date`, `internal_date`) are the machine's local time with its offset, so a model tells the user the time they live in; read from a UTC timestamp, it gave the hour an hour off. The sender's own rendition stays in `date_original` where its offset differs.
 
 ## Command line
 
@@ -168,6 +174,8 @@ imap-mcp-rs reauth Office --no-browser       # print the URL instead of opening 
 ```
 
 `reauth` is needed once per OAuth2 account at setup, and again only if the token is revoked or the state file is lost — see [Token lifetime & re-authorization](#token-lifetime--re-authorization).
+
+Any other argument is refused at startup. A misspelled `--config` therefore stops the server with an error instead of starting it on the default config, which may grant permissions the intended one withholds.
 
 ## Multi-Account
 
@@ -227,7 +235,7 @@ allow_flag_change = false    # false = mark_as_read/unread + flag/unflag blocked
 allow_unsafe_expunge = false # true = permit plain EXPUNGE fallback on servers without UIDPLUS (default: false)
 ```
 
-**`read_only = true`** overrides everything — all write tools are blocked. When `read_only = false`, `allow_delete` and `allow_move` control those specific operations individually. `delete_draft` always works (subject only to `read_only`) because the Drafts folder is the user's own workspace — deliberately so, since replacing a draft requires removing the old one. Its batch cap is 25 rather than 1000 for the same reason drafts bypass `allow_delete`: they are expunged, with no Trash to recover from.
+**`read_only = true`** overrides everything — all write tools are blocked. When `read_only = false`, `allow_delete`, `allow_move` and `allow_flag_change` control those specific operations individually. `delete_draft` always works (subject only to `read_only`) because the Drafts folder is the user's own workspace — deliberately so, since replacing a draft requires removing the old one. Its batch cap is 25 rather than 1000 for the same reason drafts bypass `allow_delete`: they are expunged, with no Trash to recover from.
 
 | Flag | Effect when `false` |
 |------|-------------------|
@@ -258,15 +266,26 @@ Several tools need to find special folders (Drafts, Sent, Trash). Since folder n
 | **Trash** | `Trash`, `[Gmail]/Trash`, `[Google Mail]/Trash`, `[Google Mail]/Papierkorb`, `Deleted Items`, `INBOX.Trash`, `Papierkorb`, `Gelöschte Elemente`, `Gel&APY-schte Elemente` |
 | **Drafts** | `Drafts`, `[Gmail]/Drafts`, `[Google Mail]/Drafts`, `[Google Mail]/Entwürfe`, `[Google Mail]/Entw&APw-rfe`, `Draft`, `INBOX.Drafts`, `Entwürfe`, `Entw&APw-rfe` |
 
-Matching is case-insensitive. Both the decoded name (e.g. `Entwürfe`) and the IMAP modified UTF-7 encoded form (e.g. `Entw&APw-rfe`) are recognized, so German and other non-ASCII folder names work regardless of how the server returns them. If no match is found, the server falls back to the English default name.
+Matching is case-insensitive. Both the decoded name (e.g. `Entwürfe`) and the IMAP modified UTF-7 encoded form (e.g. `Entw&APw-rfe`) are recognized, so German and other non-ASCII folder names work regardless of how the server returns them. Without a match, drafts go to a folder named `Drafts`. `delete_email` does not guess a trash folder: it refuses and names the alternatives, `permanent: true` or a move to an existing folder.
+
+## Folder Names
+
+Models pass the folder name they showed the user or the one the user said, which is often not the name the server knows. Every tool that takes `folder` or `target_folder` therefore resolves it first, and the first fit wins:
+
+1. the name as the server lists it (`INBOX` in any case)
+2. the readable name from `display_name` (`Entwürfe` for `Entw&APw-rfe`)
+3. either of them in another case, when exactly one folder fits (`rechnungen` for `Rechnungen`). Between two folders that differ only in case nothing is guessed
+4. a role word for the folder with that role: `Papierkorb`, `Trash`, `Deleted` or `Müll` for the trash, `Entwürfe` or `Drafts` for drafts, `Gesendet` or `Sent` for sent mail, `Posteingang` for INBOX, plus the names from the table above that carry no prefix (`Gesendete Elemente`, `Deleted Items`) and spellings without umlauts (`Entwuerfe`, `geloescht`)
+
+A name that fits nothing goes to the server unchanged, and its refusal comes back with the list of existing folders. A name with characters outside ASCII gets that error right away, because the server only takes such names encoded. Responses name the folder as the server knows it. The `dry_run` previews show the name as given, since they make no IMAP call.
 
 ## Connection Handling
 
 The server maintains one persistent IMAP connection per account with several resilience features:
 
-- **SELECT caching** — avoids redundant IMAP SELECT commands when operating on the same folder
-- **Folder name caching** — IMAP LIST is called once per session per account
-- **TCP keepalive** — probes every 30 seconds (10s interval) to detect dead connections within ~60 seconds
+- **SELECT caching** — avoids redundant IMAP SELECT commands when operating on the same folder. Listings (`list_emails`, `list_drafts`) select afresh every time, because the message count they page by would otherwise miss mail that arrived since the last SELECT
+- **Folder name caching** — IMAP LIST is called once per session per account, and again when a name is not in the cached list (a folder created in another client meanwhile)
+- **TCP keepalive** — first probe after 30 seconds of silence, then every 10 seconds; three unanswered probes drop the connection, so a dead one is noticed within about 60 seconds (Linux and macOS)
 - **Auto-reconnect** — if a connection drops, the next tool call automatically reconnects. Failed accounts at startup reconnect on first use
 - **Transparent retry** — idempotent read-only operations (SEARCH, FETCH, LIST, STATUS) automatically retry once on connection errors, so transient `broken pipe` failures don't bubble up to the caller. Write operations (APPEND, COPY) never retry to avoid duplicate messages
 - **Connection error detection** — heuristic detection of network errors vs. IMAP protocol errors. Only network errors trigger reconnect
@@ -280,9 +299,9 @@ The server maintains one persistent IMAP connection per account with several res
 - **Authorization code bound to PKCE** — `reauth` sends an S256 challenge (RFC 7636) and redeems the code with a verifier that never leaves the process. Without it, an app registered as a public client authenticates on the code alone, so any local process that claimed the loopback port first — or observed the redirect — could redeem it for mailbox access
 - **No automatic sending** — the server can only create drafts, never send emails
 - **Prompt injection defense** — the untrusted-content warning is the *first* block of the server instructions (clients truncate from the end), every response carrying a message body repeats it inline as `content_warning`, and messages whose plain-text part mirrors the HTML while adding a paragraph the reader never sees are flagged as `body_parts_diverge`
-- **Attachment directory whitelist** — draft attachments can only be read from directories listed in `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`, fallbacks to `$XDG_CACHE_HOME/imap-mcp-rs` then `/tmp/imap-mcp-rs-$USER`). Paths are canonicalized, so symlink escapes and `..` traversal are blocked. Symlinks at the base dir are rejected at startup. Downloaded attachments live in a per-download UUID subdirectory with the file under its original sanitized name (0700 dir, 0600 file). This prevents a prompt-injected LLM from attaching arbitrary local files (SSH keys, `/etc/passwd`, etc.)
+- **Attachment directory whitelist** — draft attachments can only be read from directories listed in `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`, fallbacks to `$XDG_CACHE_HOME/imap-mcp-rs` then `/tmp/imap-mcp-rs-$USER`). Paths are canonicalized, so symlink escapes and `..` traversal are blocked. This prevents a prompt-injected LLM from attaching arbitrary local files (SSH keys, `/etc/passwd`, etc.). The first entry, where downloads land, has to be a private directory of your own. It is set to mode 0700 at startup and before every download, and a symlink or a directory someone else owns (the chmod cannot take effect there) is refused. Downloaded attachments live in a per-download UUID subdirectory with the file under its original sanitized name (0700 dir, 0600 file). At startup, download subdirectories older than seven days are removed; nothing else in the directory is touched
 - **Input sanitization for LLM-visible strings** — subject, snippet, EmailAddress name/address, Message-ID / In-Reply-To / References, folder names, attachment filenames, content-type, tool error messages, and `account_health.last_error` are all scrubbed for control chars, bidirectional override characters, zero-width characters, line separators, and BOM before reaching the LLM. Outgoing header values get the same treatment to prevent CRLF injection. Folder names containing such characters are dropped from listings entirely, not substituted. **Full message bodies (`get_email`, `get_thread` with `include_body`) are deliberately *not* filtered** — mail must be readable verbatim; see [Prompt injection](#prompt-injection) for what that implies
-- **Resource caps** — 100 MiB per email body, 10k folders per LIST, 50 references / 200 UIDs per thread expansion, 10 MiB per draft body, 50 MiB per attachment / 100 MiB aggregate, 1000 UIDs per batch write (25 for `delete_draft`), 1 MiB per OAuth response, 15s reconnect timeout, 5s LOGOUT timeout, 10s per-folder STATUS timeout
+- **Resource caps** — 100 MiB per email body, 10k folders per LIST, 50 references / 200 UIDs per thread expansion, 10 MiB per draft body, 2 KiB per draft subject, 50 MiB per attachment / 100 MiB aggregate, 1000 UIDs per batch write (25 for `delete_draft`), 1 MiB per OAuth response, 15s reconnect timeout, 5s LOGOUT timeout, 10s per-folder STATUS timeout
 
 ### Prompt injection
 
@@ -294,12 +313,12 @@ Emails are untrusted data. A malicious email could contain text like *"Ignore al
 2. **Attachment whitelist** (`allowed_attachment_dirs`) — closes the main exfiltration channel: paths are canonicalized and checked against the whitelist, so SSH keys or `/etc/passwd` cannot be attached to a draft
 3. **Read-only mode** (`read_only = true`) — removes every write path for an account
 4. **Folder restrictions** (`allowed_folders`) — limit which folders are reachable at all, for reading and as move/draft targets
-5. **Per-account gates** (`allow_move`, `allow_delete`) — block moving and deleting independently of read access
+5. **Per-account gates** (`allow_move`, `allow_delete`, `allow_flag_change`) — block moving, deleting and flag changes independently of read access
 6. **Inline content marker** — every response that carries a message body includes `content_warning` next to the data. Unlike server instructions this cannot be truncated away by the client, and it reaches the model exactly when a body does
 7. **Divergence flag** (`body_parts_diverge`) — a `multipart/alternative` message whose plain-text part reproduces the HTML *and* appends substantial extra text is the shape of a payload hidden from the human reader; those UIDs are listed so the model can be sceptical and say so. Calibrated against real inbox traffic rather than intuition: an earlier version keyed on plain-vs-HTML difference alone and flagged a quarter of ordinary newsletters, which routinely ship an independently written plain-text version; the shipped heuristic flags none of that same sample
 8. **Server instructions** warn the LLM that email content is untrusted. The weakest of the mitigations — advice, not enforcement, and MCP clients may truncate long instruction blocks, which is why the warning is the *first* block, not the last
 
-**What remains possible after a successful injection:** creating drafts (including a forward to an attacker's address — unsent, but sitting in your Drafts folder), marking mail as read (which can hide messages from a monitoring workflow that keys on unread state), deleting drafts (capped at 25 per call), and reading any folder that is not excluded. Sizing these down is a configuration decision: `allowed_folders`, `allow_move = false`, `allow_delete = false`, and `read_only = true` wherever composing is not needed.
+**What remains possible after a successful injection:** creating drafts (including a forward to an attacker's address — unsent, but sitting in your Drafts folder), marking mail as read (which can hide messages from a monitoring workflow that keys on unread state), deleting drafts (capped at 25 per call), and reading any folder that is not excluded. Sizing these down is a configuration decision: `allowed_folders`, `allow_move = false`, `allow_delete = false`, `allow_flag_change = false` (which also takes marking as read off the list), and `read_only = true` wherever composing is not needed.
 
 **What this cannot solve:** Prompt injection is a fundamental LLM problem. A hostile mail can still hide its payload from you while showing it to the model — the divergence flag above catches the *mirroring* variant (harmless HTML reproduced in the plain part, payload appended), but a sender who writes two fully independent parts evades it, HTML that is invisible when styled arrives as plain text once flattened for the model, and since `alt` texts count as readable content (they are what a reader sees with images blocked), a payload mirrored into the `alt` of an always-loading inline image also balances the comparison. No server-side mitigation is 100 % effective, and none of this constrains what the model does with a body it has already read. For sensitive accounts, use `read_only = true` and review LLM actions.
 
@@ -392,7 +411,11 @@ call leaves the previous draft intact rather than nothing at all.
 # Server-wide setting (top level, before [[accounts]])
 # allowed_attachment_dirs = ["/custom/path"]  # Whitelist for draft attachments
                                               # Default: $XDG_RUNTIME_DIR/imap-mcp-rs
-                                              # Empty list `[]` is rejected — omit to get default
+                                              # The first entry receives downloads and is
+                                              # kept at 0700; empty list `[]` is rejected;
+                                              # write absolute paths (`~` is not expanded)
+# tool_set = "full"                           # "voice" trims the tool surface for a small
+                                              # model behind a voice assistant
 
 [[accounts]]
 name = "Personal"                   # Account name (used in tool calls)
@@ -408,6 +431,7 @@ signature_html = '<div style="color:#888;margin-top:12px;">Best regards,<br>John
 read_only = false                   # true = only read tools, write/draft blocked
 allow_delete = true                 # false = delete_email blocked
 allow_move = true                   # false = move_email blocked
+allow_flag_change = true            # false = mark_as_read/unread + flag/unflag blocked
 allow_unsafe_expunge = false        # true = plain EXPUNGE fallback on servers w/o UIDPLUS
 accept_invalid_certs = false        # Accept self-signed TLS certs (testing only!)
 # allowed_folders = ["INBOX"]       # Restrict accessible folders (optional, empty list `[]` rejected)
@@ -441,7 +465,7 @@ The server checks these paths in order:
 
 The config holds credentials — keep it at `chmod 600`; the server warns at startup if it is readable by other users. OAuth2 refresh tokens are *not* stored here but in `$XDG_STATE_HOME/imap-mcp-rs/tokens.toml` (`~/.local/state/…`, `0600`), which the server writes itself. Deleting that file simply means re-running `reauth`.
 
-> **Note:** CWD (`./config.toml`) is **intentionally not searched** — on a shared host it would let any directory the server is launched from inject its own config with attacker-controlled OAuth refresh tokens. Use the `--config` flag or `IMAP_MCP_CONFIG` env var if you want a local file.
+> **Note:** CWD (`./config.toml`) is **intentionally not searched** — on a shared host it would let any directory the server is launched from inject its own config with attacker-controlled OAuth refresh tokens. For the same reason no `.env` file is read, since one could set `IMAP_MCP_CONFIG`. Use the `--config` flag or `IMAP_MCP_CONFIG` env var if you want a local file.
 
 ### Provider examples
 
@@ -675,7 +699,11 @@ Normal — the server auto-reconnects on the next tool call. TCP keepalive detec
 
 ### "Account ... not found"
 
-Account names are matched case-insensitively. Check `list_accounts` to see the exact names configured.
+Account names are matched case-insensitively, and the error lists the names that are configured.
+
+### More detail in the logs
+
+The server logs to stderr at INFO level. Set `RUST_LOG` in its environment for more (`RUST_LOG=debug`) or for this server alone (`RUST_LOG=info,imap_mcp_rs=debug`). MCP clients usually take it in an `env` block next to `command`.
 
 ## Development
 
@@ -691,7 +719,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --lib               # Run the 283 unit tests
+cargo test --all-targets       # Run the 339 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
@@ -707,38 +735,58 @@ cargo build
 ./target/debug/imap-mcp-rs --config config.test.toml
 ```
 
+`config.test.toml` is git-ignored, so create it once with the container's account:
+
+```toml
+[[accounts]]
+name = "Greenmail"
+host = "127.0.0.1"
+port = 3993
+username = "test"
+email = "test@localhost"
+auth_method = "password"
+password = "password"
+accept_invalid_certs = true   # GreenMail's self-signed certificate
+```
+
 ### Integration tests
 
 End-to-end tests against the GreenMail container live in `tests/integration_greenmail.rs`. They're gated behind `#[ignore]` so `cargo test` stays fast and CI-friendly without the container:
 
 ```bash
 ./test-server.sh                                            # start container
-cargo test --test integration_greenmail -- --ignored        # run all 17 tests
+cargo test --test integration_greenmail -- --ignored        # run all 22 tests
 podman rm -f imap-test                                      # stop container when done
 ```
 
-The suite covers the wire-protocol path that unit tests can't reach: TLS + IMAP login, `LIST`, FETCH + MIME decode, UID SEARCH, and STORE with server-acknowledged UIDs (the "mark_flags intersects against input" stability fix).
+The suite covers the wire-protocol path that unit tests can't reach: TLS + IMAP login, `LIST`, FETCH + MIME decode, UID SEARCH, and STORE with server-acknowledged UIDs (the "mark_flags intersects against input" stability fix). Two sessions against one mailbox prove that a listing sees mail arriving while its folder stays selected.
 
-One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 tools** as real MCP JSON-RPC calls against the built binary — the request/response shapes an MCP client actually sees, including `has_more`, `failed`, `retryable`, `internal_date`, `dry_run` previews and the attachment `index` round trip. The run mutates the mailbox, so always give it a fresh container:
+One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 tools** as real MCP JSON-RPC calls against the built binary — the request/response shapes an MCP client actually sees, including `has_more`, `failed`, `retryable`, the `isError` flag, `internal_date`, `dry_run` previews and the attachment `index` round trip. Without an argument it picks `result/bin/imap-mcp-rs` first, which is only current after a `nix build`; pass the path of the binary you mean to test. The run mutates the mailbox, so always give it a fresh container:
 
 ```bash
 ./test-server.sh                     # fresh container (run right before — the sub-day search asserts a 1-hour window)
-nix build                            # or: cargo build --release
-python3 tests/e2e_mcp_all_tools.py   # 35 checks across all 19 tools
+cargo build --release                # or nix build, then pass result/bin/imap-mcp-rs
+python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 45 checks across all 19 tools
 podman rm -f imap-test
 ```
+
+### Measuring with a small model
+
+`mcp-tool-test/gemma/` holds the kit that shaped `tool_set = "voice"`: a Dovecot container with an invented mailbox (`welt.py`, reset before every conversation), a catalog of spoken requests with checks on the resulting mailbox, and the runners for Gemma 4 E4B behind the Otomo voice assistant and for Claude as the cross-check. It never talks to a real mailbox. `dump.py` records what the server hands a model in that world, the instructions, `tools/list` and example calls with their results. Its README (German) says how to run it, `EMPFEHLUNG.md` holds the results: with `voice`, Gemma handled 84 of 99 requests where the 2.0.0 texts managed 34 of 62, and 25 of 28 held-out requests instead of 11, while Claude with `full` lost nothing.
 
 ## Architecture
 
 ```
 src/
-├── main.rs                 Binary entry: multi-account startup, attachment-dir prep, MCP lifecycle
+├── main.rs                 Binary entry: argument check, multi-account startup, download prune,
+│                           MCP lifecycle
 ├── lib.rs                  Library shell exposing modules for integration tests
 ├── config.rs               TOML config + validation, first-run guidance, permission warning,
-│                           default attachment dir (XDG_RUNTIME_DIR)
+│                           attachment dir (XDG_RUNTIME_DIR default, private-dir check)
 ├── email.rs                Email models, MIME parsing, HTML→text, sanitize_external_str, build_snippet,
 │                           multipart divergence heuristic (parts_diverge)
-├── oauth2.rs               OAuth2 token refresh incl. rotation + typed provider errors with remedies
+├── oauth2.rs               OAuth2 token refresh incl. rotation + typed provider errors with remedies,
+│                           minimal HTTPS client (chunked + Content-Length bodies)
 ├── token_state.rs          Persisted refresh tokens (XDG state dir, locked atomic writes)
 ├── reauth.rs               `reauth` subcommand: loopback authorization-code flow + login verification
 ├── imap_client/
@@ -747,7 +795,9 @@ src/
 │   └── util.rs             Pure helpers: search criteria, astring escape, prefix detection, error cleanup
 └── tools/
     ├── mod.rs              MCP server, tool registration, account resolution, list_accounts,
-    │                       account_health, error_json
+    │                       account_health, error_json, folder name resolution
+    ├── voice.rs            tool_set = "voice": instructions, descriptions, hidden parameters,
+    │                       slim schemas
     ├── read.rs             untrusted-content marker, list_folders, list_emails (+group_by_thread),
     │                       get_email, get_thread, search_emails, download_attachment,
     │                       list_drafts, filesystem_safe_filename,
@@ -759,8 +809,10 @@ src/
         │                   delete_draft (25-UID cap), attachment handling, header sanitization
         └── render.rs       Locale presets (EN/DE), Outlook-Web-style HTML bodies, date formatting
 tests/
-├── integration_greenmail.rs  End-to-end tests against GreenMail container (17 tests, `#[ignore]`-gated)
-└── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls (35 checks)
+├── integration_greenmail.rs  End-to-end tests against GreenMail container (22 tests, `#[ignore]`-gated)
+└── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls (45 checks)
+mcp-tool-test/gemma/          Measurement kit for small models: mail world, request catalog, runners
+                              (see "Measuring with a small model")
 ```
 
 ### Key design decisions
@@ -768,7 +820,7 @@ tests/
 - **Tools only, no MCP resources** — tools are more flexible and more natural for LLM interaction
 - **One IMAP connection per account** with `HashMap<String, Arc<Mutex<ImapClient>>>` — each account has independent state, caching, and reconnect logic
 - **MIME building via mail-builder** — drafts are proper RFC 5322 messages with correct threading headers
-- **JSON error responses** — all errors returned as `{"error": "..."}` via `serde_json::json!`
+- **JSON error responses** — all errors returned as `{"error": "...", "retryable": bool}` via `serde_json::json!`, in a tool result flagged `isError: true`
 - **Tokens are state, not config** — the server never writes the config file; refresh tokens live in the XDG state dir under a lock, so rotation can be followed without touching a file the operator (or a Nix generation) owns
 - **Flag, don't filter** — suspicious mail structure is reported (`body_parts_diverge`) rather than sanitized away: message bodies must stay verbatim, and the model can weigh a hint. The heuristic was calibrated against real inbox traffic, not intuition — an earlier version flagged a quarter of ordinary newsletters
 

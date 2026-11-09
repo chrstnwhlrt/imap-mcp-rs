@@ -11,7 +11,10 @@
 //! [`EmailSummary`] without cloning, since the full struct is dropped right
 //! after.
 
-use mail_parser::{ContentType, MimeHeaders};
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use mail_parser::{ContentType, Message, MessagePart, PartKind, PartRole};
 use serde::Serialize;
 
 /// Format a MIME `Content-Type` as `type/subtype`, falling back to
@@ -20,7 +23,7 @@ use serde::Serialize;
 /// Unicode bidirectional overrides so the value can safely land in the
 /// JSON response shown to the LLM without smuggling display-manipulation
 /// or prompt-injection payloads.
-pub fn format_content_type(ct: Option<&ContentType<'_>>) -> String {
+pub fn format_content_type(ct: Option<ContentType<'_>>) -> String {
     let raw = ct.map_or_else(
         || "application/octet-stream".to_string(),
         |ct| {
@@ -65,30 +68,24 @@ pub struct EmailAddress {
 }
 
 impl EmailAddress {
-    pub fn parse_addr(addr: &mail_parser::Addr<'_>) -> Self {
+    pub fn from_mailbox(mailbox: mail_parser::Mailbox<'_>) -> Self {
         // Sender-controlled display name + address both reach the LLM via
         // every EmailFull / EmailSummary. Same class of injection surface
         // as subject/snippet/filename — strip control+bidi+zero-width before
         // exposure. `address` is normally ASCII-clean but a malicious server
         // could smuggle bidi chars here too.
         Self {
-            name: addr
-                .name
-                .as_deref()
+            name: mailbox
+                .name()
                 .filter(|n| !n.is_empty())
                 .map(sanitize_external_str),
-            address: sanitize_external_str(addr.address.as_deref().unwrap_or("")),
+            address: sanitize_external_str(mailbox.address().unwrap_or("")),
         }
     }
 
-    pub fn list_from_address(addr: &mail_parser::Address<'_>) -> Vec<Self> {
-        match addr {
-            mail_parser::Address::List(list) => list.iter().map(Self::parse_addr).collect(),
-            mail_parser::Address::Group(groups) => groups
-                .iter()
-                .flat_map(|g| g.addresses.iter().map(Self::parse_addr))
-                .collect(),
-        }
+    /// Every mailbox of an address header, group members flattened in.
+    pub fn list_from_address(list: &mail_parser::AddressList<'_>) -> Vec<Self> {
+        list.mailboxes().map(Self::from_mailbox).collect()
     }
 }
 
@@ -103,9 +100,11 @@ pub struct EmailSummary {
     pub uid: u32,
     pub folder: String,
     /// The folder name as a human reads it, when `folder` is modified-UTF-7
-    /// encoded (`Gel&APY-schte Elemente` → `Gelöschte Elemente`). Display
-    /// only — every tool takes `folder`. Mirrors `list_folders.display_name`
-    /// so a cross-folder hit from e.g. the trash is recognizable in place.
+    /// encoded (`Gel&APY-schte Elemente` → `Gelöschte Elemente`). For
+    /// showing; `folder` is what the server accepts, and the tools take this
+    /// form as well (see `resolve_folder_name`). Mirrors
+    /// `list_folders.display_name` so a cross-folder hit from e.g. the trash
+    /// is recognizable in place.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder_display: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,20 +126,25 @@ pub struct EmailSummary {
     pub cc_count: usize,
     pub subject: String,
     /// UTC-normalized ISO 8601 — compare and sort on this. See
-    /// [`NormalizedDate`] for why the sender's offset is not passed through.
+    /// `NormalizedDate` for why the sender's offset is not passed through.
+    /// Serialized in the machine's time zone (see [`shown_local`]).
+    #[serde(serialize_with = "serialize_shown")]
     pub date: Option<String>,
     /// The sender's original `Date` rendition, only when its offset differs
-    /// from UTC — useful for quoting, never for comparing.
+    /// from the machine's — useful for quoting, never for comparing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date_original: Option<String>,
     /// Arrival time (INTERNALDATE) as UTC ISO 8601 — the value sub-day
-    /// `since`/`before` bounds cut against. Only present under such a
-    /// bound (best-effort there: a server that omits INTERNALDATE leaves
-    /// it absent), so a row whose `date` (the sender's header) sits
-    /// outside the requested window is explainable in place. Never set
-    /// otherwise: without the filter it is near-redundant noise next to
-    /// `date`.
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `since`/`before` bounds cut against, serialized like `date`. Only
+    /// present under such a bound (best-effort there: a server that omits
+    /// INTERNALDATE leaves it absent), so a row whose `date` (the sender's
+    /// header) sits outside the requested window is explainable in place.
+    /// Never set otherwise: without the filter it is near-redundant noise
+    /// next to `date`.
+    #[serde(
+        serialize_with = "serialize_shown",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub internal_date: Option<String>,
     pub flags: Vec<String>,
     pub has_attachments: bool,
@@ -175,12 +179,12 @@ impl EmailSummary {
             v["from"] = serde_json::json!(from.address);
         }
         if let Some(date) = &self.date {
-            v["date"] = serde_json::json!(date);
+            v["date"] = serde_json::json!(shown_local(date));
         }
         // Only ever set when a sub-day bound was active — there it explains
         // the filter decision, so it survives the compact cut too.
         if let Some(internal) = &self.internal_date {
-            v["internal_date"] = serde_json::json!(internal);
+            v["internal_date"] = serde_json::json!(shown_local(internal));
         }
         if !self.flags.is_empty() {
             v["flags"] = serde_json::json!(self.flags);
@@ -200,9 +204,12 @@ pub struct EmailFull {
     pub to: Vec<EmailAddress>,
     pub cc: Vec<EmailAddress>,
     pub subject: String,
-    /// UTC-normalized ISO 8601 — compare and sort on this.
+    /// UTC-normalized ISO 8601 — compare and sort on this. Serialized in
+    /// the machine's time zone (see [`shown_local`]).
+    #[serde(serialize_with = "serialize_shown")]
     pub date: Option<String>,
-    /// The sender's original `Date` rendition when its offset differs.
+    /// The sender's original `Date` rendition when its offset differs from
+    /// the machine's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date_original: Option<String>,
     pub message_id: Option<String>,
@@ -217,7 +224,7 @@ pub struct EmailFull {
     /// clients render the HTML part while an LLM reads the plain text, so a
     /// divergence is how a sender hides instructions from the human reader.
     /// A heuristic, and a hint rather than a verdict — see
-    /// [`parts_diverge`]. Only computed where the full body is returned.
+    /// `parts_diverge`. Only computed where the full body is returned.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub body_parts_diverge: bool,
 }
@@ -277,16 +284,17 @@ fn parse_email_inner(
 
     let from = message
         .from()
-        .and_then(|addr| EmailAddress::list_from_address(addr).into_iter().next());
+        .and_then(|list| list.first())
+        .map(EmailAddress::from_mailbox);
 
     let to = message
         .to()
-        .map(|addr| EmailAddress::list_from_address(addr))
+        .map(|list| EmailAddress::list_from_address(&list))
         .unwrap_or_default();
 
     let cc = message
         .cc()
-        .map(|addr| EmailAddress::list_from_address(addr))
+        .map(|list| EmailAddress::list_from_address(&list))
         .unwrap_or_default();
 
     // Sanitize subject before it lands in the LLM's view — bidi overrides
@@ -295,7 +303,7 @@ fn parse_email_inner(
     // list. Same class of defense as `filename` / `content_type`.
     let subject = sanitize_external_str(message.subject().unwrap_or(""));
 
-    let normalized_date = message.date().map(format_datetime);
+    let normalized_date = message.date().as_ref().map(format_datetime);
     let (date, date_original) = match normalized_date {
         Some(n) => (Some(n.utc), n.original),
         None => (None, None),
@@ -310,33 +318,33 @@ fn parse_email_inner(
     let message_id = message.message_id().map(wrap);
     let in_reply_to = message
         .in_reply_to()
-        .as_text_list()
-        .and_then(|list| list.first().map(|s| wrap(s)));
+        .and_then(|list| list.first().map(wrap));
     let references: Vec<String> = message
         .references()
-        .as_text_list()
-        .map(|list| list.iter().map(|s| wrap(s)).collect())
+        .map(|list| list.iter().map(wrap).collect())
         .unwrap_or_default();
 
     let body_text = extract_body_text(&message);
-    let html_part = if include_html {
-        message.body_html(0).map(|s| s.to_string())
+    // Skipped entirely on the list/search path (`include_html == false`),
+    // which never returns a body anyway.
+    let body_html = if include_html {
+        own_html(&message)
     } else {
         None
     };
-    // Only meaningful when the message really carries both alternatives:
-    // `body_text` falls back to stripped HTML when no plain part exists, and
-    // comparing that against itself would flag nothing. Skipped entirely on
-    // the list/search path (`include_html == false`), which never returns a
-    // body anyway.
-    let body_parts_diverge = match (message.body_text(0), &html_part) {
-        (Some(plain), Some(html)) => parts_diverge(&plain, &strip_html(html)),
-        _ => false,
-    };
-    let body_html = html_part;
+    // What the model reads (`body_text`) against what an HTML client shows
+    // (the HTML body, rendered as text). Parts both bodies share — a mailing
+    // list's plain-text footer next to the alternative, say — sit on both
+    // sides, so only text one side carries alone counts. Meaningful only
+    // when the sender wrote both alternatives: see `own_html` for the
+    // stand-ins that must not be compared with themselves.
+    let body_parts_diverge = body_html.is_some()
+        && message
+            .text_body()
+            .any(|part| matches!(part.kind(), PartKind::Text))
+        && parts_diverge(&body_text, &rendered_html_body(&message));
 
-    let attachments = message
-        .attachments()
+    let attachments = attachment_parts(&message)
         .enumerate()
         .map(|(index, att)| AttachmentInfo {
             index,
@@ -346,7 +354,7 @@ fn parse_email_inner(
             // rendered view.
             filename: sanitize_external_str(att.attachment_name().unwrap_or("attachment")),
             content_type: format_content_type(att.content_type()),
-            size: att.len(),
+            size: att.decoded_len(),
         })
         .collect();
 
@@ -457,24 +465,30 @@ fn significant_words(s: &str) -> std::collections::HashSet<String> {
 }
 
 /// The `Date` header rendered twice: normalized to UTC, plus the sender's
-/// original offset when it differs.
+/// original offset when it differs from the machine's.
 ///
-/// `utc` is what every consumer should compare and sort on. Passing the
-/// sender's offset through as the primary value (the previous design) made
-/// one response mix `+02:00`, `-07:00` and `Z` rows: lexicographic ordering
-/// — which the cross-folder merge and the thread-representative choice rely
-/// on — silently ranked `11:02-07:00` before `13:20Z` although it is five
+/// `utc` is what the server compares and sorts on. Passing the sender's
+/// offset through as the primary value (an earlier design) made one
+/// response mix `+02:00`, `-07:00` and `Z` rows: lexicographic ordering,
+/// which the cross-folder merge and the thread-representative choice rely
+/// on, silently ranked `11:02-07:00` before `13:20Z` although it is five
 /// hours younger, and a reader skimming the rows drew the same wrong
-/// conclusion. `original` is kept for quoting (a reply cites the sender's
-/// clock), and omitted when it says nothing beyond `utc`.
+/// conclusion. Responses show `utc` in the machine's zone ([`shown_local`]),
+/// one offset for all rows. `original` is kept for quoting (a reply cites
+/// the sender's clock), and omitted when it says nothing beyond that.
 struct NormalizedDate {
     utc: String,
     original: Option<String>,
 }
 
 /// Format a `mail_parser` `DateTime` as UTC ISO 8601, keeping the sender's
-/// original rendition alongside when it carried a non-zero offset.
+/// original rendition alongside when it differs from the shown one.
 fn format_datetime(d: &mail_parser::DateTime) -> NormalizedDate {
+    format_datetime_in(d, &SHOWN_ZONE)
+}
+
+/// [`format_datetime`] for a reader in `zone`.
+fn format_datetime_in(d: &mail_parser::DateTime, zone: &jiff::tz::TimeZone) -> NormalizedDate {
     let original = format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}",
         d.year,
@@ -498,8 +512,44 @@ fn format_datetime(d: &mail_parser::DateTime) -> NormalizedDate {
         |_| original.clone(),
         |ts| ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string(),
     );
-    let original = (original != utc).then_some(original);
+    let original = (original != shown_in(&utc, zone)).then_some(original);
     NormalizedDate { utc, original }
+}
+
+/// The zone `date` and `internal_date` are shown in: the machine's, where
+/// the person reading the time lives. A model telling someone when a mail
+/// came reads the hour off the timestamp, and from a UTC one it said 23:19
+/// for a mail that arrived at 00:16 local time.
+static SHOWN_ZONE: LazyLock<jiff::tz::TimeZone> = LazyLock::new(jiff::tz::TimeZone::system);
+
+/// A UTC timestamp (`…Z`, as the server keeps it for sorting) as the same
+/// instant in `zone`, with its offset: `2026-11-09T00:16:00+01:00`. `Z`
+/// stays where the offset is zero. A value that is no timestamp passes
+/// through unchanged.
+pub fn shown_in(utc: &str, zone: &jiff::tz::TimeZone) -> String {
+    let Ok(instant) = utc.parse::<jiff::Timestamp>() else {
+        return utc.to_string();
+    };
+    let zoned = instant.to_zoned(zone.clone());
+    if zoned.offset().seconds() == 0 {
+        instant.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
+    } else {
+        zoned.strftime("%Y-%m-%dT%H:%M:%S%:z").to_string()
+    }
+}
+
+/// [`shown_in`] the machine's time zone.
+pub fn shown_local(utc: &str) -> String {
+    shown_in(utc, &SHOWN_ZONE)
+}
+
+/// Serializes a kept UTC timestamp as [`shown_local`] does.
+#[allow(clippy::ref_option)] // the signature serde's `serialize_with` calls
+fn serialize_shown<S: serde::Serializer>(value: &Option<String>, s: S) -> Result<S::Ok, S::Error> {
+    match value {
+        Some(utc) => s.serialize_some(&shown_local(utc)),
+        None => s.serialize_none(),
+    }
 }
 
 /// Unix seconds → `%Y-%m-%dT%H:%M:%SZ`, the same shape [`EmailSummary::date`]
@@ -511,22 +561,95 @@ pub fn unix_to_utc_iso(secs: i64) -> Option<String> {
         .map(|ts| ts.strftime("%Y-%m-%dT%H:%M:%SZ").to_string())
 }
 
-/// Extract plain text body. If only HTML exists, strip tags and decode entities.
-fn extract_body_text(message: &mail_parser::Message<'_>) -> String {
-    if let Some(text) = message.body_text(0) {
-        return text.to_string();
+/// The readable text of a message: every part of its text body in reading
+/// order, HTML-only parts converted to text, non-text parts skipped.
+///
+/// All parts, not just the first: phone and desktop clients put an inline
+/// photo between two text parts (`multipart/mixed[text, image, text]`), and
+/// reading only the first part silently dropped everything after the image.
+fn extract_body_text(message: &Message<'_>) -> String {
+    let mut out = String::new();
+    for text in message.text_bodies() {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&text);
     }
-    if let Some(html) = message.body_html(0) {
-        return strip_html(&html);
-    }
-    String::new()
+    out
 }
 
-/// Strip HTML tags and decode common HTML entities.
+/// The HTML parts the sender actually wrote, joined — `None` when there are
+/// none.
+///
+/// mail-parser fills a missing alternative with a stand-in: a text-only
+/// message has its text part in the HTML body too (and `body_html()` converts
+/// it to HTML on the fly), an HTML-only one has its HTML part in the text
+/// body. Right for display, wrong wherever the question is whether the
+/// message HAS such a part. Taking the stand-ins at face value made a
+/// text-only mail report a synthesized `body_html`, made a reply quote that
+/// synthesis instead of the escaped plain text, and had the divergence check
+/// compare a conversion with itself.
+fn own_html(message: &Message<'_>) -> Option<String> {
+    let mut out: Option<String> = None;
+    for part in message.html_body() {
+        if !matches!(part.kind(), PartKind::Html) {
+            continue;
+        }
+        let Some(html) = part.text() else { continue };
+        match &mut out {
+            Some(joined) => {
+                joined.push('\n');
+                joined.push_str(&html);
+            }
+            None => out = Some(html.into_owned()),
+        }
+    }
+    out
+}
+
+/// The HTML body as an HTML-capable client shows it, rendered to text: HTML
+/// parts through [`strip_html`], plain-text parts that sit between them (a
+/// mailing list's footer) as they are, media skipped.
+fn rendered_html_body(message: &Message<'_>) -> String {
+    let mut out = String::new();
+    for part in message.html_body() {
+        let rendered = match part.kind() {
+            PartKind::Html => part.text().map(|html| strip_html(&html)),
+            PartKind::Text => part.text().map(Cow::into_owned),
+            _ => None,
+        };
+        let Some(rendered) = rendered else { continue };
+        if !out.is_empty() {
+            out.push('\n');
+        }
+        out.push_str(&rendered);
+    }
+    out
+}
+
+/// Every part a reader would call an attachment, in document order: what
+/// mail-parser lists under RFC 8621 (files, nested messages, media shown in
+/// only one of the two bodies) plus images, audio and video displayed inline
+/// in both bodies.
+///
+/// mail-parser 1.0 dropped that last group from its `attachments()`, which
+/// is exactly how phone clients send photos (`multipart/mixed` with an
+/// inline image). Following it would have made those images vanish from
+/// `get_email` and turned them undownloadable. `get_email` and
+/// `download_attachment` both enumerate through here, so the `index` one
+/// reports is the one the other accepts.
+pub fn attachment_parts<'m>(message: &'m Message<'_>) -> impl Iterator<Item = MessagePart<'m>> {
+    message
+        .root()
+        .parts()
+        .filter(|part| part.is_attachment() || part.role() == PartRole::MediaBody)
+}
+
+/// Strip HTML tags and decode HTML entities.
 ///
 /// `<img>` `alt` texts are kept as text: they are what a reader sees when
 /// images are blocked or read aloud, so they belong to the message's textual
-/// content. This also keeps [`parts_diverge`] honest for mail whose plain
+/// content. This also keeps `parts_diverge` honest for mail whose plain
 /// part carries image placeholders — our own drafts write `[alt]` where the
 /// HTML has an `<img alt="…">`, and dropping the attribute made exactly that
 /// legitimate shape look like a hidden-text injection.
@@ -668,51 +791,50 @@ fn img_alt_text(tag: &str) -> Option<&str> {
     None
 }
 
-/// Decode common HTML entities.
-fn decode_html_entities(s: &str) -> String {
+/// Decode HTML entities: numeric references and the full HTML5 table of
+/// named ones. Anything that is not an entity stays as written.
+pub(crate) fn decode_html_entities(s: &str) -> String {
+    /// The longest HTML5 entity name (`CounterClockwiseContourIntegral`)
+    /// has 31 characters.
+    const MAX_ENTITY_CHARS: usize = 32;
+
     let mut result = String::with_capacity(s.len());
-    let mut chars = s.chars();
+    let mut chars = s.chars().peekable();
 
     while let Some(ch) = chars.next() {
         if ch == '&' {
+            // Entity names are alphanumeric (plus `#` for numeric ones), so
+            // the scan stops at anything else and leaves it unread. Scanning
+            // up to the next `;` instead let a lone `&` in prose swallow the
+            // real entity after it: `Müller & S&ouml;hne` kept its `&ouml;`.
             let mut entity = String::new();
-            let mut terminated = false;
-            for c in chars.by_ref() {
-                if c == ';' {
-                    terminated = true;
+            while let Some(&c) = chars.peek() {
+                if !(c.is_ascii_alphanumeric() || c == '#') || entity.len() >= MAX_ENTITY_CHARS {
                     break;
                 }
                 entity.push(c);
-                if entity.len() > 10 {
-                    // Not a real entity, emit as-is
-                    result.push('&');
-                    result.push_str(&entity);
-                    entity.clear();
-                    break;
-                }
+                chars.next();
             }
-            if entity.is_empty() {
-                if !terminated {
-                    result.push('&'); // lone & at end of string
-                }
-                continue;
-            }
-            if !terminated {
-                // Unterminated entity (e.g. &amp at EOF) — emit literally
+            let terminated = chars.next_if_eq(&';').is_some();
+            // Not an entity — unterminated (`&amp` at the end, `AT&T`),
+            // empty (`&;`) or a lone `&` in prose: the text stays as written.
+            // (An earlier version emitted an extra `&` after a long run and
+            // dropped `&;` entirely.)
+            if !terminated || entity.is_empty() {
                 result.push('&');
                 result.push_str(&entity);
+                if terminated {
+                    result.push(';');
+                }
                 continue;
             }
             match entity.as_str() {
-                "amp" => result.push('&'),
-                "lt" => result.push('<'),
-                "gt" => result.push('>'),
-                "quot" => result.push('"'),
-                "apos" => result.push('\''),
+                // A plain space, so word splitting and whitespace collapsing
+                // treat it like the space it renders as.
                 "nbsp" => result.push(' '),
                 s if s.starts_with('#') => {
                     let num_str = &s[1..];
-                    let code = num_str.strip_prefix('x').map_or_else(
+                    let code = num_str.strip_prefix(['x', 'X']).map_or_else(
                         || num_str.parse().ok(),
                         |hex| u32::from_str_radix(hex, 16).ok(),
                     );
@@ -724,10 +846,17 @@ fn decode_html_entities(s: &str) -> String {
                         result.push(';');
                     }
                 }
+                // The full HTML5 table via mail-parser's decoder (unknown
+                // names pass through verbatim). The six names handled here
+                // before left `Gr&uuml;&szlig;e` encoded, splitting German
+                // words into fragments that the divergence check then
+                // counted as text missing from the HTML part.
                 other => {
-                    result.push('&');
-                    result.push_str(other);
-                    result.push(';');
+                    mail_parser::add_html_token(
+                        &mut result,
+                        format!("&{other};").as_bytes(),
+                        false,
+                    );
                 }
             }
         } else {
@@ -781,14 +910,24 @@ pub fn summarize(email: EmailFull, snippet_len: usize) -> EmailSummary {
     }
 }
 
-/// Build a sanitized snippet in one pass: drop chars that
-/// `sanitize_external_str` would strip, and stop once we've accumulated
-/// `snippet_len` bytes of kept output (char-boundary-safe by construction),
-/// appending `"..."` if anything was truncated.
+/// Build a sanitized snippet in one pass: every run of whitespace becomes
+/// one space, chars that `sanitize_external_str` would strip are dropped,
+/// and the scan stops once `snippet_len` bytes of output are reached
+/// (char-boundary-safe by construction), appending `"..."` if anything was
+/// truncated.
+///
+/// Line breaks become spaces rather than vanishing with the other control
+/// characters: dropping them glued the lines of a mail together, and a
+/// listing read `Liebe GrüßeMama`.
 fn build_snippet(body: &str, snippet_len: usize) -> String {
     let mut out = String::with_capacity(snippet_len.min(body.len()) + 3);
     let mut truncated = false;
+    let mut space_pending = false;
     for c in body.chars() {
+        if c.is_whitespace() {
+            space_pending = !out.is_empty();
+            continue;
+        }
         // Matches the filter in `sanitize_external_str`; kept inline to
         // avoid a second pass over the result.
         let dangerous = c.is_control()
@@ -800,9 +939,14 @@ fn build_snippet(body: &str, snippet_len: usize) -> String {
         if dangerous {
             continue;
         }
-        if out.len() + c.len_utf8() > snippet_len {
+        let space = usize::from(space_pending);
+        if out.len() + space + c.len_utf8() > snippet_len {
             truncated = true;
             break;
+        }
+        if space_pending {
+            out.push(' ');
+            space_pending = false;
         }
         out.push(c);
     }
@@ -814,6 +958,7 @@ fn build_snippet(body: &str, snippet_len: usize) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     fn summary_fixture() -> EmailSummary {
         EmailSummary {
@@ -876,7 +1021,7 @@ mod tests {
         with_internal.internal_date = Some("2026-07-28T10:30:00Z".into());
         assert_eq!(
             with_internal.compact()["internal_date"],
-            "2026-07-28T10:30:00Z"
+            shown_local("2026-07-28T10:30:00Z")
         );
 
         let full = serde_json::to_value(summary_fixture()).unwrap();
@@ -906,8 +1051,6 @@ mod tests {
         assert_eq!(grouped.compact()["thread_message_count"], 7);
     }
 
-    use super::*;
-
     fn dt(hour: u8, tz_hour: u8, before_gmt: bool) -> mail_parser::DateTime {
         mail_parser::DateTime {
             year: 2026,
@@ -930,13 +1073,26 @@ mod tests {
     /// the true order.
     #[test]
     fn format_datetime_normalizes_to_utc_and_keeps_the_original() {
-        let west = format_datetime(&dt(11, 7, true)); // 11:02:02-07:00
+        let reader = jiff::tz::TimeZone::UTC;
+        let west = format_datetime_in(&dt(11, 7, true), &reader); // 11:02:02-07:00
         assert_eq!(west.utc, "2026-08-14T18:02:02Z");
         assert_eq!(west.original.as_deref(), Some("2026-08-14T11:02:02-07:00"));
 
-        let utc = format_datetime(&dt(13, 0, false)); // 13:02:02Z
+        let utc = format_datetime_in(&dt(13, 0, false), &reader); // 13:02:02Z
         assert_eq!(utc.utc, "2026-08-14T13:02:02Z");
         assert!(utc.original.is_none(), "Z adds nothing beyond utc");
+
+        // A reader two hours east sees the shown time in their offset: a
+        // sender there adds nothing, a sender in UTC does.
+        let east = jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(2));
+        let local = format_datetime_in(&dt(13, 2, false), &east); // 13:02:02+02:00
+        assert_eq!(local.utc, "2026-08-14T11:02:02Z");
+        assert!(
+            local.original.is_none(),
+            "the reader's own offset adds nothing"
+        );
+        let from_utc = format_datetime_in(&dt(13, 0, false), &east);
+        assert_eq!(from_utc.original.as_deref(), Some("2026-08-14T13:02:02Z"));
 
         // The report's exact trap: -07:00 late morning vs. early-afternoon
         // Z. Lexicographic order over the normalized strings is the true
@@ -958,10 +1114,52 @@ mod tests {
                     Date: Fri, 14 Aug 2026 11:02:02 -0700\r\n\r\nbody";
         let email = parse_email(1, "INBOX", raw, vec![]);
         assert_eq!(email.date.as_deref(), Some("2026-08-14T18:02:02Z"));
+        // Alongside unless the machine itself is at -07:00 that day.
+        let original = "2026-08-14T11:02:02-07:00";
+        let shown = shown_local("2026-08-14T18:02:02Z");
         assert_eq!(
             email.date_original.as_deref(),
-            Some("2026-08-14T11:02:02-07:00")
+            (shown != original).then_some(original)
         );
+        // Kept in UTC for sorting, served in the machine's zone.
+        assert_eq!(serde_json::to_value(&email).unwrap()["date"], shown);
+    }
+
+    #[test]
+    fn shown_in_renders_the_instant_in_the_zone_with_its_offset() {
+        let plus_one = jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(1));
+        assert_eq!(
+            shown_in("2026-11-08T23:16:00Z", &plus_one),
+            "2026-11-09T00:16:00+01:00"
+        );
+        let minus_seven = jiff::tz::TimeZone::fixed(jiff::tz::Offset::constant(-7));
+        assert_eq!(
+            shown_in("2026-11-08T23:16:00Z", &minus_seven),
+            "2026-11-08T16:16:00-07:00"
+        );
+        assert_eq!(
+            shown_in("2026-11-08T23:16:00Z", &jiff::tz::TimeZone::UTC),
+            "2026-11-08T23:16:00Z"
+        );
+        // A header so broken that it stayed as written passes through.
+        assert_eq!(
+            shown_in("2026-13-45T99:00:00Z", &plus_one),
+            "2026-13-45T99:00:00Z"
+        );
+    }
+
+    /// Threading ids reach the caller wrapped exactly once — mail-parser
+    /// hands them out bare, and a doubled `<<id>>` would survive into reply
+    /// headers the moment one consumer forgot to trim.
+    #[test]
+    fn parse_email_wraps_threading_ids_once() {
+        let raw = b"From: a@example.com\r\nSubject: T\r\nMessage-ID: <m3@example.com>\r\n\
+                    In-Reply-To: <m2@example.com>\r\n\
+                    References: <m1@example.com> <m2@example.com>\r\n\r\nbody";
+        let email = parse_email(1, "INBOX", raw, vec![]);
+        assert_eq!(email.message_id.as_deref(), Some("<m3@example.com>"));
+        assert_eq!(email.in_reply_to.as_deref(), Some("<m2@example.com>"));
+        assert_eq!(email.references, ["<m1@example.com>", "<m2@example.com>"]);
     }
 
     #[test]
@@ -1045,7 +1243,7 @@ mod tests {
     /// The shape our own drafts produce: the plain part carries `[alt]`
     /// placeholders whose words sit in the HTML only inside `alt`
     /// attributes. Dropping those attributes made the plain part look like
-    /// it carried hidden extra text — the exact signature [`parts_diverge`]
+    /// it carried hidden extra text — the exact signature `parts_diverge`
     /// flags — so reading back a freshly saved draft reported it as a
     /// possible injection.
     #[test]
@@ -1104,6 +1302,18 @@ mod tests {
     fn decode_html_entities_numeric_hex() {
         assert_eq!(decode_html_entities("&#x41;"), "A");
         assert_eq!(decode_html_entities("&#xE4;"), "ä");
+        // HTML accepts the upper-case marker too.
+        assert_eq!(decode_html_entities("&#XE4;"), "ä");
+    }
+
+    /// German mail routinely encodes umlauts as named entities; anything
+    /// outside the old six-name list stayed encoded and split words apart.
+    #[test]
+    fn decode_html_entities_named_beyond_the_basics() {
+        assert_eq!(
+            decode_html_entities("Gr&uuml;&szlig;e &Auml;nderung &euro; &hellip;&ndash;"),
+            "Grüße Änderung € …–"
+        );
     }
 
     #[test]
@@ -1127,10 +1337,35 @@ mod tests {
 
     #[test]
     fn decode_html_entities_long_run_emits_literal() {
-        // Entity longer than 10 chars without `;` → emit literally.
-        let result = decode_html_entities("&waytoolongtobeavalidentity;");
-        assert!(result.starts_with('&'));
-        assert!(result.contains("waytoolong"));
+        // Longer than any entity without a `;` in reach: the text stays
+        // exactly as written — an earlier version inserted a second `&`.
+        assert_eq!(
+            decode_html_entities("&waytoolongtobeavalidentity;"),
+            "&waytoolongtobeavalidentity;"
+        );
+        assert_eq!(
+            decode_html_entities("Tom & Jerry are friends"),
+            "Tom & Jerry are friends"
+        );
+        // An empty `&;` is text too, not something to swallow.
+        assert_eq!(decode_html_entities("a &; b"), "a &; b");
+    }
+
+    /// A lone `&` must not take the entity after it down with it: scanning
+    /// to the next `;` turned `& S&ouml;` into one unknown "entity" and left
+    /// the umlaut encoded.
+    #[test]
+    fn decode_html_entities_after_a_lone_ampersand() {
+        assert_eq!(
+            decode_html_entities("Müller & S&ouml;hne"),
+            "Müller & Söhne"
+        );
+        assert_eq!(decode_html_entities("AT&T &amp; Co"), "AT&T & Co");
+        // Long names from the HTML5 table decode too.
+        assert_eq!(
+            decode_html_entities("&CounterClockwiseContourIntegral;"),
+            "\u{2233}"
+        );
     }
 
     #[test]
@@ -1201,8 +1436,25 @@ mod tests {
     #[test]
     fn build_snippet_strips_dangerous_chars_inline() {
         // Sanitize happens BEFORE the byte counter, so dangerous chars
-        // don't count toward the snippet budget.
-        assert_eq!(build_snippet("a\u{202E}b\r\nc", 200), "abc");
+        // don't count toward the snippet budget; the line break between
+        // two words stays a space.
+        assert_eq!(build_snippet("a\u{202E}b\r\nc", 200), "ab c");
+    }
+
+    /// Lines of a mail stay apart: a listing that read `Liebe GrüßeMama`
+    /// glued words the model then had to guess apart.
+    #[test]
+    fn build_snippet_turns_line_breaks_and_runs_of_blanks_into_one_space() {
+        assert_eq!(
+            build_snippet(
+                "\n  Hallo Mama,\r\n\r\nwir kommen.\tLiebe Grüße\nMama\n",
+                200
+            ),
+            "Hallo Mama, wir kommen. Liebe Grüße Mama"
+        );
+        // The space counts toward the budget like any other byte.
+        assert_eq!(build_snippet("ab\ncd", 3), "ab...");
+        assert_eq!(build_snippet("ab\ncd", 4), "ab c...");
     }
 
     #[test]
@@ -1367,6 +1619,128 @@ mod tests {
             "",
         );
         assert!(!parse_email(1, "INBOX", benign.as_bytes(), vec![]).body_parts_diverge);
+    }
+
+    /// mail-parser stands a text part in for a missing HTML alternative and
+    /// converts it on the fly. Taken at face value that reported a
+    /// synthesized `body_html` for plain mail — and made replies quote the
+    /// synthesis instead of the escaped plain text.
+    #[test]
+    fn text_only_mail_has_no_body_html() {
+        let raw = b"From: a@example.com\r\nSubject: T\r\nMIME-Version: 1.0\r\n\
+                    Content-Type: text/plain; charset=utf-8\r\n\r\nJust <text> & lines\r\n";
+        let email = parse_email(1, "INBOX", raw, vec![]);
+        assert_eq!(email.body_text.trim_end(), "Just <text> & lines");
+        assert!(email.body_html.is_none(), "{:?}", email.body_html);
+        assert!(!email.body_parts_diverge);
+    }
+
+    /// Phone clients put an inline photo between two text parts. Reading
+    /// only the first text part dropped everything after the photo, and
+    /// mail-parser 1.0's RFC 8621 attachment list no longer names a medium
+    /// shown in both bodies — which would have hidden the photo itself.
+    #[test]
+    fn inline_photo_between_text_parts_keeps_both_texts_and_the_photo() {
+        let raw = "From: a@example.com\r\nSubject: Photo\r\nMIME-Version: 1.0\r\n\
+                   Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+                   --B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nLook at this:\r\n\
+                   --B\r\nContent-Type: image/jpeg; name=\"IMG_0001.jpeg\"\r\n\
+                   Content-Disposition: inline; filename=\"IMG_0001.jpeg\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\r\n/9j/4AAQSkZJRg==\r\n\
+                   --B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nSent from my phone\r\n\
+                   --B--\r\n";
+        let email = parse_email(1, "INBOX", raw.as_bytes(), vec![]);
+        assert!(
+            email.body_text.contains("Look at this:"),
+            "{}",
+            email.body_text
+        );
+        assert!(
+            email.body_text.contains("Sent from my phone"),
+            "text after the photo was dropped: {}",
+            email.body_text
+        );
+        assert_eq!(email.attachments.len(), 1, "{:?}", email.attachments);
+        assert_eq!(email.attachments[0].index, 0);
+        assert_eq!(email.attachments[0].filename, "IMG_0001.jpeg");
+        assert_eq!(email.attachments[0].content_type, "image/jpeg");
+        assert_eq!(email.attachments[0].size, 10, "decoded size, not encoded");
+    }
+
+    /// An image referenced from the HTML (`multipart/related`) stays an
+    /// attachment, and a real HTML part is reported as such.
+    #[test]
+    fn related_inline_image_is_listed_and_html_part_kept() {
+        let raw = "From: a@example.com\r\nSubject: Logo\r\nMIME-Version: 1.0\r\n\
+                   Content-Type: multipart/alternative; boundary=\"A\"\r\n\r\n\
+                   --A\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nHello\r\n\
+                   --A\r\nContent-Type: multipart/related; boundary=\"R\"\r\n\r\n\
+                   --R\r\nContent-Type: text/html; charset=utf-8\r\n\r\n\
+                   <p>Hello</p><img src=\"cid:logo@x\" alt=\"Logo\">\r\n\
+                   --R\r\nContent-Type: image/png\r\nContent-ID: <logo@x>\r\n\
+                   Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n\
+                   --R--\r\n--A--\r\n";
+        let email = parse_email(1, "INBOX", raw.as_bytes(), vec![]);
+        assert_eq!(email.body_text.trim_end(), "Hello");
+        assert!(
+            email
+                .body_html
+                .as_deref()
+                .is_some_and(|h| h.contains("<p>Hello</p>")),
+            "{:?}",
+            email.body_html
+        );
+        assert_eq!(email.attachments.len(), 1, "{:?}", email.attachments);
+        assert_eq!(email.attachments[0].content_type, "image/png");
+        assert_eq!(email.attachments[0].filename, "attachment");
+    }
+
+    /// Mailing lists append a plain-text footer next to the alternative
+    /// (`multipart/mixed[alternative[text, html], text/plain]`). An HTML
+    /// client shows that footer below the HTML, so it is no hidden text —
+    /// comparing every text part with the HTML parts alone flagged every
+    /// short list mail.
+    #[test]
+    fn mailing_list_footer_does_not_read_as_hidden_text() {
+        let short = "Quick status update from the platform team: deployment of \
+                     the reporting service finished this morning without incidents.";
+        let footer = "You received this message because you are subscribed to the \
+                      engineering announcements group. To unsubscribe from this group \
+                      and stop receiving emails from it, send an email to the list \
+                      administrator. Visit the group archive for previous discussions \
+                      and subscription settings.";
+        let raw = format!(
+            "From: a@example.com\r\nSubject: List\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+             --M\r\nContent-Type: multipart/alternative; boundary=\"A\"\r\n\r\n\
+             --A\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{short}\r\n\
+             --A\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>{short}</p>\r\n\
+             --A--\r\n\
+             --M\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{footer}\r\n\
+             --M--\r\n"
+        );
+        let email = parse_email(1, "INBOX", raw.as_bytes(), vec![]);
+        assert!(
+            email.body_text.contains("subscribed"),
+            "{}",
+            email.body_text
+        );
+        assert!(
+            !email.body_parts_diverge,
+            "a footer both views show is not hidden"
+        );
+
+        // Control: the same text inside the plain alternative only — no
+        // footer part an HTML client would show — is exactly the attack
+        // shape, and must still be flagged.
+        let hidden = format!(
+            "From: a@example.com\r\nSubject: List\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/alternative; boundary=\"A\"\r\n\r\n\
+             --A\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{short} {footer}\r\n\
+             --A\r\nContent-Type: text/html; charset=utf-8\r\n\r\n<p>{short}</p>\r\n\
+             --A--\r\n"
+        );
+        assert!(parse_email(1, "INBOX", hidden.as_bytes(), vec![]).body_parts_diverge);
     }
 
     #[test]

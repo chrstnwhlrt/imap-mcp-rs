@@ -148,23 +148,28 @@ impl std::error::Error for OAuth2Error {}
 
 /// Build an [`OAuth2Error`] from a non-2xx token-endpoint response.
 /// Extracts only the two RFC 6749 error fields; the description is cut
-/// before the provider's `Trace ID` noise, stripped of control characters
-/// and capped, so it is safe to log and to surface through `last_error`.
+/// before the provider's `Trace ID` noise. Both are stripped of control
+/// characters and capped, so they are safe to log, to print on the
+/// operator's terminal (`reauth`) and to surface through `last_error` —
+/// the code used to pass through as received.
 pub fn parse_error_body(http_status: u16, body: &str) -> OAuth2Error {
+    let printable = |s: &str, max: usize| {
+        s.chars()
+            .filter(|c| !c.is_control())
+            .take(max)
+            .collect::<String>()
+    };
     let parsed: ErrorBody = serde_json::from_str(body).unwrap_or(ErrorBody {
         error: None,
         error_description: None,
     });
     let description = parsed.error_description.map(|d| {
         let cut = d.split(" Trace ID").next().unwrap_or(&d);
-        cut.chars()
-            .filter(|c| !c.is_control())
-            .take(300)
-            .collect::<String>()
+        printable(cut, 300)
     });
     OAuth2Error {
         http_status,
-        code: parsed.error,
+        code: parsed.error.map(|code| printable(&code, 100)),
         description,
     }
 }
@@ -250,9 +255,7 @@ pub async fn refresh_access_token(
     let token_response: TokenResponse = serde_json::from_str(&response)
         .context("Failed to parse OAuth2 token response (body omitted from log)")?;
 
-    // Default to 30 minutes if the server omits `expires_in` — conservative
-    // compared to Gmail/Outlook's typical 3600s, prevents stale-token reuse.
-    let ttl = Duration::from_secs(token_response.expires_in.unwrap_or(1800));
+    let ttl = access_token_ttl(token_response.expires_in);
     // A provider echoing back the identical token is not a rotation — treat
     // as no-op so callers don't rewrite the state file on every refresh. An
     // empty value is not a token either: adopting one would leave the account
@@ -272,6 +275,20 @@ pub async fn refresh_access_token(
         },
         rotated_refresh_token,
     })
+}
+
+/// How long a fresh access token counts as valid: the provider's
+/// `expires_in`, or 30 minutes when it is missing — conservative next to
+/// Gmail's and Outlook's 3600 s, so a stale token is not reused.
+///
+/// Capped at a day. The value only schedules the next refresh, and it comes
+/// off the network: an absurd one such as `u64::MAX` would overflow the
+/// `Instant` addition that turns it into a deadline, and that addition
+/// panics.
+fn access_token_ttl(expires_in: Option<u64>) -> Duration {
+    const DEFAULT: Duration = Duration::from_mins(30);
+    const MAX: Duration = Duration::from_hours(24);
+    expires_in.map_or(DEFAULT, |secs| Duration::from_secs(secs).min(MAX))
 }
 
 /// Render the optional `client_secret` form field, ready to append to a token
@@ -324,9 +341,15 @@ pub async fn minimal_https_post(url: &str, body: &str) -> Result<(u16, String)> 
 
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    let tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+    // Provider pinned, not taken from the process default — see
+    // `ImapClient::establish_tls`.
+    let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .context("TLS setup failed")?
+    .with_root_certificates(root_store)
+    .with_no_client_auth();
     let connector = TlsConnector::from(Arc::new(tls_config));
     let domain = rustls::pki_types::ServerName::try_from(url_parsed.host.clone())?;
     let mut tls = connector.connect(domain, tcp).await?;
@@ -366,22 +389,88 @@ pub async fn minimal_https_post(url: &str, body: &str) -> Result<(u16, String)> 
             Err(e) => return Err(e.into()),
         }
     }
-    let response = String::from_utf8_lossy(&response_bytes).to_string();
+    let (status_code, body) = parse_http_response(&response_bytes)?;
+    Ok((status_code, String::from_utf8_lossy(&body).into_owned()))
+}
 
-    // Extract HTTP status line
-    let first_line = response.lines().next().unwrap_or("");
-    let status_code: u16 = first_line
-        .split_whitespace()
-        .nth(1)
-        .and_then(|s| s.parse().ok())
+/// Split a raw HTTP/1.1 response into its status code and body, decoding
+/// `Transfer-Encoding: chunked` and honouring `Content-Length`.
+///
+/// The body used to be taken verbatim after the header block. Google's token
+/// endpoint answers HTTP/1.1 requests chunked, so the chunk-size lines ended
+/// up inside the JSON: every Gmail refresh and code exchange failed to
+/// parse, and an `invalid_grant` was never recognized as one. Microsoft
+/// sends a `Content-Length`, which is why Outlook accounts never noticed.
+///
+/// Errors never quote response bytes: a success response whose framing is
+/// broken may carry the access token right where a chunk size was expected.
+fn parse_http_response(raw: &[u8]) -> Result<(u16, Vec<u8>)> {
+    let header_end = find_subslice(raw, b"\r\n\r\n")
+        .context("Invalid HTTP response: no header/body separator")?;
+    let head = String::from_utf8_lossy(&raw[..header_end]);
+    let mut lines = head.split("\r\n");
+    let status = lines
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse().ok())
         .unwrap_or(0);
+    let mut chunked = false;
+    let mut content_length = None;
+    for line in lines {
+        let Some((name, value)) = line.split_once(':') else {
+            continue;
+        };
+        let name = name.trim();
+        if name.eq_ignore_ascii_case("transfer-encoding") {
+            chunked = value
+                .split(',')
+                .any(|coding| coding.trim().eq_ignore_ascii_case("chunked"));
+        } else if name.eq_ignore_ascii_case("content-length") {
+            content_length = value.trim().parse::<usize>().ok();
+        }
+    }
 
-    // Extract body (after \r\n\r\n)
-    let body_start = response
-        .find("\r\n\r\n")
-        .context("Invalid HTTP response: no header/body separator")?
-        + 4;
-    Ok((status_code, response[body_start..].to_string()))
+    let body = &raw[header_end + 4..];
+    let body = if chunked {
+        decode_chunked(body)?
+    } else if let Some(len) = content_length {
+        // Anything past the declared length is not part of this response.
+        body[..len.min(body.len())].to_vec()
+    } else {
+        body.to_vec()
+    };
+    Ok((status, body))
+}
+
+/// Decode a `Transfer-Encoding: chunked` body (RFC 9112 §7.1). Chunk
+/// extensions and trailer fields carry nothing a token response needs and
+/// are skipped.
+fn decode_chunked(mut data: &[u8]) -> Result<Vec<u8>> {
+    let mut out = Vec::with_capacity(data.len());
+    loop {
+        let line_end =
+            find_subslice(data, b"\r\n").context("Invalid chunked body: missing chunk size")?;
+        let size = std::str::from_utf8(&data[..line_end])
+            .ok()
+            .and_then(|line| line.split(';').next())
+            .and_then(|hex| usize::from_str_radix(hex.trim(), 16).ok())
+            .context("Invalid chunked body: malformed chunk size")?;
+        data = &data[line_end + 2..];
+        if size == 0 {
+            return Ok(out);
+        }
+        let chunk = data
+            .get(..size)
+            .context("Invalid chunked body: truncated chunk")?;
+        out.extend_from_slice(chunk);
+        data = data[size..]
+            .strip_prefix(b"\r\n")
+            .context("Invalid chunked body: missing line break after chunk")?;
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 #[cfg(test)]
@@ -464,6 +553,17 @@ mod tests {
         assert!(!remedy.contains("secrets expire"), "{remedy}");
     }
 
+    /// `expires_in` comes off the network. An absurd value must not overflow
+    /// the `Instant` deadline, which panics — it is capped instead.
+    #[test]
+    fn access_token_ttl_defaults_and_caps() {
+        assert_eq!(access_token_ttl(Some(3600)), Duration::from_hours(1));
+        assert_eq!(access_token_ttl(None), Duration::from_mins(30));
+        let huge = access_token_ttl(Some(u64::MAX));
+        assert_eq!(huge, Duration::from_hours(24));
+        assert!(std::time::Instant::now().checked_add(huge).is_some());
+    }
+
     #[test]
     fn client_secret_param_is_omitted_entirely_when_absent() {
         assert_eq!(client_secret_param(None), "");
@@ -481,6 +581,70 @@ mod tests {
         assert!(!e.is_invalid_grant());
     }
 
+    /// Encode `parts` as a chunked body, one chunk each.
+    fn chunked(parts: &[&str]) -> String {
+        use std::fmt::Write as _;
+        let mut body = String::new();
+        for part in parts {
+            let _ = write!(body, "{:x}\r\n{part}\r\n", part.len());
+        }
+        body.push_str("0\r\n\r\n");
+        body
+    }
+
+    /// Google's token endpoint answers HTTP/1.1 chunked. Taking the raw body
+    /// put the chunk sizes into the JSON — every Gmail refresh failed to
+    /// parse and `invalid_grant` was never recognized.
+    #[test]
+    fn http_response_decodes_chunked_bodies() {
+        let json = r#"{"error":"invalid_grant","error_description":"Bad Request"}"#;
+        let raw = format!(
+            "HTTP/1.1 400 Bad Request\r\nContent-Type: application/json; charset=utf-8\r\n\
+             transfer-encoding: Chunked\r\n\r\n{}",
+            chunked(&[&json[..10], &json[10..]])
+        );
+        let (status, body) = parse_http_response(raw.as_bytes()).unwrap();
+        assert_eq!(status, 400);
+        assert_eq!(body, json.as_bytes());
+        let body = String::from_utf8(body).unwrap();
+        assert!(parse_error_body(status, &body).is_invalid_grant());
+
+        // Chunk extensions are legal and carry nothing we need.
+        let raw =
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n2;name=v\r\n{}\r\n0\r\n\r\n";
+        assert_eq!(parse_http_response(raw.as_bytes()).unwrap().1, b"{}");
+    }
+
+    #[test]
+    fn http_response_honours_content_length_and_eof() {
+        let raw = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n{}trailing junk";
+        let (status, body) = parse_http_response(raw.as_bytes()).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"{}");
+        // Neither header: the body runs to the end of the connection.
+        let raw = "HTTP/1.1 200 OK\r\nConnection: close\r\n\r\n{\"a\":1}";
+        assert_eq!(
+            parse_http_response(raw.as_bytes()).unwrap().1,
+            br#"{"a":1}"#
+        );
+        assert!(parse_http_response(b"HTTP/1.1 200 OK\r\nno separator").is_err());
+    }
+
+    /// Broken framing around a success body must fail without quoting it —
+    /// the access token sits right where a chunk size was expected.
+    #[test]
+    fn malformed_chunked_bodies_fail_without_echoing_the_body() {
+        for body in [
+            r#"{"access_token":"SECRET-TOKEN"}"#.to_string(),
+            "5\r\nSECRET-TOKEN-TOO-LONG".to_string(),
+            "zz\r\nSECRET-TOKEN\r\n0\r\n\r\n".to_string(),
+        ] {
+            let raw = format!("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{body}");
+            let err = format!("{:#}", parse_http_response(raw.as_bytes()).unwrap_err());
+            assert!(!err.contains("SECRET"), "{err}");
+        }
+    }
+
     #[test]
     fn error_description_strips_control_chars_and_caps() {
         let long = format!("{}\r\nX{}", "A".repeat(10), "B".repeat(500));
@@ -489,6 +653,16 @@ mod tests {
         let desc = e.description.unwrap();
         assert!(!desc.contains('\r') && !desc.contains('\n'));
         assert!(desc.chars().count() <= 300);
+
+        // The code reaches the same terminal and `last_error`: a terminal
+        // escape in it is stripped too, and a legitimate code is untouched.
+        let body = serde_json::json!({"error": "invalid\u{1b}]0;x\u{7}_grant"});
+        let code = parse_error_body(400, &body.to_string()).code.unwrap();
+        assert!(
+            !code.contains('\u{1b}') && !code.contains('\u{7}'),
+            "{code:?}"
+        );
+        assert!(parse_error_body(400, r#"{"error":"invalid_grant"}"#).is_invalid_grant());
     }
 }
 

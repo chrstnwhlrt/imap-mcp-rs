@@ -9,12 +9,16 @@
 //! These tests are `#[ignore]` by default so `cargo test` stays green in
 //! environments without `GreenMail` (CI, dev boxes). The `./test-server.sh`
 //! script spins up a `GreenMail` container on 127.0.0.1:3993 with user
-//! `test` / `password` and seeds INBOX with three emails (a Q2 Report
-//! thread + a standalone meeting invite).
+//! `test` / `password`, creates Drafts, Sent, Trash and `B&APw-cher` (Bücher,
+//! encoded on the wire) and seeds INBOX with four emails: the "Project Update
+//! Q2" thread (original + reply), a second "Project Update Q2" without
+//! threading headers (the subject-collision case) and a standalone meeting
+//! invite.
 //!
 //! Each test creates its own `ImapClient` so they can run in any order,
 //! but keep in mind they share the `GreenMail` mailbox — tests that mutate
-//! state must clean up after themselves.
+//! state must clean up after themselves, and they run one at a time (see
+//! [`serial`]).
 //!
 //! The test's point is coverage of the wire-protocol / MIME path that
 //! pure-Rust unit tests can't exercise.
@@ -47,6 +51,17 @@ fn greenmail_config() -> AccountConfig {
     }
 }
 
+/// One test at a time against the shared mailbox. `GreenMail` does not keep
+/// a per-session view of a folder the way RFC 3501 requires: a FETCH that
+/// races another session's EXPUNGE fails on the server ("No such message
+/// with uid …") and comes back short, so parallel tests failed at random.
+/// Every test holds this guard for its whole run, which keeps the suite
+/// serial however the harness schedules it.
+async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
+    static MAILBOX: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+    MAILBOX.lock().await
+}
+
 /// Skip helper: if the test server isn't reachable, produce a clear
 /// `#[ignore]`-appropriate message rather than a cryptic connect error.
 async fn client_or_skip() -> Option<ImapClient> {
@@ -63,6 +78,7 @@ async fn client_or_skip() -> Option<ImapClient> {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn connect_and_disconnect() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -72,6 +88,7 @@ async fn connect_and_disconnect() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn list_folders_contains_inbox_and_drafts() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -94,6 +111,7 @@ async fn list_folders_contains_inbox_and_drafts() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn list_emails_inbox_returns_seeded_messages() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -129,8 +147,9 @@ async fn list_emails_inbox_returns_seeded_messages() {
         "\\Recent leaked into flags: {:?}",
         emails.iter().map(|e| &e.flags).collect::<Vec<_>>()
     );
-    // Dates are UTC-normalized: every value ends in Z, none carries a
-    // sender offset.
+    // Dates are kept UTC-normalized for sorting (responses show them in the
+    // machine's local time): every value ends in Z, none carries a sender
+    // offset.
     assert!(
         emails
             .iter()
@@ -148,6 +167,7 @@ async fn list_emails_inbox_returns_seeded_messages() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn search_time_bounds_cut_on_internaldate_over_the_wire() {
+    let _serial = serial().await;
     // The sub-day part of since/before cuts on INTERNALDATE, resolved on a
     // lightweight (UID INTERNALDATE) round before counting and paging. The
     // seeds arrived when the container started, i.e. within the last hour
@@ -174,8 +194,9 @@ async fn search_time_bounds_cut_on_internaldate_over_the_wire() {
         .expect("search failed");
     assert!(rows.len() >= 4, "seeds arrived within the hour: {rows:?}");
     assert!(matched >= 4);
-    // Under a sub-day bound every row echoes the arrival time the cut ran
-    // on, UTC-shaped like `date` — the caller can verify the decision.
+    // Under a sub-day bound every row carries the arrival time the cut ran
+    // on, kept in UTC like `date` (responses show it in local time), so the
+    // caller can verify the decision.
     assert!(
         rows.iter()
             .all(|r| r.internal_date.as_deref().is_some_and(|d| d.ends_with('Z'))),
@@ -202,6 +223,7 @@ async fn search_time_bounds_cut_on_internaldate_over_the_wire() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn get_email_full_content_with_body_text() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -229,6 +251,7 @@ async fn get_email_full_content_with_body_text() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn search_emails_from_bob() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -289,6 +312,7 @@ async fn search_emails_from_bob() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn search_emails_applies_the_body_filter_to_full_bodies() {
+    let _serial = serial().await;
     // The client-side fallback path (Outlook 365 diverts non-ASCII terms
     // there) must filter on each message's FULL body over the wire — the
     // unit tests cover it only with synthetic strings. "room 4B" sits in the
@@ -343,6 +367,7 @@ async fn search_emails_applies_the_body_filter_to_full_bodies() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn get_thread_strict_follows_references_only() {
+    let _serial = serial().await;
     // `test-server.sh` seeds the Q2 thread as msg1 (alice, "Project Update Q2"
     // with Message-ID) + msg2 (bob, "Re: Project Update Q2" with In-Reply-To
     // + References → msg1), plus a *separate* msg4 (charlie) sharing the
@@ -402,6 +427,7 @@ async fn get_thread_strict_follows_references_only() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn get_thread_non_strict_merges_subject_collisions() {
+    let _serial = serial().await;
     // Opposite of the strict test: strict=false enables the subject-kernel
     // fallback, so charlie's mail (same subject, no References) DOES get
     // pulled in. This is the Lotus-Notes-friendly mode.
@@ -445,6 +471,7 @@ async fn get_thread_non_strict_merges_subject_collisions() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn get_thread_standalone_returns_single_message() {
+    let _serial = serial().await;
     // The Team Meeting mail has no References and a unique subject — even
     // strict=false's subject-fallback shouldn't find anyone to merge.
     let Some(mut client) = client_or_skip().await else {
@@ -477,6 +504,7 @@ async fn get_thread_standalone_returns_single_message() {
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn mark_flags_intersects_against_input() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -505,14 +533,10 @@ async fn mark_flags_intersects_against_input() {
     client.disconnect().await;
 }
 
-/// Draft replacement is the one new IMAP-interactive path, and IMAP has no
-/// update-in-place: `replaces_uid` appends the new version and only then
-/// expunges the old one. The ordering is the whole point — a test against a
-/// real server is the only way to show that the new draft survives and the
-/// old UID is really gone.
 #[tokio::test]
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn get_folder_names_lists_every_mailbox_and_serves_repeats_from_cache() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -538,6 +562,7 @@ async fn get_folder_names_lists_every_mailbox_and_serves_repeats_from_cache() {
 #[tokio::test]
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn move_emails_lands_the_message_in_the_target_and_clears_the_source() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -618,6 +643,7 @@ async fn move_emails_lands_the_message_in_the_target_and_clears_the_source() {
 #[tokio::test]
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn delete_emails_moves_to_trash_by_default_and_expunges_when_asked() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -698,6 +724,7 @@ async fn delete_emails_moves_to_trash_by_default_and_expunges_when_asked() {
 #[tokio::test]
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn fetch_raw_returns_the_verbatim_message_and_none_for_unknown_uids() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -734,6 +761,7 @@ async fn fetch_raw_returns_the_verbatim_message_and_none_for_unknown_uids() {
 #[tokio::test]
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn save_draft_reports_the_uid_it_landed_on() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -799,9 +827,14 @@ async fn save_draft_reports_the_uid_it_landed_on() {
     client.disconnect().await;
 }
 
+/// IMAP has no update-in-place: `replaces_uid` appends the new version and
+/// only then expunges the old one. The ordering is the whole point — a test
+/// against a real server is the only way to show that the new draft survives
+/// and the old UID is really gone.
 #[tokio::test]
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn draft_replacement_keeps_new_version_and_drops_the_old() {
+    let _serial = serial().await;
     let Some(mut client) = client_or_skip().await else {
         return;
     };
@@ -880,5 +913,266 @@ async fn draft_replacement_keeps_new_version_and_drops_the_old() {
     {
         let _ = client.delete_draft(&[new_uid]).await;
     }
+    client.disconnect().await;
+}
+
+/// A folder stays selected between calls, and the server reports mail
+/// arriving there only as an untagged EXISTS alongside a later command —
+/// which async-imap queues where nothing reads it. `list_emails` used to page
+/// by the count of its original SELECT and never showed what arrived after
+/// it, for as long as the folder stayed selected.
+///
+/// Only the listing is asserted, not `total`: other tests append to and
+/// expunge from the same Drafts folder while this one runs, so an exact
+/// before/after count would race them.
+#[tokio::test]
+#[ignore = "requires GreenMail via ./test-server.sh"]
+async fn list_emails_sees_mail_that_arrived_after_the_folder_was_selected() {
+    let _serial = serial().await;
+    let Some(mut reader) = client_or_skip().await else {
+        return;
+    };
+    let Some(mut writer) = client_or_skip().await else {
+        return;
+    };
+    let drafts = reader
+        .detect_drafts_folder()
+        .await
+        .expect("drafts detection failed")
+        .expect("no Drafts folder on the test server");
+
+    // Selects Drafts in the reader's session, which then stays selected.
+    reader
+        .list_emails(&drafts, 50, 0, false)
+        .await
+        .expect("first listing failed");
+
+    // Arrives through ANOTHER session while the reader keeps Drafts selected.
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let subject = format!("Arrival probe {tag}");
+    let uid = writer
+        .save_draft(
+            format!(
+                "From: test@localhost\r\nTo: bob@localhost\r\nMessage-ID: <{tag}@arrival>\r\n\
+                 Subject: {subject}\r\n\r\nbody\r\n"
+            )
+            .as_bytes(),
+        )
+        .await
+        .expect("saving the probe failed");
+
+    let (rows, _, _) = reader
+        .list_emails(&drafts, 50, 0, false)
+        .await
+        .expect("second listing failed");
+    assert!(
+        rows.iter().any(|e| e.subject == subject),
+        "mail that arrived after the SELECT is missing from the listing"
+    );
+
+    if let Some(uid) = uid {
+        let _ = writer.delete_draft(&[uid]).await;
+    }
+    reader.disconnect().await;
+    writer.disconnect().await;
+}
+
+/// The "full thread" must include sibling branches — replies to an ancestor
+/// rather than to the message `get_thread` was called on. Those reference
+/// neither that message nor anything it references except the root.
+#[tokio::test]
+#[ignore = "requires GreenMail via ./test-server.sh"]
+async fn get_thread_includes_sibling_branches() {
+    let _serial = serial().await;
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let drafts = client
+        .detect_drafts_folder()
+        .await
+        .expect("drafts detection failed")
+        .expect("no Drafts folder on the test server");
+
+    let tag = uuid::Uuid::new_v4().simple().to_string();
+    let root = format!("<root-{tag}@thread>");
+    let message = |id: &str, subject: &str, parent: Option<&str>| {
+        let threading = parent.map_or_else(String::new, |p| {
+            format!("In-Reply-To: {p}\r\nReferences: {p}\r\n")
+        });
+        format!(
+            "From: test@localhost\r\nTo: bob@localhost\r\nMessage-ID: {id}\r\n{threading}\
+             Subject: {subject}\r\n\r\nbody\r\n"
+        )
+        .into_bytes()
+    };
+    let mut uids = Vec::new();
+    for (id, subject, parent) in [
+        (root.clone(), format!("Branch root {tag}"), None),
+        (
+            format!("<a-{tag}@thread>"),
+            format!("Re: Branch A {tag}"),
+            Some(root.as_str()),
+        ),
+        (
+            format!("<b-{tag}@thread>"),
+            format!("Re: Branch B {tag}"),
+            Some(root.as_str()),
+        ),
+    ] {
+        let uid = client
+            .save_draft(&message(&id, &subject, parent))
+            .await
+            .expect("saving a thread message failed")
+            .expect("no UID for a message with a Message-ID");
+        uids.push(uid);
+    }
+
+    // Called on branch A: branch B is its sibling.
+    let thread = client
+        .get_thread(&drafts, uids[1], true)
+        .await
+        .expect("get_thread failed");
+    let subjects: Vec<&str> = thread.iter().map(|e| e.subject.as_str()).collect();
+    assert_eq!(
+        thread.len(),
+        3,
+        "root + both branches expected: {subjects:?}"
+    );
+    assert!(
+        subjects.iter().any(|s| s.contains("Branch B")),
+        "sibling branch missing: {subjects:?}"
+    );
+
+    let _ = client.delete_draft(&uids).await;
+    client.disconnect().await;
+}
+
+/// Moving a folder into itself only re-creates its messages under new UIDs,
+/// and a non-permanent delete from the Trash would leave them where they are
+/// while reporting them deleted — both are refused before anything runs.
+#[tokio::test]
+#[ignore = "requires GreenMail via ./test-server.sh"]
+async fn moves_that_cannot_move_anything_are_refused() {
+    let _serial = serial().await;
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let (rows, _, _) = client
+        .list_emails("INBOX", 1, 0, false)
+        .await
+        .expect("listing failed");
+    let uid = rows.first().expect("seeded INBOX is empty").uid;
+
+    let err = client
+        .move_emails("INBOX", &[uid], "INBOX")
+        .await
+        .expect_err("a move into the source folder must be refused");
+    assert!(err.to_string().contains("same"), "{err}");
+
+    let err = client
+        .delete_emails("Trash", &[uid], false)
+        .await
+        .expect_err("a soft delete from the Trash must be refused");
+    assert!(err.to_string().contains("permanent"), "{err}");
+
+    // Nothing moved: the message is still where it was, under its UID.
+    let (after, _, _) = client
+        .list_emails("INBOX", 1, 0, false)
+        .await
+        .expect("listing failed");
+    assert_eq!(after.first().map(|e| e.uid), Some(uid));
+    client.disconnect().await;
+}
+
+/// A folder that does not exist is refused with the names of those that do,
+/// for reading as for a move target, and the move refuses before anything
+/// is copied.
+#[tokio::test]
+#[ignore = "requires GreenMail via ./test-server.sh"]
+async fn missing_folders_are_refused_with_the_existing_names() {
+    let _serial = serial().await;
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let err = client
+        .list_emails("Papierkorb", 10, 0, false)
+        .await
+        .expect_err("a missing folder must be refused")
+        .to_string();
+    assert!(err.contains("\"Papierkorb\" does not exist"), "{err}");
+    assert!(
+        err.contains("Folders: INBOX, B&APw-cher (Bücher), Drafts"),
+        "{err}"
+    );
+
+    let (rows, _, _) = client
+        .list_emails("INBOX", 1, 0, false)
+        .await
+        .expect("listing failed");
+    let uid = rows.first().expect("seeded INBOX is empty").uid;
+    let err = client
+        .move_emails("INBOX", &[uid], "Archiv")
+        .await
+        .expect_err("a missing target must be refused")
+        .to_string();
+    assert!(err.contains("\"Archiv\" does not exist"), "{err}");
+    let (after, _, _) = client
+        .list_emails("INBOX", 1, 0, false)
+        .await
+        .expect("listing failed");
+    assert_eq!(
+        after.first().map(|e| e.uid),
+        Some(uid),
+        "nothing may have moved"
+    );
+    client.disconnect().await;
+}
+
+/// Folder names as models pass them resolve to the wire name: another case,
+/// the readable form of an encoded name, a role word. A name nothing fits
+/// passes through when it is ASCII (the server's refusal follows) and is
+/// refused with the folder list otherwise.
+#[tokio::test]
+#[ignore = "requires GreenMail via ./test-server.sh"]
+async fn folder_names_resolve_as_people_say_them() {
+    let _serial = serial().await;
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    for (requested, wire) in [
+        ("inbox", "INBOX"),
+        ("trash", "Trash"),
+        ("Bücher", "B&APw-cher"),
+        ("BÜCHER", "B&APw-cher"),
+        ("Papierkorb", "Trash"),
+        ("Entwürfe", "Drafts"),
+        ("Gesendete Elemente", "Sent"),
+    ] {
+        let resolved = client
+            .resolve_folder(requested)
+            .await
+            .unwrap_or_else(|e| panic!("{requested}: {e}"));
+        assert_eq!(resolved, wire, "{requested}");
+    }
+    let passed = client
+        .resolve_folder("NoSuchFolder")
+        .await
+        .expect("an ASCII name passes through");
+    assert_eq!(passed, "NoSuchFolder");
+    let err = client
+        .resolve_folder("Größe")
+        .await
+        .expect_err("a name outside ASCII that fits nothing is refused")
+        .to_string();
+    assert!(err.contains("\"Größe\" does not exist"), "{err}");
+    assert!(err.contains("Folders: INBOX"), "{err}");
+
+    // The resolved name selects: the encoded folder reads like any other.
+    let books = client.resolve_folder("Bücher").await.expect("resolved");
+    let (rows, total, _) = client
+        .list_emails(&books, 5, 0, false)
+        .await
+        .expect("listing the encoded folder failed");
+    assert!(rows.is_empty() && total == 0, "{rows:?}");
     client.disconnect().await;
 }

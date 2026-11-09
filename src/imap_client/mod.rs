@@ -1,15 +1,15 @@
 //! Async IMAP client wrapped around `async-imap`, plus pure helpers in
-//! [`util`].
+//! `util`.
 //!
 //! Per-account state lives in one [`ImapClient`] guarded by a Mutex (created
 //! by `main`). The client transparently reconnects on transport-level errors
 //! via the `retry_read!` macro, caches the currently-selected folder to
-//! skip redundant SELECTs, and enforces `allowed_folders` inside
-//! `ensure_selected` so an LLM can't bypass the whitelist by passing an
-//! unfiltered folder name.
+//! skip redundant SELECTs, and enforces `allowed_folders` on every SELECT
+//! (`select`, which `ensure_selected` goes through) so an LLM can't bypass
+//! the whitelist by passing an unfiltered folder name.
 //!
 //! Pure helpers (search-criteria escaping, ISO-date conversion, host detection)
-//! live in [`util`] and are unit-tested in isolation.
+//! live in `util` and are unit-tested in isolation.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -29,7 +29,7 @@ use crate::email::{self, EmailFull, EmailSummary};
 mod util;
 pub use util::{
     FORWARD_PREFIXES, REPLY_PREFIXES, build_or_criteria, clean_imap_error,
-    host_supports_unicode_search, imap_astring, is_retryable_error, iso_to_imap_date,
+    host_supports_unicode_search, imap_astring, is_retryable_error, iso_to_imap_date, same_folder,
     sanitize_log_str, starts_with_ignore_ascii_case,
 };
 use util::{clean_message_id, is_connection_error, strip_email_prefixes};
@@ -63,6 +63,10 @@ type ImapSession = Session<TlsStream<TcpStream>>;
 /// larger than realistic emails with max-size attachments.
 const MAX_EMAIL_BYTES: usize = 100 * 1024 * 1024;
 
+/// Upper bound for establishing a session (TCP, TLS, login), at startup and
+/// on every reconnect — see [`ImapClient::connect_bounded`].
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Hard cap on the number of folders we'll process in a single `LIST` response.
 /// A malicious server could return millions of folders to drive the subsequent
 /// per-folder STATUS loop into a `DoS`.
@@ -71,13 +75,13 @@ const MAX_FOLDER_COUNT: usize = 10_000;
 // TRUNCATED-BODY FETCH (deferred): an earlier iteration added
 // `BODY.PEEK[]<0.16384>` here to save 5–10× bandwidth on HTML-heavy
 // inboxes. It works against RFC-compliant servers, but `imap-proto`
-// 0.16.6 (our parser) requires a literal SP between the `<origin>`
-// marker and the `{size}` literal per RFC 3501 §7.4.2, and at least
-// `GreenMail` 2.1.2 emits them adjacent (`BODY[]<0>{416}`). That tripped
-// the FETCH-response parser end-to-end. Fixing it needs a fork of
-// imap-proto (and by extension async-imap) to accept the missing-SP
-// form leniently. Kept as the existing full-body fetch below until
-// upstream relaxes the parse or we swap to a different IMAP crate.
+// (our parser, still as of 0.17) requires the literal SP between the
+// `<origin>` marker and the `{size}` literal that RFC 3501 §7.4.2
+// prescribes, and `GreenMail` (still as of 2.1.15) emits them adjacent
+// (`BODY[]<0>{416}`). That tripped the FETCH-response parser end-to-end.
+// Fixing it needs a fork of imap-proto (and by extension async-imap) to
+// accept the missing-SP form leniently. Kept as the existing full-body
+// fetch below until one side changes or we swap to a different IMAP crate.
 // INTERNALDATE feeds the sub-day `since`/`before` cut: IMAP's own
 // SINCE/BEFORE are day-granular, so the exact bound is applied client-side
 // against the arrival timestamp (not the sender-controlled Date header).
@@ -85,7 +89,7 @@ const SUMMARY_FETCH_ITEMS: &str = "(BODY.PEEK[] FLAGS UID INTERNALDATE)";
 
 /// Client-side full-text criteria for servers whose SEARCH cannot take them
 /// (Outlook 365 silently returns zero matches for `CHARSET UTF-8`). Applied
-/// in [`summarize_fetches`] against the parsed message — subject, the
+/// in `summarize_fetches` against the parsed message — subject, the
 /// addressing headers and the full `body_text`, approximating RFC 3501's
 /// `TEXT` (which matches header OR body) — BEFORE the message is cut down
 /// to a 200-character snippet. Matching only the snippet (the original
@@ -279,7 +283,6 @@ pub struct ImapClient {
     // entries) linear is negligible.
     allowed_folders: Option<Vec<String>>,
     selected_folder: Option<String>,
-    selected_exists: u32,
     /// UIDVALIDITY captured on the last successful SELECT for
     /// `selected_folder`. If a re-SELECT returns a different value for the
     /// same folder, any UIDs the LLM obtained from a prior call are stale
@@ -298,7 +301,7 @@ pub struct ImapClient {
     /// provider rotates it. The config value itself is never mutated.
     active_refresh_token: Option<String>,
     /// Sanitized description of the last error that caused `mark_dead`
-    /// (or the last failed `connect()`). Surfaced via
+    /// (or the last connect that failed or timed out). Surfaced via
     /// [`ConnectionState::last_error`] for the `account_health` tool so
     /// operators can answer "why is this account offline?" without tailing
     /// stderr.
@@ -348,7 +351,6 @@ impl ImapClient {
             config,
             allowed_folders,
             selected_folder: None,
-            selected_exists: 0,
             last_uid_validity: None,
             cached_folder_names: None,
             cached_oauth_token: None,
@@ -514,6 +516,8 @@ impl ImapClient {
     /// covered too — that is the path an expired OAuth token fails on, and
     /// leaving it unrecorded was why "why is Office offline?" previously
     /// required reading stderr.
+    ///
+    /// Unbounded; the server goes through [`Self::connect_bounded`].
     pub async fn connect(&mut self) -> Result<()> {
         let result = self.connect_inner().await;
         match &result {
@@ -579,7 +583,7 @@ impl ImapClient {
                 let auth_string = format!("user={clean_user}\x01auth=Bearer {clean_token}\x01\x01");
                 tracing::debug!(auth_len = auth_string.len(), "Attempting XOAUTH2");
                 match client
-                    .authenticate("XOAUTH2", XOAuth2Authenticator(auth_string))
+                    .authenticate("XOAUTH2", XOAuth2Authenticator::new(auth_string))
                     .await
                 {
                     Ok(session) => session,
@@ -604,7 +608,6 @@ impl ImapClient {
 
         self.session = Some(session);
         self.selected_folder = None;
-        self.selected_exists = 0;
         self.cached_folder_names = None;
         Ok(())
     }
@@ -622,7 +625,6 @@ impl ImapClient {
             }
         }
         self.selected_folder = None;
-        self.selected_exists = 0;
         self.cached_folder_names = None;
     }
 
@@ -640,22 +642,33 @@ impl ImapClient {
     pub fn mark_dead(&mut self) {
         self.session = None;
         self.selected_folder = None;
-        self.selected_exists = 0;
         self.cached_folder_names = None;
     }
 
-    /// Ensure we have a live IMAP session, reconnecting if necessary. The
-    /// reconnect path is wrapped in a 15s timeout matching the initial
-    /// `main.rs` connect — without this, a hostile server stuck in a
-    /// never-ending XOAUTH2 continuation-challenge loop could hold this
-    /// account's mutex indefinitely (TCP keepalive only cuts in ~60s, and
-    /// the inner `XOAuth2Authenticator::process` re-sends the same token
-    /// on every challenge with no internal bound).
+    /// [`Self::connect`] within `CONNECT_TIMEOUT` (15 s) — the startup
+    /// connect and every reconnect. Without the bound, a hostile server that keeps
+    /// sending XOAUTH2 continuation challenges could hold this account's
+    /// mutex indefinitely (`XOAuth2Authenticator` answers each one, and TCP
+    /// keepalive never fires on a connection that keeps talking).
     ///
-    /// Reconnect failures are stashed in `last_error` so `account_health`
-    /// can surface them to the operator without tailing stderr — `connect`
-    /// records its own outcome; the timeout case is recorded here, since it
-    /// aborts `connect` before it can do so itself.
+    /// `connect` records its own outcome in `last_error`; a timeout aborts it
+    /// before it can, so that case is recorded here. At startup it used to
+    /// be logged only, leaving `account_health` with an offline account and
+    /// no reason.
+    pub async fn connect_bounded(&mut self) -> Result<()> {
+        let Ok(result) = tokio::time::timeout(CONNECT_TIMEOUT, self.connect()).await else {
+            let msg = format!(
+                "IMAP connect timed out after {}s",
+                CONNECT_TIMEOUT.as_secs()
+            );
+            self.last_error = Some(msg.clone());
+            return Err(anyhow::Error::msg(msg));
+        };
+        result
+    }
+
+    /// Ensure we have a live IMAP session, reconnecting if necessary (within
+    /// [`CONNECT_TIMEOUT`], see [`Self::connect_bounded`]).
     async fn ensure_connected(&mut self) -> Result<()> {
         if self.session.is_some() {
             return Ok(());
@@ -664,25 +677,35 @@ impl ImapClient {
             account = %self.config.name,
             "IMAP session lost, attempting reconnect..."
         );
-        let Ok(result) = tokio::time::timeout(Duration::from_secs(15), self.connect()).await else {
-            const TIMED_OUT: &str = "IMAP reconnect timed out";
-            self.last_error = Some(TIMED_OUT.to_string());
-            return Err(anyhow::anyhow!(TIMED_OUT));
-        };
-        result
+        self.connect_bounded().await
     }
 
-    /// Select a folder, skipping the IMAP command if already selected.
-    /// Returns the message count (exists) from the SELECT response, or the
-    /// cached value if we skipped the command. Enforces `allowed_folders`
-    /// — an explicit folder name bypassing this check was the main security
-    /// gap of the previous implementation.
-    async fn ensure_selected(&mut self, folder: &str) -> Result<u32> {
+    /// Select a folder, skipping the IMAP command if it is already selected.
+    /// Enough for everything that addresses messages by UID or searches —
+    /// those see the folder's current state either way. Counting by sequence
+    /// number needs [`Self::select`] instead.
+    async fn ensure_selected(&mut self, folder: &str) -> Result<()> {
         // Fast path: if this folder is already selected, it was vetted against
         // `allowed_folders` on the prior SELECT — skip the re-check entirely.
         if self.selected_folder.as_deref() == Some(folder) {
-            return Ok(self.selected_exists);
+            return Ok(());
         }
+        self.select(folder).await.map(|_exists| ())
+    }
+
+    /// Issue a SELECT — also when `folder` is already selected — and return
+    /// its current message count (EXISTS). Enforces `allowed_folders`: an
+    /// explicit folder name bypassing this check was the main security gap
+    /// of the previous implementation.
+    ///
+    /// The count must come from a SELECT of its own. A server reports mail
+    /// arriving in the selected folder only as an untagged EXISTS alongside
+    /// a later command, and async-imap queues those unsolicited responses
+    /// where nothing reads them; a count cached from an earlier SELECT
+    /// therefore stays at that value for as long as the folder remains
+    /// selected — and paging by sequence number with it hid every message
+    /// that arrived in the meantime.
+    async fn select(&mut self, folder: &str) -> Result<u32> {
         if !self.is_folder_allowed(folder) {
             anyhow::bail!("Folder \"{folder}\" is not in allowed_folders for this account");
         }
@@ -696,9 +719,13 @@ impl ImapClient {
                 // the next ensure_selected hit would skip a necessary re-SELECT
                 // and subsequent FETCH/SEARCH fail with "no mailbox selected".
                 self.selected_folder = None;
-                self.selected_exists = 0;
-                let err: anyhow::Error = e.into();
-                return Err(self.check_error(err));
+                let err = self.check_error(e.into());
+                if says_nonexistent(&err.to_string())
+                    && let Some(names) = self.folder_list_without(folder).await
+                {
+                    return Err(unknown_folder_error(folder, &names));
+                }
+                return Err(err);
             }
         };
         // Compare UIDVALIDITY against the previous SELECT of the same folder.
@@ -709,7 +736,7 @@ impl ImapClient {
         // mark_as_read/move/delete onto freshly-injected content.
         if let Some(new_uv) = mailbox.uid_validity
             && let Some((prev_folder, prev_uv)) = &self.last_uid_validity
-            && prev_folder.eq_ignore_ascii_case(folder)
+            && same_folder(prev_folder, folder)
             && *prev_uv != new_uv
         {
             tracing::warn!(
@@ -721,11 +748,50 @@ impl ImapClient {
             );
         }
         self.selected_folder = Some(folder.to_string());
-        self.selected_exists = mailbox.exists;
         if let Some(uv) = mailbox.uid_validity {
             self.last_uid_validity = Some((folder.to_string(), uv));
         }
         Ok(mailbox.exists)
+    }
+
+    /// The wire name of the folder a caller means, see
+    /// [`resolve_folder_name`]: the name itself, its readable form or a role
+    /// word. A miss in the cached folder list is checked against a fresh
+    /// LIST. When nothing fits, an ASCII name is passed on unchanged (the
+    /// server's refusal then turns into the error with the folder list), a
+    /// name with other characters is refused here: no wire name has them,
+    /// IMAP encodes those as modified UTF-7.
+    pub async fn resolve_folder(&mut self, requested: &str) -> Result<String> {
+        if requested.eq_ignore_ascii_case("INBOX") {
+            return Ok("INBOX".to_string());
+        }
+        let names = self.get_folder_names().await?;
+        if let Some(name) = resolve_folder_name(requested, &names) {
+            return Ok(name);
+        }
+        self.cached_folder_names = None;
+        let names = self.get_folder_names().await?;
+        if let Some(name) = resolve_folder_name(requested, &names) {
+            return Ok(name);
+        }
+        if !requested.is_ascii() {
+            return Err(unknown_folder_error(requested, &names));
+        }
+        Ok(requested.to_string())
+    }
+
+    /// The folder list when it does not contain `folder`; `None` when it does
+    /// or cannot be read. A miss in the cached list is checked against a
+    /// fresh LIST first: a folder created in another client since must not be
+    /// reported missing. Only `allowed_folders` appear, like everywhere else.
+    async fn folder_list_without(&mut self, folder: &str) -> Option<Vec<String>> {
+        let names = self.get_folder_names_once().await.ok()?;
+        if names.iter().any(|n| same_folder(n, folder)) {
+            return None;
+        }
+        self.cached_folder_names = None;
+        let names = self.get_folder_names_once().await.ok()?;
+        (!names.iter().any(|n| same_folder(n, folder))).then_some(names)
     }
 
     /// Check if an error is a connection error. If so, mark dead for reconnect.
@@ -869,7 +935,9 @@ impl ImapClient {
         offset: u32,
         unread_only: bool,
     ) -> Result<(Vec<EmailSummary>, u32, u32)> {
-        let total = self.ensure_selected(folder).await?;
+        // Always a fresh SELECT: the page window below is computed from this
+        // count — see `select` for why a cached one hid new mail.
+        let total = self.select(folder).await?;
         if total == 0 {
             return Ok((vec![], 0, 0));
         }
@@ -952,7 +1020,7 @@ impl ImapClient {
             .await?;
         let fetches: Vec<Fetch> = stream.try_collect().await?;
 
-        let Some(fetch) = fetches.first() else {
+        let Some(fetch) = requested_fetch(&fetches, uid) else {
             return Ok(None);
         };
 
@@ -971,7 +1039,7 @@ impl ImapClient {
             .await?;
         let fetches: Vec<Fetch> = stream.try_collect().await?;
 
-        let Some(fetch) = fetches.first() else {
+        let Some(fetch) = requested_fetch(&fetches, uid) else {
             return Ok(None);
         };
 
@@ -1125,6 +1193,7 @@ impl ImapClient {
         //    - "who references our Message-ID" (in References or In-Reply-To)
         //    - "messages we reference" (by their Message-ID)
         //    - "message we reply to" (In-Reply-To target)
+        //    - "who descends from the thread root" (sibling branches)
         let mut criteria_parts: Vec<String> = Vec::new();
 
         if let Some(msg_id) = &initial.message_id {
@@ -1141,6 +1210,18 @@ impl ImapClient {
         if let Some(reply_to) = &initial.in_reply_to {
             let clean = clean_message_id(reply_to);
             criteria_parts.push(format!("HEADER Message-ID \"{clean}\""));
+        }
+
+        // Everything that descends from the thread's root. The links above
+        // reach only the initial message's own ancestors and its replies; a
+        // sibling branch (another reply to an ancestor) references neither,
+        // so "the full thread" silently lacked it. The root is the first
+        // References entry — mailers keep it when they trim a long chain —
+        // else the In-Reply-To target.
+        if let Some(root) = initial.references.first().or(initial.in_reply_to.as_ref()) {
+            let clean = clean_message_id(root);
+            criteria_parts.push(format!("HEADER References \"{clean}\""));
+            criteria_parts.push(format!("HEADER In-Reply-To \"{clean}\""));
         }
 
         if let Some(combined) = build_or_criteria(&criteria_parts) {
@@ -1333,7 +1414,20 @@ impl ImapClient {
         if !self.is_folder_allowed(target) {
             anyhow::bail!("Target folder \"{target}\" is not in allowed_folders for this account");
         }
+        // A folder moved into itself is COPY-then-expunge of its own
+        // messages: nothing moves, yet every UID the caller holds goes stale
+        // and the reply would report the messages as moved.
+        if same_folder(folder, target) {
+            anyhow::bail!(
+                "Source and target folder are the same (\"{folder}\") — there is nothing to move"
+            );
+        }
         self.ensure_selected(folder).await?;
+        // Checked before anything moves; the server's own refusal of the
+        // COPY would only say "doesn't exist", without the names to pick from.
+        if let Some(names) = self.folder_list_without(target).await {
+            return Err(unknown_folder_error(target, &names));
+        }
         // Confirmation source for the response — see `existing_uids` for why
         // this is a SEARCH up front rather than the STORE acknowledgements.
         let existing = self.existing_uids(uids).await?;
@@ -1374,10 +1468,9 @@ impl ImapClient {
                  \\Deleted; retry would duplicate in target. Investigate server state",
             ));
         }
-        // EXPUNGE changed the folder's message count — invalidate the cache
-        // so the next `list_emails` doesn't return a stale `total`.
+        // EXPUNGE renumbered the folder — forget the selection so the next
+        // operation starts from a fresh SELECT.
         self.selected_folder = None;
-        self.selected_exists = 0;
         Ok(existing)
     }
 
@@ -1429,7 +1522,6 @@ impl ImapClient {
         }
         self.scoped_expunge(&uid_set).await?;
         self.selected_folder = None;
-        self.selected_exists = 0;
         Ok(existing)
     }
 
@@ -1527,12 +1619,28 @@ impl ImapClient {
             self.ensure_selected(folder).await?;
             self.expunge_uids_in_selected(uids).await
         } else {
-            let trash = self
-                .find_folder_by_role(TRASH_FOLDER_NAMES)
-                .await
-                .ok()
-                .flatten()
-                .unwrap_or_else(|| "Trash".to_string());
+            // No guessed name: a fallback "Trash" that does not exist only
+            // ended in the server's "doesn't exist", which told the caller
+            // neither why nor what to do instead.
+            let Some(trash) = self.find_folder_by_role(TRASH_FOLDER_NAMES).await? else {
+                // Ask, not `permanent: true` outright: a small model reads a
+                // suggestion in an error as the next call, and a deletion for
+                // good is not one to take on its own.
+                anyhow::bail!(
+                    "This account has no trash folder under a known name (Trash, Deleted Items, \
+                     Papierkorb, Gelöschte Elemente, …), so nothing was deleted. Ask the user \
+                     whether to delete for good (`permanent: true`) or to move the emails with \
+                     move_email to a folder from list_folders"
+                );
+            };
+            // Deleting from the Trash itself: a move would leave the messages
+            // where they are (under new UIDs) while reporting them deleted.
+            if same_folder(folder, &trash) {
+                anyhow::bail!(
+                    "\"{folder}\" is the Trash folder — moving its messages to Trash changes \
+                     nothing. Pass `permanent: true` to delete them for good"
+                );
+            }
             self.move_emails(folder, uids, &trash).await
         }
     }
@@ -1543,11 +1651,11 @@ impl ImapClient {
     /// even when mailbox-wide delete is disabled. Still honours
     /// `allowed_folders`.
     ///
-    /// Uses UID EXPUNGE (RFC 4315 UIDPLUS) when the server advertises it,
-    /// so only the requested UIDs are removed — any other `\Deleted`-flagged
-    /// messages in the folder are left alone. Falls back to plain EXPUNGE on
-    /// servers without UIDPLUS only when `allow_unsafe_expunge` is enabled
-    /// (rare: Gmail, Outlook 365, Dovecot, Cyrus all have UIDPLUS).
+    /// Uses UID EXPUNGE (RFC 4315 UIDPLUS), so only the requested UIDs are
+    /// removed — any other `\Deleted`-flagged messages in the folder are left
+    /// alone. A server that rejects it gets plain EXPUNGE only when
+    /// `allow_unsafe_expunge` is enabled (see `scoped_expunge`; rare: Gmail,
+    /// Outlook 365, Dovecot, Cyrus all have UIDPLUS).
     pub async fn delete_draft(&mut self, uids: &[u32]) -> Result<Vec<u32>> {
         if uids.is_empty() {
             return Ok(vec![]);
@@ -1601,7 +1709,6 @@ impl ImapClient {
             .await?;
         // APPEND doesn't change selection, but be safe
         self.selected_folder = None;
-        self.selected_exists = 0;
 
         Ok(self.locate_appended_draft(&drafts, message_bytes).await)
     }
@@ -1656,22 +1763,38 @@ impl ImapClient {
             .await
             .with_context(|| format!("Failed to connect to {addr}"))?;
 
-        // TCP keepalive: detect dead connections within ~30s instead of ~2h default
+        // TCP keepalive: first probe after 30 s idle, then every 10 s, and
+        // three unanswered probes drop the connection — a dead peer is
+        // noticed within ~60 s instead of the OS default of two hours before
+        // probing even starts. The probe count matters as much as the
+        // timing: Linux defaults to nine, which stretched detection to two
+        // minutes.
         let sock_ref = socket2::SockRef::from(&tcp_stream);
         let keepalive = socket2::TcpKeepalive::new()
             .with_time(Duration::from_secs(30))
             .with_interval(Duration::from_secs(10));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let keepalive = keepalive.with_retries(3);
         sock_ref.set_tcp_keepalive(&keepalive)?;
 
+        // The crypto provider is pinned here rather than left to the process
+        // default: `ClientConfig::builder()` resolves that from the enabled
+        // crate features and panics at runtime the day a second provider
+        // (`ring`) enters the dependency tree.
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .context("TLS setup failed")?;
         let tls_config = if self.config.accept_invalid_certs {
-            rustls::ClientConfig::builder()
+            builder
                 .dangerous()
                 .with_custom_certificate_verifier(Arc::new(NoVerifier))
                 .with_no_client_auth()
         } else {
             let mut root_store = rustls::RootCertStore::empty();
             root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            rustls::ClientConfig::builder()
+            builder
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
@@ -1744,13 +1867,152 @@ pub struct FolderInfo {
     /// The name as a human reads it, when `name` is modified-UTF-7 encoded
     /// (`Entw&APw-rfe` → `Entwürfe`). Absent for plain-ASCII names.
     ///
-    /// Display only — every other tool takes `name`, which is what the server
-    /// accepts. Set only when the decoded form passes the same control/bidi
+    /// For showing — `name` is what the server accepts; the tools take this
+    /// form as well (see [`resolve_folder_name`], which only counts it when
+    /// it is set). Set only when the decoded form passes the same control/bidi
     /// check as the raw name: the encoding hides non-ASCII from that filter,
     /// so a crafted folder could otherwise smuggle a right-to-left override
     /// into the listing and render as a different folder entirely.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub display_name: Option<String>,
+}
+
+/// Words that name a folder by its role, as people and models say them, and
+/// the role they stand for (the tags `detect_folder_role` gives).
+const ROLE_WORDS: &[(&str, &str)] = &[
+    ("inbox", "inbox"),
+    ("posteingang", "inbox"),
+    ("eingang", "inbox"),
+    ("drafts", "drafts"),
+    ("draft", "drafts"),
+    ("entwurf", "drafts"),
+    ("entwürfe", "drafts"),
+    ("entwuerfe", "drafts"),
+    ("sent", "sent"),
+    ("gesendet", "sent"),
+    ("gesendete", "sent"),
+    ("sent items", "sent"),
+    ("sent mail", "sent"),
+    ("gesendete elemente", "sent"),
+    ("gesendete objekte", "sent"),
+    ("trash", "trash"),
+    ("papierkorb", "trash"),
+    ("gelöscht", "trash"),
+    ("gelöschte", "trash"),
+    ("gelöschte elemente", "trash"),
+    ("gelöschte objekte", "trash"),
+    ("geloescht", "trash"),
+    ("geloeschte", "trash"),
+    ("geloeschte elemente", "trash"),
+    ("deleted", "trash"),
+    ("deleted items", "trash"),
+    ("bin", "trash"),
+    ("müll", "trash"),
+    ("mülleimer", "trash"),
+];
+
+/// The folder of `names` that `requested` means, or `None`. Tried in order,
+/// the first fit wins:
+/// 1. the wire name itself (`INBOX` in any case);
+/// 2. a folder's readable name (`Entwürfe` for `Entw&APw-rfe`);
+/// 3. the wire or readable name in any case, when exactly one folder fits
+///    (`rechnungen` for `Rechnungen`); with several it stops there, unresolved;
+/// 4. a role word in any case (`Papierkorb`, `trash`, `Entwurf`,
+///    `Posteingang` and the like, see `ROLE_WORDS`), resolved to the folder
+///    with that role.
+///
+/// Models pass what they show the user or what the user said: the readable
+/// name, which the server cannot select (Dovecot refuses it as "not valid
+/// mUTF-7"), or the role, which is not a name at all.
+pub fn resolve_folder_name(requested: &str, names: &[String]) -> Option<String> {
+    if let Some(name) = names.iter().find(|n| same_folder(n, requested)) {
+        return Some(name.clone());
+    }
+    // Only a readable name that list_folders shows counts (see
+    // `safe_display_name`): one with control or bidi characters names no
+    // folder a model could have been shown.
+    if let Some(name) = names
+        .iter()
+        .find(|n| safe_display_name(n).as_deref() == Some(requested))
+    {
+        return Some(name.clone());
+    }
+    let wanted = requested.trim().to_lowercase();
+    let mut any_case = names.iter().filter(|n| {
+        n.to_lowercase() == wanted
+            || safe_display_name(n).is_some_and(|shown| shown.to_lowercase() == wanted)
+    });
+    match (any_case.next(), any_case.next()) {
+        (Some(name), None) => return Some(name.clone()),
+        (Some(_), Some(_)) => return None,
+        _ => {}
+    }
+    let role = ROLE_WORDS
+        .iter()
+        .find(|(word, _)| *word == wanted)
+        .map(|(_, role)| *role)?;
+    if role == "inbox" {
+        return names
+            .iter()
+            .find(|n| n.eq_ignore_ascii_case("INBOX"))
+            .cloned();
+    }
+    names
+        .iter()
+        .find(|n| detect_folder_role(n) == Some(role))
+        .cloned()
+}
+
+/// Whether a server's refusal says the mailbox is not there, in the wordings
+/// of the servers around: RFC 5530's `[NONEXISTENT]`, Dovecot and Outlook
+/// ("doesn't exist", "does not exist"), `GreenMail` ("No such mailbox"), Gmail
+/// ("Unknown Mailbox"). Anything else, a busy mailbox included, keeps the
+/// server's own words.
+fn says_nonexistent(message: &str) -> bool {
+    let lower = message.to_lowercase();
+    [
+        "[nonexistent]",
+        "[trycreate]",
+        "doesn't exist",
+        "does not exist",
+        "no such mailbox",
+        "unknown mailbox",
+        "folder not found",
+        "mailbox not found",
+    ]
+    .iter()
+    .any(|phrase| lower.contains(phrase))
+}
+
+/// The error for a folder the account does not have, naming the ones it has
+/// so the next call can take one instead of guessing again: INBOX first,
+/// then alphabetically, the readable name in parentheses where the wire
+/// name is encoded, at most 20 of them.
+fn unknown_folder_error(folder: &str, names: &[String]) -> anyhow::Error {
+    const SHOWN: usize = 20;
+    let mut ordered: Vec<&String> = names.iter().collect();
+    ordered.sort_by_key(|name| (!name.eq_ignore_ascii_case("INBOX"), name.to_lowercase()));
+    let shown: Vec<String> = ordered
+        .iter()
+        .take(SHOWN)
+        .map(|name| {
+            safe_display_name(name)
+                .map_or_else(|| (*name).clone(), |shown| format!("{name} ({shown})"))
+        })
+        .collect();
+    let more = ordered.len().saturating_sub(SHOWN);
+    let rest = if more > 0 {
+        format!(" … and {more} more, see list_folders")
+    } else {
+        String::new()
+    };
+    // The last sentence names the next call: "use delete_email" alone made a
+    // model tell the user which folder to use instead of making the call.
+    anyhow::anyhow!(
+        "Folder \"{folder}\" does not exist. Folders: {}{rest}. To move emails to the trash, call \
+         delete_email with the same folder and uids; it puts them there.",
+        shown.join(", ")
+    )
 }
 
 /// The readable form of a folder name, when it is safe to show.
@@ -1771,7 +2033,9 @@ fn safe_display_name(name: &str) -> Option<String> {
 
 /// Classify a folder name against the well-known role lists. Returns a
 /// stable role tag the LLM can match against ("drafts" | "sent" | "trash").
-fn detect_folder_role(name: &str) -> Option<&'static str> {
+/// Pure name matching — usable where no IMAP round trip may happen, such as
+/// a `dry_run` preview.
+pub fn detect_folder_role(name: &str) -> Option<&'static str> {
     if DRAFTS_FOLDER_NAMES
         .iter()
         .any(|n| name.eq_ignore_ascii_case(n))
@@ -1845,17 +2109,48 @@ impl rustls::client::danger::ServerCertVerifier for NoVerifier {
     }
 }
 
-struct XOAuth2Authenticator(String);
+/// SASL `XOAUTH2`. The first challenge (empty) is answered with the
+/// credentials. A later one is the server's error report — base64 JSON
+/// naming the failure — which the mechanism answers with an empty response,
+/// so the server can conclude with the tagged `NO` that carries its reason.
+/// Replaying the credentials there (the previous behaviour) is a protocol
+/// violation, leaving the outcome of a failed login to however the server
+/// treats one.
+struct XOAuth2Authenticator {
+    auth: String,
+    sent: bool,
+}
+
+impl XOAuth2Authenticator {
+    const fn new(auth: String) -> Self {
+        Self { auth, sent: false }
+    }
+}
 
 impl async_imap::Authenticator for XOAuth2Authenticator {
     type Response = String;
 
     fn process(&mut self, _challenge: &[u8]) -> Self::Response {
-        self.0.clone()
+        if std::mem::replace(&mut self.sent, true) {
+            String::new()
+        } else {
+            self.auth.clone()
+        }
     }
 }
 
 // ========== Utility functions ==========
+
+/// The response for `uid` among a single-message UID FETCH's responses.
+///
+/// The stream also carries unsolicited FETCH responses, such as a flag
+/// update for another message a parallel client just changed. Taking the
+/// first one made `get_email` fail with "no body" whenever such an update
+/// came in ahead of the answer. RFC 3501 has a UID FETCH response carry the
+/// UID, so the right one is unambiguous.
+fn requested_fetch(fetches: &[Fetch], uid: u32) -> Option<&Fetch> {
+    fetches.iter().find(|f| f.uid == Some(uid))
+}
 
 /// Map IMAP flags to strings, dropping `\Recent`: it is session-scoped
 /// server bookkeeping (whether THIS connection is the first to see the
@@ -1863,20 +2158,22 @@ impl async_imap::Authenticator for XOAuth2Authenticator {
 /// it — and it reads like "new for me", which it is not. Surfacing it
 /// invited exactly that misread.
 fn parse_flags(fetch: &Fetch) -> Vec<String> {
-    fetch
-        .flags()
-        .filter(|f| !matches!(f, async_imap::types::Flag::Recent))
-        .map(|f| match f {
-            async_imap::types::Flag::Seen => "\\Seen".to_string(),
-            async_imap::types::Flag::Answered => "\\Answered".to_string(),
-            async_imap::types::Flag::Flagged => "\\Flagged".to_string(),
-            async_imap::types::Flag::Deleted => "\\Deleted".to_string(),
-            async_imap::types::Flag::Draft => "\\Draft".to_string(),
-            async_imap::types::Flag::Recent => "\\Recent".to_string(),
-            async_imap::types::Flag::MayCreate => "\\MayCreate".to_string(),
-            async_imap::types::Flag::Custom(c) => c.to_string(),
-        })
-        .collect()
+    fetch.flags().filter_map(|flag| flag_name(&flag)).collect()
+}
+
+/// The wire spelling of one flag, `None` for `\Recent` (see [`parse_flags`]).
+fn flag_name(flag: &async_imap::types::Flag<'_>) -> Option<String> {
+    use async_imap::types::Flag;
+    Some(match flag {
+        Flag::Seen => "\\Seen".to_string(),
+        Flag::Answered => "\\Answered".to_string(),
+        Flag::Flagged => "\\Flagged".to_string(),
+        Flag::Deleted => "\\Deleted".to_string(),
+        Flag::Draft => "\\Draft".to_string(),
+        Flag::Recent => return None,
+        Flag::MayCreate => "\\MayCreate".to_string(),
+        Flag::Custom(c) => c.to_string(),
+    })
 }
 
 /// Build an IMAP UID set string like `"1,3,5:10,42"`. Sorts a local copy
@@ -1965,6 +2262,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// A folder whose raw name is pure ASCII sails past the control/bidi
     /// filter, while its decoded form carries a right-to-left override — the
@@ -2002,7 +2300,131 @@ mod tests {
         assert_eq!(safe_display_name("INBOX"), None);
         assert_eq!(safe_display_name("Clients/Acme"), None);
     }
-    use super::*;
+
+    /// The refusal for a missing folder lists the folders there are, so the
+    /// caller can pick one: INBOX first, encoded names readable in
+    /// parentheses, long lists cut with a pointer to `list_folders`.
+    #[test]
+    fn unknown_folder_error_names_the_folders_there_are() {
+        let names: Vec<String> = ["Rechnungen", "Entw&APw-rfe", "INBOX", "Gesendete Elemente"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let err = unknown_folder_error("Trash", &names).to_string();
+        assert_eq!(
+            err,
+            "Folder \"Trash\" does not exist. Folders: INBOX, Entw&APw-rfe (Entwürfe), \
+             Gesendete Elemente, Rechnungen. To move emails to the trash, call delete_email with \
+             the same folder and uids; it puts them there."
+        );
+        let many: Vec<String> = (0..25).map(|i| format!("Ordner {i:02}")).collect();
+        let err = unknown_folder_error("X", &many).to_string();
+        assert!(
+            err.contains("Ordner 19 … and 5 more, see list_folders."),
+            "{err}"
+        );
+        assert!(!err.contains("Ordner 20"), "{err}");
+    }
+
+    /// Models pass the readable name or the role instead of the wire name;
+    /// each resolves to the folder meant, the wire name first.
+    #[test]
+    fn resolve_folder_name_takes_wire_readable_and_role_names() {
+        let names: Vec<String> = [
+            "INBOX",
+            "Entw&APw-rfe",
+            "Gesendete Elemente",
+            "Gel&APY-schte Elemente",
+            "Rechnungen",
+        ]
+        .iter()
+        .map(|s| (*s).to_string())
+        .collect();
+        let resolve = |requested: &str| resolve_folder_name(requested, &names);
+        assert_eq!(resolve("Rechnungen").as_deref(), Some("Rechnungen"));
+        assert_eq!(resolve("rechnungen").as_deref(), Some("Rechnungen"));
+        assert_eq!(resolve("inbox").as_deref(), Some("INBOX"));
+        assert_eq!(resolve("Posteingang").as_deref(), Some("INBOX"));
+        assert_eq!(resolve("Entwürfe").as_deref(), Some("Entw&APw-rfe"));
+        assert_eq!(resolve("DRAFT").as_deref(), Some("Entw&APw-rfe"));
+        assert_eq!(
+            resolve("gelöschte elemente").as_deref(),
+            Some("Gel&APY-schte Elemente")
+        );
+        assert_eq!(
+            resolve("Papierkorb").as_deref(),
+            Some("Gel&APY-schte Elemente")
+        );
+        assert_eq!(resolve("Trash").as_deref(), Some("Gel&APY-schte Elemente"));
+        assert_eq!(resolve("Gesendet").as_deref(), Some("Gesendete Elemente"));
+        assert_eq!(resolve("Archiv"), None);
+        // A real folder of that name wins over the role word.
+        let with_trash: Vec<String> = ["INBOX", "Trash", "Gel&APY-schte Elemente"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            resolve_folder_name("Trash", &with_trash).as_deref(),
+            Some("Trash")
+        );
+        // Two folders differing only in case: no guess, not even through
+        // the role word the name also is.
+        let twins: Vec<String> = ["Projekt", "PROJEKT", "Trash", "TRASH"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(resolve_folder_name("projekt", &twins), None);
+        assert_eq!(resolve_folder_name("trash", &twins), None);
+        assert_eq!(
+            resolve_folder_name("PROJEKT", &twins).as_deref(),
+            Some("PROJEKT")
+        );
+        // The readable name in its own case beats a case-insensitive fit.
+        let readable_twins: Vec<String> = ["Gel&APY-scht", "gel&APY-scht"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        assert_eq!(
+            resolve_folder_name("gelöscht", &readable_twins).as_deref(),
+            Some("gel&APY-scht")
+        );
+        assert_eq!(resolve_folder_name("GELÖSCHT", &readable_twins), None);
+        // What people type: blanks around the name, umlauts spelled out,
+        // the full localized name of a folder that has another name here.
+        let plain: Vec<String> = ["INBOX", "Drafts", "Sent", "Trash"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let resolve = |requested: &str| resolve_folder_name(requested, &plain);
+        assert_eq!(resolve(" Sent ").as_deref(), Some("Sent"));
+        assert_eq!(resolve("Entwuerfe").as_deref(), Some("Drafts"));
+        assert_eq!(resolve("geloescht").as_deref(), Some("Trash"));
+        assert_eq!(resolve("Geloeschte Elemente").as_deref(), Some("Trash"));
+        assert_eq!(resolve("Gelöschte Objekte").as_deref(), Some("Trash"));
+        assert_eq!(resolve("Gelöschte Elemente").as_deref(), Some("Trash"));
+        assert_eq!(resolve("Gesendete Objekte").as_deref(), Some("Sent"));
+        assert_eq!(resolve("Müll").as_deref(), Some("Trash"));
+        assert_eq!(resolve("Eingang").as_deref(), Some("INBOX"));
+    }
+
+    #[test]
+    fn says_nonexistent_knows_the_server_wordings() {
+        for message in [
+            "no response: code: None, info: Some(\"[NONEXISTENT] Unknown Mailbox: X (Failure)\")",
+            "Mailbox doesn't exist: Papierkorb",
+            "SELECT failed. No such mailbox",
+            "Mailbox does not exist, or must be subscribed to.",
+        ] {
+            assert!(says_nonexistent(message), "{message}");
+        }
+        for message in [
+            "[INUSE] Mailbox is in use",
+            "connection lost",
+            "Permission denied",
+        ] {
+            assert!(!says_nonexistent(message), "{message}");
+        }
+    }
 
     #[test]
     fn uid_set_string_empty_returns_empty() {
@@ -2080,11 +2502,31 @@ mod tests {
         assert_eq!(detect_folder_role("MyCustomFolder"), None);
     }
 
+    /// `\Recent` is session-scoped bookkeeping that reads like "new for
+    /// me"; it must never reach a caller. Everything else keeps its wire
+    /// spelling, keywords included.
     #[test]
-    fn parse_flags_known_standard_flags() {
-        // Build a test Fetch isn't worth the effort; parse_flags is
-        // exercised transitively by all read ops in integration. Skip
-        // direct unit test — the function is a pure 1-to-1 mapping.
+    fn flag_names_drop_recent_and_keep_keywords() {
+        use async_imap::types::Flag;
+        assert_eq!(flag_name(&Flag::Seen).as_deref(), Some("\\Seen"));
+        assert_eq!(flag_name(&Flag::Flagged).as_deref(), Some("\\Flagged"));
+        assert_eq!(flag_name(&Flag::Draft).as_deref(), Some("\\Draft"));
+        assert_eq!(flag_name(&Flag::Recent), None);
+        assert_eq!(
+            flag_name(&Flag::Custom("$Forwarded".into())).as_deref(),
+            Some("$Forwarded")
+        );
+    }
+
+    #[test]
+    fn xoauth2_answers_the_error_challenge_with_an_empty_response() {
+        use async_imap::Authenticator as _;
+        let mut auth = XOAuth2Authenticator::new("user=a\x01auth=Bearer t\x01\x01".into());
+        // The initial (empty) challenge gets the credentials …
+        assert_eq!(auth.process(b""), "user=a\x01auth=Bearer t\x01\x01");
+        // … every later one is an error report and gets an empty response.
+        assert_eq!(auth.process(br#"{"status":"401","schemes":"bearer"}"#), "");
+        assert_eq!(auth.process(b"again"), "");
     }
 
     /// Minimal message for the filter tests.

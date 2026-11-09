@@ -7,12 +7,27 @@
 # Filesystem directories from which attachment files may be read when composing
 # drafts. Default is `$XDG_RUNTIME_DIR/imap-mcp-rs` (systemd Linux) with
 # fallbacks to `$XDG_CACHE_HOME/imap-mcp-rs` and `/tmp/imap-mcp-rs-$USER`.
-# `download_attachment` saves into a per-download UUID subdir inside this path.
 # Paths outside these dirs are rejected — this prevents a prompt-injected LLM
 # from attaching arbitrary local files like SSH keys. Symlinks are resolved,
 # so links that escape the whitelist are also rejected.
-# Empty list `[]` is rejected — omit the field to get the default.
+# The FIRST entry is where `download_attachment` saves, one UUID subdirectory
+# per download. It has to be a directory of your own. The server sets it to
+# mode 0700 and refuses a symlink or a directory owned by someone else. At
+# startup it removes download subdirectories older than seven days and leaves
+# everything else alone. Further entries are only read from.
+# Empty list `[]` is rejected — omit the field to get the default. Write
+# absolute paths. `~` is not expanded (an entry starting with it is refused),
+# and a relative path depends on the directory the MCP client starts the
+# server in.
 # allowed_attachment_dirs = ["/custom/path", "/home/user/Documents"]
+
+# Tool surface. "full" (the default) offers every parameter, for assistants
+# such as Claude. "voice" is for a small model behind a voice assistant:
+# shorter descriptions and instructions written for such a model, fewer
+# parameters (no dry_run previews), and a search for words that finds
+# nothing lists the newest INBOX emails. Hidden parameters still work when a
+# call sends them.
+# tool_set = "full"
 
 [[accounts]]
 name = "Personal"
@@ -23,6 +38,8 @@ username = "user@gmail.com"
 # display_name = "John Doe"         # Name shown in From header (e.g. "John Doe <user@gmail.com>")
 # locale = "en"                      # "en" or "de" — controls draft labels, date format, font, prefixes
 # signature_html = '<div style="color:#888;margin-top:12px;">Best regards,<br>John Doe</div>'
+# signature_text = "Best regards,\nJohn Doe"  # text/plain signature (default: derived from signature_html)
+# message_id_domain = "example.com"  # Message-ID domain (default: domain of the sender address)
 # read_only = false                  # true = only read tools, no write/draft
 # allow_delete = true                # false = delete_email blocked
 # allow_move = true                  # false = move_email blocked
@@ -35,7 +52,7 @@ username = "user@gmail.com"
 # accept_invalid_certs = false       # true for self-signed certs (testing only!)
 # allowed_folders = ["INBOX"]        # restrict accessible folders (optional; empty list `[]` rejected)
 auth_method = "password"
-password = "your-app-specific-password"  # or use a .env file
+password = "your-app-specific-password"
 
 # [[accounts]]
 # name = "Work"

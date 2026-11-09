@@ -248,9 +248,9 @@ pub(super) fn build_compose_bodies(
 }
 
 /// Derive a plaintext signature from the configured HTML signature: block
-/// tags become newlines, remaining tags are stripped, basic entities are
-/// decoded, and runs of blank lines collapse. Good enough for signatures —
-/// which are trusted config, not arbitrary mail content.
+/// tags become newlines, remaining tags are stripped, entities are decoded,
+/// and runs of blank lines collapse. Good enough for signatures — which are
+/// trusted config, not arbitrary mail content.
 fn signature_text_from_html(html: &str) -> String {
     if html.is_empty() {
         return String::new();
@@ -287,14 +287,10 @@ fn signature_text_from_html(html: &str) -> String {
     }
     out.push_str(rest);
 
-    // Decode the entities that realistically appear in signature markup.
-    let decoded = out
-        .replace("&nbsp;", " ")
-        .replace("&lt;", "<")
-        .replace("&gt;", ">")
-        .replace("&quot;", "\"")
-        .replace("&#39;", "'")
-        .replace("&amp;", "&");
+    // The full entity table, not just the markup basics: signatures pasted
+    // from Outlook or a web editor spell umlauts as `&uuml;`, and the text
+    // part showed `Gr&uuml;&szlig;e` while only six names were decoded.
+    let decoded = crate::email::decode_html_entities(&out);
 
     // Trim each line and collapse blank-line runs. A line consisting of
     // `--` is the RFC 3676 signature separator and is restored to `-- `
@@ -416,6 +412,10 @@ fn quote_metablock_html(
         l2 = labels[2],
         l3 = labels[3],
         from = html_escape(from_display),
+        // Our own rendering of the date — but an unparseable input falls
+        // through verbatim (see `format_date_outlook_in`), so it is escaped
+        // like every other header value here.
+        sent = html_escape(sent),
         to = html_escape(to_display),
         subj = html_escape(subject),
     )
@@ -1173,6 +1173,15 @@ mod tests {
     }
 
     #[test]
+    fn signature_text_from_html_decodes_named_entities_beyond_the_basics() {
+        let html = "<p>Viele Gr&uuml;&szlig;e<br>M&uuml;ller &amp; S&ouml;hne &ndash; Hamburg</p>";
+        assert_eq!(
+            signature_text_from_html(html),
+            "Viele Grüße\nMüller & Söhne – Hamburg"
+        );
+    }
+
+    #[test]
     fn signature_text_from_html_collapses_source_newlines() {
         // Raw newlines inside the markup are source formatting, not line
         // breaks — only tags create lines. This exact shape (a phone number
@@ -1257,6 +1266,9 @@ mod tests {
     fn find_unparsed_cid_fragment(body: &str) -> Option<String> {
         inspect_markers(body).stray_fragment
     }
+    /// Expected result of a body that must not parse as any marker —
+    /// compared with `assert_eq!` so a failure shows what DID parse.
+    const NO_MARKERS: [&str; 0] = [];
 
     /// Test refs with a fixed, recognizable wire id per marker id.
     fn make_ref(cid: &'static str, filename: &'static str) -> InlineRef<'static> {
@@ -1314,10 +1326,13 @@ mod tests {
     fn cid_marker_alt_must_stay_on_one_line_and_bounded() {
         // A `![` in prose followed paragraphs later by `](cid:x)` must not
         // swallow the text in between into an alt attribute.
-        assert!(collect_cid_markers("Na toll![\nZeile zwei](cid:x)").is_empty());
-        assert!(collect_cid_markers("a![\r\nb](cid:x)").is_empty());
+        assert_eq!(
+            collect_cid_markers("Na toll![\nZeile zwei](cid:x)"),
+            NO_MARKERS
+        );
+        assert_eq!(collect_cid_markers("a![\r\nb](cid:x)"), NO_MARKERS);
         let oversized = format!("![{}](cid:x)", "a".repeat(MAX_MARKER_ALT_BYTES + 1));
-        assert!(collect_cid_markers(&oversized).is_empty());
+        assert_eq!(collect_cid_markers(&oversized), NO_MARKERS);
         // At the cap, and with arbitrary single-line prose, it parses.
         let max_alt = format!("![{}](cid:x)", "ä".repeat(MAX_MARKER_ALT_BYTES / 2));
         assert_eq!(collect_cid_markers(&max_alt), vec!["x"]);
@@ -1327,9 +1342,12 @@ mod tests {
     fn cid_marker_scan_ignores_plain_markdown_and_prose() {
         // A normal markdown image, a bare bracket pair, and an unterminated
         // marker must all survive as text.
-        assert!(collect_cid_markers("![shot](https://example.com/a.png)").is_empty());
-        assert!(collect_cid_markers("costs ![] and more").is_empty());
-        assert!(collect_cid_markers("![](cid:unterminated").is_empty());
+        assert_eq!(
+            collect_cid_markers("![shot](https://example.com/a.png)"),
+            NO_MARKERS
+        );
+        assert_eq!(collect_cid_markers("costs ![] and more"), NO_MARKERS);
+        assert_eq!(collect_cid_markers("![](cid:unterminated"), NO_MARKERS);
         // Prose containing the opener must not swallow the rest of the mail.
         let body = "see ![](cid: and then a real one ![](cid:real)";
         assert_eq!(collect_cid_markers(body), vec!["real"]);
@@ -1349,7 +1367,7 @@ mod tests {
         // far parenthesis.
         let mut body = "![a](cid:x ".repeat(50_000);
         body.push(')');
-        assert!(collect_cid_markers(&body).is_empty());
+        assert_eq!(collect_cid_markers(&body), NO_MARKERS);
     }
 
     /// The SECOND pair of quadratics, found in review after the first was

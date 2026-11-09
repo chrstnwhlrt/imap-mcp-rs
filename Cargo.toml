@@ -2,44 +2,51 @@
 name = "imap-mcp-rs"
 version = "2.0.0"
 edition = "2024"
-# Determined empirically (1.91 compiles, 1.90 fails on then-unstable APIs:
-# Duration::from_mins, str::floor_char_boundary; File::lock needs 1.89).
-# Without this field an older toolchain fails with bare E0658 compiler
-# errors instead of cargo's one-line "requires rustc 1.91" message. The
-# flake pins latest stable and is unaffected.
-rust-version = "1.91"
+# The floor is set by mail-parser 1.0, which requires 1.98 (this crate's own
+# code needs 1.91: Duration::from_mins, str::floor_char_boundary; File::lock
+# needs 1.89). Declared so an older toolchain fails with cargo's one-line
+# "requires rustc 1.98" message instead of bare compiler errors, and so the
+# resolver picks dependency versions that build with it. The flake pins
+# latest stable and is unaffected.
+rust-version = "1.98"
 description = "IMAP MCP Server — email tools for LLM assistants"
 license = "MIT"
 repository = "https://github.com/chrstnwhlrt/imap-mcp-rs"
 
 [dependencies]
-rmcp = { version = "3.1.2", features = ["server", "macros", "transport-io"] }
-tokio = { version = "1.53.1", features = ["macros", "rt-multi-thread", "io-std", "fs"] }
+rmcp = { version = "3.9.0", features = ["server", "macros", "transport-io"] }
+# Every feature the code uses, spelled out: `time`, `net`, `sync` and `io-util`
+# were only enabled through other crates' feature requests before.
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "fs", "net", "sync", "time"] }
 serde = { version = "1.0.229", features = ["derive"] }
-serde_json = "1.0.151"
-schemars = "1.2.2"
+serde_json = "1.0.154"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 anyhow = "1.0.104"
-toml = "1.1.4"
-dotenvy = "0.15.7"
-dirs = "6.0.0"
-async-imap = { version = "0.11.3", default-features = false, features = ["runtime-tokio"] }
-tokio-rustls = { version = "0.26.4", default-features = false, features = ["aws-lc-rs", "tls12"] }
-rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs", "tls12", "std"] }
-webpki-roots = "1.0.9"
-mail-parser = "0.11.6"
-mail-builder = "0.4.4"
+toml = "1.2.1"
+dirs = "7.0.0"
+async-imap = { version = "0.12.0", default-features = false, features = ["runtime-tokio"] }
+tokio-rustls = { version = "0.26.6", default-features = false, features = ["aws-lc-rs", "tls12"] }
+rustls = { version = "0.23.46", default-features = false, features = ["aws-lc-rs", "tls12", "std"] }
+webpki-roots = "1.0.11"
+mail-parser = "1.0.1"
+# Without default features: `gethostname` only feeds mail-builder's own
+# Message-ID fallback. Every draft sets its Message-ID explicitly, and the
+# fallback is exactly how the machine's hostname used to leak into drafts —
+# without the feature it degrades to "localhost" instead.
+mail-builder = { version = "2.0.1", default-features = false }
 futures-util = "0.3.34"
-socket2 = "0.6.5"
-uuid = { version = "1.24.0", features = ["v4"] }
+# `all` exposes `TcpKeepalive::with_retries` (the probe count); no extra
+# dependencies.
+socket2 = { version = "0.6.5", features = ["all"] }
+uuid = { version = "1.29.1", features = ["v4"] }
 # PKCE (RFC 7636): SHA-256 + CSPRNG from the same provider rustls already
 # uses, and URL-safe base64. Both are already in the tree transitively.
-aws-lc-rs = { version = "1.18.0", default-features = false, features = ["aws-lc-sys"] }
+aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys"] }
 base64 = "0.23.1"
 # Draft fidelity: ammonia sanitizes original HTML for reply/forward quotes
 # (formatting survives, scripts/event handlers/javascript: URLs do not);
 # jiff renders the Date header with the local UTC offset like desktop
 # clients do, instead of mail-builder's UTC fallback.
-ammonia = "4.1.4"
-jiff = "0.2.35"
+ammonia = "4.2.4"
+jiff = "0.2.41"

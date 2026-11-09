@@ -2,7 +2,7 @@
 //! listing.
 //!
 //! `search_emails` carries the most logic: criteria are split between
-//! server-side (IMAP `SEARCH`) and an internal [`ClientFilter`] for non-ASCII
+//! server-side (IMAP `SEARCH`) and an internal `ClientFilter` for non-ASCII
 //! terms on Outlook 365 (which silently returns 0 matches for `CHARSET UTF-8`).
 
 use std::collections::HashSet;
@@ -16,7 +16,7 @@ use crate::imap_client::{
     iso_to_imap_date,
 };
 
-use super::{ImapMcpServer, error_json};
+use super::{ImapMcpServer, ToolResult, error_json};
 
 /// Travels with every payload that carries a full message body. The server
 /// instructions say the same thing, but those are a separate channel the
@@ -86,7 +86,7 @@ pub struct ListEmailsRequest {
     #[schemars(description = "Only show unread emails (default: false)")]
     pub unread_only: Option<bool>,
     #[schemars(
-        description = "Collapse results into conversation threads by Message-ID / References (default: false). Returns one row per thread (newest message), with `thread_message_count` indicating thread size. Fetches ~3× the limit internally to compensate for collapsing. Note: `thread_message_count` counts only messages within the fetched window — older thread members outside the window are not included. For the full thread, call `get_thread(uid)` on the representative."
+        description = "Collapse results into conversation threads by Message-ID / References (default: false). Returns one row per thread (newest message), with `thread_message_count` indicating thread size. Fetches ~3× the limit internally to compensate for collapsing. Note: `thread_message_count` counts only messages within the fetched window — older thread members outside the window are not included. For the full thread, call `get_thread(uid)` on the representative. `offset` still counts messages, not threads, so grouped pages can overlap or skip conversations: use grouping for an overview and ungrouped paging to cover a folder completely."
     )]
     pub group_by_thread: Option<bool>,
     #[schemars(
@@ -152,7 +152,7 @@ pub struct SearchEmailsRequest {
     )]
     pub folder: Option<String>,
     #[schemars(
-        description = "Full-text search in body and headers (single term, substring, case-insensitive). Server-side IMAP search — not fuzzy/stemmed."
+        description = "Full-text search in body and headers, case-insensitive substrings. Several words must all occur; \"quoted words\" stay one phrase; filler words (der, vom, the, Mail …) are ignored. Server-side IMAP search — not fuzzy/stemmed."
     )]
     pub text: Option<String>,
     #[schemars(
@@ -177,7 +177,9 @@ pub struct SearchEmailsRequest {
     pub from_all: Option<Vec<String>>,
     #[schemars(description = "Filter by recipient address (substring match, case-insensitive)")]
     pub to: Option<String>,
-    #[schemars(description = "Filter by subject line (substring match, case-insensitive)")]
+    #[schemars(
+        description = "Filter by subject line, case-insensitive substrings; several words must all occur, as with `text`."
+    )]
     pub subject: Option<String>,
     #[schemars(
         description = "Filter by subject matching ALL of these terms (AND-combined, substring, case-insensitive). E.g. [\"invoice\", \"Q4\"]."
@@ -198,7 +200,7 @@ pub struct SearchEmailsRequest {
     )]
     pub unread_only: Option<bool>,
     #[schemars(
-        description = "Collapse results into conversation threads by Message-ID / References (default: false), exactly as in list_emails: one row per thread (newest message wins), `thread_message_count` counts members within this result window, `threads_truncated_from` reports a cut. Fetches ~3× the limit per folder internally. Combine with since/before + is_read for \"what is new and unanswered, grouped\" in one call."
+        description = "Collapse results into conversation threads by Message-ID / References (default: false), exactly as in list_emails: one row per thread (newest message wins), `thread_message_count` counts members within this result window, `threads_truncated_from` reports a cut. Fetches ~3× the limit per folder internally. Combine with since/before + is_read for \"what is new and unanswered, grouped\" in one call. `offset` counts messages, not threads, so grouped pages can overlap or skip conversations — narrow the criteria instead of paging a grouped result."
     )]
     pub group_by_thread: Option<bool>,
     #[schemars(description = "Filter by flag state: true = flagged/starred, false = unflagged")]
@@ -267,10 +269,10 @@ pub struct ListDraftsRequest {
     pub compact: Option<bool>,
 }
 
-pub async fn list_folders(server: &ImapMcpServer, req: ListFoldersRequest) -> String {
+pub async fn list_folders(server: &ImapMcpServer, req: ListFoldersRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     let account_name = account_config.name.clone();
     let mut client = client_arc.lock().await;
@@ -288,9 +290,9 @@ pub async fn list_folders(server: &ImapMcpServer, req: ListFoldersRequest) -> St
                 "returned": folders.len(),
                 "folders": folders,
             }))
-            .unwrap_or_else(|e| error_json(&e.to_string()))
+            .map_err(|e| error_json(&e.to_string()))
         }
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
@@ -347,13 +349,14 @@ fn summary_rows(emails: &[EmailSummary], compact: bool) -> serde_json::Value {
     }
 }
 
-pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> String {
+pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     let account_name = account_config.name.clone();
     let mut client = client_arc.lock().await;
+    let folder = super::folder_for(&mut client, &req.folder).await?;
     // Clamp to a hard ceiling so a prompt-injected limit can't ask for 100k
     // emails and OOM the host. Users needing more should paginate via offset.
     let limit_capped = req.limit.is_some_and(|l| l > 500);
@@ -371,7 +374,7 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Stri
     };
 
     match client
-        .list_emails(&req.folder, fetch_limit, offset, unread_only)
+        .list_emails(&folder, fetch_limit, offset, unread_only)
         .await
     {
         Ok((emails, total, matched)) => {
@@ -393,7 +396,7 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Stri
             let rows = summary_rows(&emails, req.compact.unwrap_or(false));
             let mut payload = serde_json::json!({
                 "account": account_name,
-                "folder": req.folder,
+                "folder": folder,
                 "total": total,
                 "matched": matched,
                 "offset": offset,
@@ -408,16 +411,16 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Stri
             if let Some(count) = threads_before_cap {
                 payload["threads_truncated_from"] = serde_json::json!(count);
             }
-            serde_json::to_string(&payload).unwrap_or_else(|e| error_json(&e.to_string()))
+            serde_json::to_string(&payload).map_err(|e| error_json(&e.to_string()))
         }
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
 /// Union-find `find` with path compression over the interned ID space
 /// built by [`group_summaries_by_thread`]. Extracted so
 /// `clippy::items_after_statements` stays happy.
-fn uf_find(parent: &mut [usize], mut i: usize) -> usize {
+const fn uf_find(parent: &mut [usize], mut i: usize) -> usize {
     while parent[i] != i {
         parent[i] = parent[parent[i]];
         i = parent[i];
@@ -428,7 +431,7 @@ fn uf_find(parent: &mut [usize], mut i: usize) -> usize {
 /// Union-find union by setting one root's parent to the other's. Biased
 /// toward `b` for simplicity — the size doesn't matter for our tree depth
 /// since `uf_find` already path-compresses.
-fn uf_union(parent: &mut [usize], a: usize, b: usize) {
+const fn uf_union(parent: &mut [usize], a: usize, b: usize) {
     let (ra, rb) = (uf_find(parent, a), uf_find(parent, b));
     if ra != rb {
         parent[ra] = rb;
@@ -528,15 +531,16 @@ fn group_summaries_by_thread(mut summaries: Vec<EmailSummary>) -> Vec<EmailSumma
     representatives.into_iter().map(|(_, s)| s).collect()
 }
 
-pub async fn get_email(server: &ImapMcpServer, req: GetEmailRequest) -> String {
+pub async fn get_email(server: &ImapMcpServer, req: GetEmailRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     let account_name = account_config.name.clone();
     let include_html = req.include_html.unwrap_or(false);
     let mut client = client_arc.lock().await;
-    match client.get_email(&req.folder, req.uid).await {
+    let folder = super::folder_for(&mut client, &req.folder).await?;
+    match client.get_email(&folder, req.uid).await {
         Ok(Some(mut email)) => {
             if !include_html {
                 email.body_html = None;
@@ -551,21 +555,21 @@ pub async fn get_email(server: &ImapMcpServer, req: GetEmailRequest) -> String {
                 "email": email,
             });
             add_untrusted_marker(&mut payload, &diverging);
-            serde_json::to_string(&payload).unwrap_or_else(|e| error_json(&e.to_string()))
+            serde_json::to_string(&payload).map_err(|e| error_json(&e.to_string()))
         }
-        Ok(None) => error_json(&format!(
+        Ok(None) => Err(error_json(&format!(
             "Email with UID {} not found in {}",
             req.uid,
-            crate::email::sanitize_external_str(&req.folder)
-        )),
-        Err(e) => error_json(&client.check_error(e).to_string()),
+            crate::email::sanitize_external_str(&folder)
+        ))),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
-pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> String {
+pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     let account_name = account_config.name.clone();
     let strict = req.strict.unwrap_or(true);
@@ -573,7 +577,8 @@ pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> String
     let include_html = req.include_html.unwrap_or(false);
     let max_messages = req.max_messages.unwrap_or(50).clamp(1, 200) as usize;
     let mut client = client_arc.lock().await;
-    match client.get_thread(&req.folder, req.uid, strict).await {
+    let folder = super::folder_for(&mut client, &req.folder).await?;
+    match client.get_thread(&folder, req.uid, strict).await {
         Ok(mut emails) => {
             let original_count = emails.len();
             let truncated = original_count > max_messages;
@@ -628,9 +633,9 @@ pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> String
                 add_untrusted_marker(&mut payload, &diverging);
             }
 
-            serde_json::to_string(&payload).unwrap_or_else(|e| error_json(&e.to_string()))
+            serde_json::to_string(&payload).map_err(|e| error_json(&e.to_string()))
         }
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
@@ -645,7 +650,7 @@ pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> String
 /// 200-character snippet, and matching against that silently dropped every
 /// mail whose term appeared later in the body. They travel in `body` and are
 /// applied inside the IMAP client against the complete `body_text` before
-/// summarization — see [`BodyTextFilter`].
+/// summarization — see [`crate::imap_client::BodyTextFilter`].
 ///
 /// **Invariant: all stored needles are already lowercased.** `build_search_criteria`
 /// owns the `.to_lowercase()` call so `matches()` can hot-loop over N emails
@@ -713,7 +718,7 @@ impl ClientFilter {
             }
         }
         for group in &self.from_any {
-            if !group.iter().any(|s| from_l.contains(&s.to_lowercase())) {
+            if !group.iter().any(|s| from_l.contains(s.as_str())) {
                 return false;
             }
         }
@@ -822,13 +827,131 @@ fn parse_time_bound(
     })
 }
 
-/// Build an IMAP SEARCH criteria string from the request. When `unicode_search`
-/// is `false`, non-ASCII string criteria are diverted into a `ClientFilter`
-/// (server gets ASCII-only) so they can be applied after fetch — workaround for
-/// Outlook 365's broken `CHARSET UTF-8` SEARCH.
+/// Filler words a search term never needs: articles, prepositions and
+/// conjunctions (German and English), and the words that name the mail
+/// itself. A model asking for "die Mail von Mama" means Mama, and the word
+/// "Mail" rarely occurs in the mail it is looking for.
+const SEARCH_STOPWORDS: &[&str] = &[
+    "der",
+    "die",
+    "das",
+    "dem",
+    "den",
+    "des",
+    "ein",
+    "eine",
+    "einem",
+    "einen",
+    "einer",
+    "eines",
+    "und",
+    "oder",
+    "vom",
+    "von",
+    "mit",
+    "für",
+    "im",
+    "in",
+    "am",
+    "an",
+    "auf",
+    "aus",
+    "bei",
+    "zu",
+    "zum",
+    "zur",
+    "über",
+    "nach",
+    "um",
+    "the",
+    "a",
+    "of",
+    "and",
+    "or",
+    "to",
+    "for",
+    "on",
+    "at",
+    "from",
+    "by",
+    "with",
+    "about",
+    "mail",
+    "mails",
+    "email",
+    "emails",
+    "e-mail",
+    "e-mails",
+    "nachricht",
+    "nachrichten",
+    "message",
+    "messages",
+];
+
+/// The terms a free-text `text` or `subject` value stands for, all of which
+/// must occur. A "quoted phrase" stays one term; other words count one by
+/// one, without punctuation at their edges and without filler words, and a
+/// word joined by hyphens counts as its parts (see [`hyphen_parts`]). When
+/// only filler words are given, they are searched as written, so the search
+/// never turns empty.
 ///
-/// Returns `Err` for user-facing validation failures (bad date, no criterion,
-/// non-ASCII-only criteria without a date scope on a non-Unicode server).
+/// The whole value used to be one substring: "Stadtwerke Rechnung" found
+/// nothing because no mail says exactly that, and a model then reported
+/// that nothing was there. All the words still occur in what the old
+/// substring found, so this only ever adds matches.
+fn search_terms(raw: &str) -> Vec<String> {
+    let mut phrases = Vec::new();
+    let mut words = Vec::new();
+    // Even segments lie outside quotes, odd ones inside; an unclosed quote
+    // makes the rest one phrase.
+    for (index, segment) in raw.split('"').enumerate() {
+        if index % 2 == 1 {
+            let phrase = segment.trim();
+            if !phrase.is_empty() {
+                phrases.push(phrase.to_string());
+            }
+            continue;
+        }
+        for word in segment.split_whitespace() {
+            // A hyphen at the edge belongs to an elided compound ("Telekom-
+            // und Stromrechnung"): the word without it is what occurs.
+            let word = word.trim_matches(|c: char| ".,;:!?()[]{}'-".contains(c));
+            words.extend(hyphen_parts(word));
+        }
+    }
+    let content: Vec<String> = words
+        .iter()
+        .filter(|w| !SEARCH_STOPWORDS.contains(&w.to_lowercase().as_str()))
+        .cloned()
+        .collect();
+    if content.is_empty() && phrases.is_empty() {
+        return words;
+    }
+    phrases.extend(content);
+    phrases
+}
+
+/// A word joined by hyphens as its parts, when each part has at least three
+/// letters: "Telekom-Rechnung" is "Telekom" and "Rechnung". A mail may well
+/// write the two apart ("Ihre Rechnung der Telekom"), and one that writes
+/// them joined contains both parts too, so the split only adds matches.
+/// "E-Mail", "Wi-Fi" and a date such as "2025-11-03" stay whole: their
+/// short parts would match nearly every mail.
+fn hyphen_parts(word: &str) -> Vec<String> {
+    if word.is_empty() {
+        return Vec::new();
+    }
+    let parts: Vec<&str> = word.split('-').collect();
+    let all_words = parts
+        .iter()
+        .all(|part| part.chars().filter(|c| c.is_alphabetic()).count() >= 3);
+    if parts.len() > 1 && all_words {
+        parts.into_iter().map(str::to_string).collect()
+    } else {
+        vec![word.to_string()]
+    }
+}
+
 /// Server-side / client-side splitter for a single search term. Pulled
 /// out of `build_search_criteria` so `clippy::items_after_statements`
 /// stays happy when it's referenced from inside the function body.
@@ -846,6 +969,13 @@ fn push_search_term(
     }
 }
 
+/// Build an IMAP SEARCH criteria string from the request. When `unicode_search`
+/// is `false`, non-ASCII string criteria are diverted into a `ClientFilter`
+/// (server gets ASCII-only) so they can be applied after fetch — workaround for
+/// Outlook 365's broken `CHARSET UTF-8` SEARCH.
+///
+/// Returns `Err` for user-facing validation failures (bad date, no criterion,
+/// non-ASCII-only criteria without a date scope on a non-Unicode server).
 #[allow(clippy::too_many_lines)]
 fn build_search_criteria(
     req: &SearchEmailsRequest,
@@ -867,13 +997,15 @@ fn build_search_criteria(
     let push_term = push_search_term;
 
     if let Some(text) = &req.text {
-        push_term(
-            &mut parts,
-            &mut filter.post.body.all,
-            "TEXT",
-            text,
-            unicode_search,
-        );
+        for term in search_terms(text) {
+            push_term(
+                &mut parts,
+                &mut filter.post.body.all,
+                "TEXT",
+                &term,
+                unicode_search,
+            );
+        }
     }
     if let Some(text_all) = &req.text_all {
         for term in text_all {
@@ -934,13 +1066,15 @@ fn build_search_criteria(
         push_term(&mut parts, &mut filter.to, "TO", to, unicode_search);
     }
     if let Some(subject) = &req.subject {
-        push_term(
-            &mut parts,
-            &mut filter.subject,
-            "SUBJECT",
-            subject,
-            unicode_search,
-        );
+        for term in search_terms(subject) {
+            push_term(
+                &mut parts,
+                &mut filter.subject,
+                "SUBJECT",
+                &term,
+                unicode_search,
+            );
+        }
     }
     if let Some(subject_all) = &req.subject_all {
         for term in subject_all {
@@ -1044,17 +1178,17 @@ fn build_search_criteria(
     Ok((criteria, filter))
 }
 
-pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> String {
+pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     let account_name = account_config.name.clone();
     let unicode_search = host_supports_unicode_search(&account_config.host);
 
     let (criteria, filter) = match build_search_criteria(&req, unicode_search) {
         Ok(c) => c,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     // Clamp to a hard ceiling so a prompt-injected limit can't ask for 100k
     // emails and OOM the host. Larger result sets are reached via `offset`.
@@ -1074,19 +1208,19 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
     // silently dropping matches instead of paging past them. Refuse rather
     // than return a plausible-looking but incomplete page.
     if offset > 0 && req.folder.is_none() {
-        return error_json(
+        return Err(error_json(
             "offset requires a single `folder` — across all folders it would skip messages in each one instead of paging through the combined result; narrow the criteria (e.g. a date range) instead",
-        );
+        ));
     }
 
     let mut client = client_arc.lock().await;
 
     let folders = if let Some(folder) = &req.folder {
-        vec![folder.clone()]
+        vec![super::folder_for(&mut client, folder).await?]
     } else {
         match client.get_folder_names().await {
             Ok(names) => names,
-            Err(e) => return error_json(&client.check_error(e).to_string()),
+            Err(e) => return Err(error_json(&client.check_error(e).to_string())),
         }
     };
 
@@ -1100,47 +1234,19 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
         ordered_folders.sort_by_key(|f| i32::from(!f.eq_ignore_ascii_case("INBOX")));
     }
 
-    let mut all_results = Vec::new();
-    // For single-folder searches, surface errors directly — otherwise a
-    // disallowed folder (`allowed_folders` violation) or typo'd folder name
-    // would silently return empty results, which is misleading.
-    let single_folder = ordered_folders.len() == 1;
-    let mut single_folder_error: Option<String> = None;
-    // Server-side match count, summed over the searched folders. Kept
-    // separate from what we deliver so a caller can tell "this is all of it"
-    // from "these are the newest of many" — see the note on `matched` below.
-    let mut server_matched: u32 = 0;
-    for folder in &ordered_folders {
-        match client
-            .search_emails(folder, &criteria, fetch_limit, offset, &filter.post)
-            .await
-        {
-            Ok((results, matched)) => {
-                server_matched = server_matched.saturating_add(matched);
-                all_results.extend(results);
-            }
-            Err(e) => {
-                let err_str = e.to_string();
-                tracing::warn!(
-                    folder = %crate::imap_client::sanitize_log_str(folder),
-                    error = %crate::imap_client::sanitize_log_str(&err_str),
-                    "Search failed for folder"
-                );
-                let _ = client.check_error(e);
-                if single_folder {
-                    single_folder_error = Some(err_str);
-                }
-            }
-        }
-    }
-
+    let searched = search_folders(
+        &mut client,
+        &ordered_folders,
+        &criteria,
+        fetch_limit,
+        offset,
+        &filter.post,
+    )
+    .await;
     // Release the mutex before CPU-bound dedup/sort/serialize so parallel tool
     // calls on the same account aren't blocked.
     drop(client);
-
-    if let Some(err) = single_folder_error {
-        return error_json(&err);
-    }
+    let (mut all_results, server_matched) = searched.map_err(|e| error_json(&e))?;
 
     // Apply the summary-level client-side filters (Outlook 365 UTF-8
     // fallback): subject/from/to and has_attachments. The full-text (`body`)
@@ -1168,6 +1274,17 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
         });
     }
 
+    // A search for words that found nothing gets help (`hint`), and under
+    // `tool_set = "voice"` the newest INBOX rows to look through: a small
+    // model that searched for "Steuerberaterin" (a word in no header) gave
+    // up, and with the senders in front of it found Selin Kaya.
+    let nothing_found = searches_words(&req) && offset == 0 && all_results.is_empty();
+    let newest = if nothing_found && server.config.tool_set == crate::config::ToolSet::Voice {
+        newest_inbox_rows(&client_arc).await
+    } else {
+        None
+    };
+
     render_search_payload(
         all_results,
         &SearchPayload {
@@ -1178,8 +1295,136 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
             limit_capped,
             group_by_thread,
             compact: req.compact.unwrap_or(false),
+            hint: nothing_found.then(|| empty_search_hint(req.folder.is_some(), newest.is_some())),
+            newest,
         },
     )
+}
+
+/// Whether the request looks for words (text, sender, recipient, subject).
+/// Only then is an empty result a miss worth help: for pure date or flag
+/// filters it is the answer, as in an unattended "anything new since X?"
+/// run.
+fn searches_words(req: &SearchEmailsRequest) -> bool {
+    [&req.text, &req.from, &req.to, &req.subject]
+        .iter()
+        .any(|v| v.as_deref().is_some_and(|s| !s.trim().is_empty()))
+        || [
+            &req.text_any,
+            &req.text_all,
+            &req.from_any,
+            &req.from_all,
+            &req.subject_all,
+        ]
+        .iter()
+        .any(|v| v.as_ref().is_some_and(|list| !list.is_empty()))
+}
+
+/// What to try after a search for words found nothing.
+fn empty_search_hint(folder_given: bool, newest: bool) -> String {
+    let mut hint = String::from(
+        "No match. Terms match as parts of words, any case: try one distinctive word, or `text` \
+         instead of `from` (`from` only sees the sender's name and address)",
+    );
+    if folder_given {
+        hint.push_str(", or leave out `folder` to search every folder");
+    }
+    hint.push_str(if newest {
+        ". `newest` lists the newest emails of INBOX: where one of them is the one the user \
+         means, as for a person named by role or a word in another form, go on with it."
+    } else {
+        ", or list_emails on INBOX to see the newest emails with their senders."
+    });
+    hint
+}
+
+/// The ten newest INBOX emails as compact rows, the sender as
+/// `Name <address>`: the name is what a model matches "Mama" or "the tax
+/// adviser" against. `None` when the INBOX cannot be listed.
+async fn newest_inbox_rows(
+    client_arc: &std::sync::Arc<tokio::sync::Mutex<crate::imap_client::ImapClient>>,
+) -> Option<Vec<serde_json::Value>> {
+    let mut client = client_arc.lock().await;
+    let (emails, _, _) = match client.list_emails("INBOX", 10, 0, false).await {
+        Ok(listing) => listing,
+        Err(e) => {
+            let _ = client.check_error(e);
+            return None;
+        }
+    };
+    drop(client);
+    Some(
+        emails
+            .iter()
+            .map(|email| {
+                let mut row = email.compact();
+                if let Some(from) = &email.from {
+                    row["from"] = serde_json::json!(from.name.as_deref().map_or_else(
+                        || from.address.clone(),
+                        |name| format!("{name} <{}>", from.address)
+                    ));
+                }
+                row
+            })
+            .collect(),
+    )
+}
+
+/// Search `folders` one after another and collect the rows together with the
+/// server-side match count, summed over the folders. That count stays
+/// separate from what is delivered, so a caller can tell "this is all of it"
+/// from "these are the newest of many" (see `matched` in
+/// `render_search_payload`).
+///
+/// A folder that refuses the search for good is skipped: a `\Noselect`
+/// parent such as `[Gmail]` refuses every one. Transient trouble (a dead
+/// connection, a busy server) is not: it would hit every remaining folder
+/// too, each after a reconnect attempt of its own, and end in a quietly
+/// partial answer, down to `matched: 0`, so it ends the search for the
+/// caller to retry. When no folder could be searched at all, the refusal is
+/// the answer: an empty result would read as "no matches", whether the one
+/// folder was misspelled or the server refused the criteria everywhere.
+async fn search_folders(
+    client: &mut crate::imap_client::ImapClient,
+    folders: &[String],
+    criteria: &str,
+    fetch_limit: u32,
+    offset: u32,
+    post: &PostFetchFilter,
+) -> Result<(Vec<EmailSummary>, u32), String> {
+    let mut rows = Vec::new();
+    let mut server_matched: u32 = 0;
+    let mut searched_any = false;
+    let mut refusal: Option<String> = None;
+    for folder in folders {
+        match client
+            .search_emails(folder, criteria, fetch_limit, offset, post)
+            .await
+        {
+            Ok((results, matched)) => {
+                searched_any = true;
+                server_matched = server_matched.saturating_add(matched);
+                rows.extend(results);
+            }
+            Err(e) => {
+                let err_str = e.to_string();
+                tracing::warn!(
+                    folder = %crate::imap_client::sanitize_log_str(folder),
+                    error = %crate::imap_client::sanitize_log_str(&err_str),
+                    "Search failed for folder"
+                );
+                let _ = client.check_error(e);
+                if crate::imap_client::is_retryable_error(&err_str) {
+                    return Err(err_str);
+                }
+                refusal = Some(err_str);
+            }
+        }
+    }
+    match refusal {
+        Some(err) if !searched_any => Err(err),
+        _ => Ok((rows, server_matched)),
+    }
 }
 
 /// Everything `render_search_payload` needs besides the result rows —
@@ -1192,10 +1437,14 @@ struct SearchPayload<'a> {
     limit_capped: bool,
     group_by_thread: bool,
     compact: bool,
+    /// Set when a search for words found nothing.
+    hint: Option<String>,
+    /// The newest INBOX rows that come with `hint` under `tool_set = "voice"`.
+    newest: Option<Vec<serde_json::Value>>,
 }
 
 /// Sort, optionally thread-group, page-cap and serialize search results.
-fn render_search_payload(mut all_results: Vec<EmailSummary>, p: &SearchPayload<'_>) -> String {
+fn render_search_payload(mut all_results: Vec<EmailSummary>, p: &SearchPayload<'_>) -> ToolResult {
     all_results.sort_by(|a, b| b.date.cmp(&a.date));
 
     // Grouping mirrors list_emails exactly (same union-find, same
@@ -1255,13 +1504,25 @@ fn render_search_payload(mut all_results: Vec<EmailSummary>, p: &SearchPayload<'
     if let Some(count) = threads_before_cap {
         payload["threads_truncated_from"] = serde_json::json!(count);
     }
-    serde_json::to_string(&payload).unwrap_or_else(|e| error_json(&e.to_string()))
+    if let Some(hint) = &p.hint {
+        payload["hint"] = serde_json::json!(hint);
+    }
+    if let Some(rows) = &p.newest {
+        payload["newest"] = serde_json::json!(rows);
+    }
+    serde_json::to_string(&payload).map_err(|e| error_json(&e.to_string()))
 }
 
-/// Make a filesystem-safe filename out of an LLM-supplied attachment name.
+/// Make a filesystem-safe filename out of a sender-supplied attachment name.
 /// Sanitises bidi/control via `sanitize_external_str`, then replaces path
 /// separators + NUL with `_` so the result is always a single path
 /// component. Falls back to `"attachment"` for empty / `.` / `..` inputs.
+///
+/// Also capped at [`MAX_FILENAME_BYTES`]: file systems refuse names over
+/// 255 bytes, so a long sender-chosen name (plus the `.partial` suffix the
+/// download writes first) made the download fail outright. The extension
+/// survives the cut — it is what the type detection of a later `draft_*`
+/// attachment and the recipient's client go by.
 fn filesystem_safe_filename(raw: &str) -> String {
     let cleaned = crate::email::sanitize_external_str(raw);
     let safe: String = cleaned
@@ -1273,18 +1534,40 @@ fn filesystem_safe_filename(raw: &str) -> String {
         .collect();
     let trimmed = safe.trim();
     if trimmed.is_empty() || trimmed == "." || trimmed == ".." {
-        "attachment".to_string()
-    } else {
-        trimmed.to_string()
+        return "attachment".to_string();
     }
+    if trimmed.len() <= MAX_FILENAME_BYTES {
+        return trimmed.to_string();
+    }
+    // Keep a short extension; a "suffix" longer than this is part of the name.
+    let (stem, ext) = match trimmed.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() && ext.len() <= 16 => (stem, Some(ext)),
+        _ => (trimmed, None),
+    };
+    let ext_len = ext.map_or(0, |e| e.len() + 1);
+    let mut out = stem[..stem.floor_char_boundary(MAX_FILENAME_BYTES - ext_len)]
+        .trim_end()
+        .to_string();
+    if let Some(ext) = ext {
+        out.push('.');
+        out.push_str(ext);
+    }
+    out
 }
+
+/// Longest saved attachment file name, in bytes: 255 is the common file
+/// system limit, minus room for the `.partial` suffix of the in-progress
+/// write.
+const MAX_FILENAME_BYTES: usize = 200;
 
 // Linear download workflow (resolve → fetch raw → parse → find attachment →
 // size check → mkdir → write partial → chmod → rename). Splitting would
 // fragment a straight pipeline for no readability gain.
 #[allow(clippy::too_many_lines)]
-pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachmentRequest) -> String {
-    use mail_parser::MimeHeaders;
+pub async fn download_attachment(
+    server: &ImapMcpServer,
+    req: DownloadAttachmentRequest,
+) -> ToolResult {
     use std::path::Path;
     use uuid::Uuid;
 
@@ -1295,36 +1578,43 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
 
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     let account_name = account_config.name.clone();
     let mut client = client_arc.lock().await;
+    let folder = super::folder_for(&mut client, &req.folder).await?;
 
     // Fetch raw email bytes
-    let raw = match client.fetch_raw(&req.folder, req.uid).await {
+    let raw = match client.fetch_raw(&folder, req.uid).await {
         Ok(Some(bytes)) => bytes,
         Ok(None) => {
-            return error_json(&format!(
+            return Err(error_json(&format!(
                 "Email with UID {} not found in {}",
                 req.uid,
-                crate::email::sanitize_external_str(&req.folder)
-            ));
+                crate::email::sanitize_external_str(&folder)
+            )));
         }
-        Err(e) => return error_json(&client.check_error(e).to_string()),
+        Err(e) => return Err(error_json(&client.check_error(e).to_string())),
     };
+    // Everything below is parsing, decoding and file I/O — release the
+    // account so parallel tool calls on it aren't blocked meanwhile.
+    drop(client);
 
     // Parse and find the attachment
     let Some(message) = mail_parser::MessageParser::default().parse(&raw) else {
-        return error_json("Failed to parse email");
+        return Err(error_json("Failed to parse email"));
     };
 
-    // The names exactly as `get_email` renders them — same sanitizer, same
-    // `"attachment"` placeholder for nameless parts. The two defaults used
-    // to diverge (`"attachment"` here vs `""` there), so following the
-    // documented get_email→download flow dead-ended on any nameless part:
-    // the placeholder shown could never match.
-    let names: Vec<String> = message
-        .attachments()
+    // The same list `get_email` enumerates, so its `index` addresses the
+    // same part here. Names exactly as `get_email` renders them — same
+    // sanitizer, same `"attachment"` placeholder for nameless parts. The two
+    // defaults used to diverge (`"attachment"` here vs `""` there), so
+    // following the documented get_email→download flow dead-ended on any
+    // nameless part: the placeholder shown could never match.
+    let parts: Vec<mail_parser::MessagePart<'_>> =
+        crate::email::attachment_parts(&message).collect();
+    let names: Vec<String> = parts
+        .iter()
         .map(|att| {
             crate::email::sanitize_external_str(att.attachment_name().unwrap_or("attachment"))
         })
@@ -1338,28 +1628,31 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
     let selected = match resolve_attachment_selection(&names, req.index, safe_requested.as_deref())
     {
         Ok(i) => i,
-        Err(e) => return error_json(&format!("{e} (email UID {})", req.uid)),
+        Err(e) => return Err(error_json(&format!("{e} (email UID {})", req.uid))),
     };
-    let Some(attachment) = message.attachments().nth(selected) else {
-        return error_json("Attachment list changed during processing");
-    };
+    let attachment = parts[selected];
     let attachment_name = names[selected].clone();
 
     let content_type = crate::email::format_content_type(attachment.content_type());
 
-    let contents = attachment.contents();
+    // Measured before decoding (base64 and quoted-printable lengths are
+    // computed without decoding), so an oversized part is refused without
+    // first materializing all of it.
+    let size = attachment.decoded_len();
+    if size > MAX_ATTACHMENT_SIZE {
+        return Err(error_json(&format!(
+            "Attachment \"{attachment_name}\" is {size} bytes — exceeds the {MAX_ATTACHMENT_SIZE}-byte cap"
+        )));
+    }
+    let contents = attachment.decoded();
     let size = contents.len();
 
-    if size > MAX_ATTACHMENT_SIZE {
-        return error_json(&format!(
-            "Attachment \"{attachment_name}\" is {size} bytes — exceeds the {MAX_ATTACHMENT_SIZE}-byte cap"
-        ));
-    }
-
-    // Save into the first configured attachment dir (created + mode-locked
-    // by main at startup) rather than a hardcoded `/tmp/imap-mcp-rs` — the
-    // hardcoded path was exploitable on multi-user hosts via a pre-created
-    // symlink.
+    // Save into the first configured attachment dir rather than a hardcoded
+    // `/tmp/imap-mcp-rs` — the hardcoded path was exploitable on multi-user
+    // hosts via a pre-created symlink. Prepared at startup already; checked
+    // again here because it may have been removed and recreated since, and
+    // attachments are potentially sensitive (keys, contracts, private
+    // photos).
     let default_dir = crate::config::default_attachment_dir();
     let dir_str = server
         .config
@@ -1368,17 +1661,8 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
         .cloned()
         .unwrap_or(default_dir);
     let dir = Path::new(&dir_str);
-    if let Err(e) = tokio::fs::create_dir_all(dir).await {
-        return error_json(&format!("Failed to create directory: {e}"));
-    }
-    // Restrict dir to user-only (0700) in case create_dir_all just created it
-    // with a permissive umask default — attachments are potentially sensitive
-    // (keys, contracts, private photos) and shouldn't be world-readable on
-    // multi-user systems.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = tokio::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).await;
+    if let Err(e) = crate::config::prepare_attachment_dir(dir).await {
+        return Err(error_json(&format!("{e:#}")));
     }
 
     // Per-download UUID subdirectory containing the file under its
@@ -1390,7 +1674,9 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
     let uuid = Uuid::new_v4();
     let download_dir = dir.join(uuid.to_string());
     if let Err(e) = tokio::fs::create_dir_all(&download_dir).await {
-        return error_json(&format!("Failed to create download subdir: {e}"));
+        return Err(error_json(&format!(
+            "Failed to create download subdir: {e}"
+        )));
     }
     #[cfg(unix)]
     {
@@ -1414,7 +1700,7 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
 
     if let Err(e) = tokio::fs::write(&partial_path, contents).await {
         let _ = tokio::fs::remove_file(&partial_path).await;
-        return error_json(&format!("Failed to write file: {e}"));
+        return Err(error_json(&format!("Failed to write file: {e}")));
     }
     // chmod BEFORE the rename so the final path is 0600-locked from the
     // moment it exists under its advertised name — avoids a brief window
@@ -1428,14 +1714,14 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
             tokio::fs::set_permissions(&partial_path, std::fs::Permissions::from_mode(0o600)).await
         {
             let _ = tokio::fs::remove_file(&partial_path).await;
-            return error_json(&format!(
+            return Err(error_json(&format!(
                 "Failed to lock attachment permissions to 0600: {e}"
-            ));
+            )));
         }
     }
     if let Err(e) = tokio::fs::rename(&partial_path, &save_path).await {
         let _ = tokio::fs::remove_file(&partial_path).await;
-        return error_json(&format!("Failed to finalize file: {e}"));
+        return Err(error_json(&format!("Failed to finalize file: {e}")));
     }
 
     serde_json::to_string(&serde_json::json!({
@@ -1448,7 +1734,7 @@ pub async fn download_attachment(server: &ImapMcpServer, req: DownloadAttachment
         "size": size,
         "content_type": content_type,
     }))
-    .unwrap_or_else(|e| error_json(&e.to_string()))
+    .map_err(|e| error_json(&e.to_string()))
 }
 
 /// Pick one attachment by `index` or by (sanitized) `filename`.
@@ -1503,10 +1789,10 @@ fn resolve_attachment_selection(
     }
 }
 
-pub async fn list_drafts(server: &ImapMcpServer, req: ListDraftsRequest) -> String {
+pub async fn list_drafts(server: &ImapMcpServer, req: ListDraftsRequest) -> ToolResult {
     let (account_config, client_arc) = match server.resolve_client(req.account.as_deref()) {
         Ok(r) => r,
-        Err(e) => return error_json(&e),
+        Err(e) => return Err(error_json(&e)),
     };
     let account_name = account_config.name.clone();
     // Clamp to a hard ceiling so a prompt-injected limit can't ask for 100k
@@ -1519,11 +1805,11 @@ pub async fn list_drafts(server: &ImapMcpServer, req: ListDraftsRequest) -> Stri
     let drafts_folder = match client.detect_drafts_folder().await {
         Ok(Some(f)) => f,
         Ok(None) => {
-            return error_json(
+            return Err(error_json(
                 "No Drafts folder found on server. Create one manually via your webmail client.",
-            );
+            ));
         }
-        Err(e) => return error_json(&client.check_error(e).to_string()),
+        Err(e) => return Err(error_json(&client.check_error(e).to_string())),
     };
 
     match client
@@ -1544,9 +1830,9 @@ pub async fn list_drafts(server: &ImapMcpServer, req: ListDraftsRequest) -> Stri
             if limit_capped {
                 payload["limit_capped"] = serde_json::json!(true);
             }
-            serde_json::to_string(&payload).unwrap_or_else(|e| error_json(&e.to_string()))
+            serde_json::to_string(&payload).map_err(|e| error_json(&e.to_string()))
         }
-        Err(e) => error_json(&client.check_error(e).to_string()),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
 }
 
@@ -1675,18 +1961,62 @@ mod tests {
             limit_capped: false,
             group_by_thread: false,
             compact: true,
+            hint: None,
+            newest: None,
         };
-        let rendered = render_search_payload((1..=30).map(row).collect(), &payload(30));
+        let rendered = render_search_payload((1..=30).map(row).collect(), &payload(30)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(v["returned"], 20);
         assert_eq!(v["matched"], 30);
         assert_eq!(v["has_more"], true, "{v}");
 
         // Exactly filling the page is not a truncation — no phantom "more".
-        let rendered = render_search_payload((1..=20).map(row).collect(), &payload(20));
+        let rendered = render_search_payload((1..=20).map(row).collect(), &payload(20)).unwrap();
         let v: serde_json::Value = serde_json::from_str(&rendered).unwrap();
         assert_eq!(v["returned"], 20);
         assert_eq!(v["has_more"], false, "{v}");
+    }
+
+    /// An empty search for words says what to try next, and `newest` rides
+    /// along only when given; a found result carries neither.
+    #[test]
+    fn render_search_payload_adds_hint_and_newest_only_when_given() {
+        let empty = SearchPayload {
+            account: "A",
+            server_matched: 0,
+            offset: 0,
+            limit: 20,
+            limit_capped: false,
+            group_by_thread: false,
+            compact: true,
+            hint: Some(empty_search_hint(true, true)),
+            newest: Some(vec![
+                serde_json::json!({"uid": 4, "from": "Selin Kaya <s.kaya@steuer.example>"}),
+            ]),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&render_search_payload(vec![], &empty).unwrap()).unwrap();
+        assert!(
+            v["hint"].as_str().unwrap().contains("leave out `folder`"),
+            "{v}"
+        );
+        assert!(v["hint"].as_str().unwrap().contains("`newest`"), "{v}");
+        assert_eq!(v["newest"][0]["from"], "Selin Kaya <s.kaya@steuer.example>");
+
+        let found = SearchPayload {
+            hint: None,
+            newest: None,
+            server_matched: 1,
+            ..empty
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&render_search_payload(vec![row(1)], &found).unwrap()).unwrap();
+        assert!(v.get("hint").is_none() && v.get("newest").is_none(), "{v}");
+
+        // Without the newest rows the hint points at list_emails instead.
+        let hint = empty_search_hint(false, false);
+        assert!(hint.contains("list_emails on INBOX"), "{hint}");
+        assert!(!hint.contains("folder`"), "{hint}");
     }
 
     /// Both tools render through this, so a divergence between them would be
@@ -1775,6 +2105,24 @@ mod tests {
     }
 
     #[test]
+    fn only_searches_for_words_get_help_when_empty() {
+        let mut req = empty_req();
+        req.since = Some("2026-01-01".to_string());
+        req.is_read = Some(false);
+        assert!(
+            !searches_words(&req),
+            "date and flag filters: empty is the answer"
+        );
+        req.from = Some("Steuerberaterin".to_string());
+        assert!(searches_words(&req));
+        let mut req = empty_req();
+        req.text_all = Some(vec!["Rechnung".to_string()]);
+        assert!(searches_words(&req));
+        req.text_all = Some(vec![]);
+        assert!(!searches_words(&req));
+    }
+
+    #[test]
     fn build_search_criteria_no_criteria_errors() {
         let req = empty_req();
         let err = build_search_criteria(&req, true).unwrap_err();
@@ -1841,6 +2189,10 @@ mod tests {
         req.since = Some("not-a-date".to_string());
         let err = build_search_criteria(&req, true).unwrap_err();
         assert!(err.contains("Invalid 'since' date"));
+        // Shaped like a date but not one: refused here, not by the server.
+        req.since = Some("2026-02-30".to_string());
+        let err = build_search_criteria(&req, true).unwrap_err();
+        assert!(err.contains("does not exist"), "{err}");
     }
 
     #[test]
@@ -1863,6 +2215,66 @@ mod tests {
         assert!(criteria.contains("FROM \"alice@x.com\""));
         assert!(criteria.contains("TO \"bob@x.com\""));
         assert!(criteria.contains("TEXT \"hello\""));
+    }
+
+    /// A model writes "Stadtwerke Rechnung" or "Newsletter vom Radhaus".
+    /// Taken as one substring neither occurs in any mail; as words, all of
+    /// which must occur, both find what was meant.
+    #[test]
+    fn search_terms_split_words_and_drop_filler() {
+        let terms = |raw: &str| search_terms(raw);
+        assert_eq!(terms("Stadtwerke Rechnung"), ["Stadtwerke", "Rechnung"]);
+        assert_eq!(terms("Newsletter vom Radhaus"), ["Newsletter", "Radhaus"]);
+        assert_eq!(terms("die Mail von Mama"), ["Mama"]);
+        assert_eq!(terms("Rechnung, Stadtwerke!"), ["Rechnung", "Stadtwerke"]);
+        // Short content survives; only listed filler words go.
+        assert_eq!(terms("Raum 4B"), ["Raum", "4B"]);
+        assert_eq!(terms("Update Q2"), ["Update", "Q2"]);
+        // Inner punctuation belongs to the word.
+        assert_eq!(terms("E-Mail-Adresse 84,20"), ["E-Mail-Adresse", "84,20"]);
+        // A word joined by hyphens counts as its parts where each is a word
+        // of its own; short parts and dates keep it whole.
+        assert_eq!(terms("Telekom-Rechnung"), ["Telekom", "Rechnung"]);
+        assert_eq!(
+            terms("die Hals-Nasen-Ohren-Praxis vom Montag"),
+            ["Hals", "Nasen", "Ohren", "Praxis", "Montag"]
+        );
+        assert_eq!(terms("Wi-Fi T-Online"), ["Wi-Fi", "T-Online"]);
+        assert_eq!(terms("2025-11-03"), ["2025-11-03"]);
+        assert_eq!(
+            terms("Telekom- und Stromrechnung"),
+            ["Telekom", "Stromrechnung"]
+        );
+        assert_eq!(terms("\"Telekom-Rechnung\""), ["Telekom-Rechnung"]);
+        // A quoted phrase stays whole, filler words inside it included.
+        assert_eq!(
+            terms("\"Termin am Donnerstag\" Jonas"),
+            ["Termin am Donnerstag", "Jonas"]
+        );
+        // Only filler words: searched as written rather than not at all.
+        assert_eq!(terms("von"), ["von"]);
+        assert_eq!(terms("Von der"), ["Von", "der"]);
+        assert_eq!(terms("  "), Vec::<String>::new());
+    }
+
+    #[test]
+    fn build_search_criteria_text_and_subject_take_several_words() {
+        let mut req = empty_req();
+        req.text = Some("Stadtwerke Rechnung".to_string());
+        req.subject = Some("Herbstaktion vom Radhaus".to_string());
+        let (criteria, _) = build(&req, true);
+        assert_eq!(
+            criteria,
+            "TEXT \"Stadtwerke\" TEXT \"Rechnung\" SUBJECT \"Herbstaktion\" SUBJECT \"Radhaus\""
+        );
+        // On a server without UTF-8 search every word goes to the client-side
+        // filter on its own, lowercased, still all required.
+        let mut req = empty_req();
+        req.text = Some("Glückwunsch Mama".to_string());
+        req.since = Some("2026-01-01".to_string());
+        let (criteria, filter) = build(&req, false);
+        assert!(criteria.contains("TEXT \"Mama\""), "{criteria}");
+        assert_eq!(filter.post.body.all, vec!["glückwunsch".to_string()]);
     }
 
     #[test]
@@ -2047,10 +2459,10 @@ mod tests {
 
     /// The documented `get_email` → `download_attachment` flow used to
     /// dead-end on nameless parts: `get_email` showed the "attachment"
-    /// placeholder while download
-    /// compared against "" — the shown name could never match. With one
-    /// shared default the placeholder matches; TWO placeholders are
-    /// ambiguous and must point at `index` instead of silently picking one.
+    /// placeholder while download compared against "" — the shown name
+    /// could never match. With one shared default the placeholder matches;
+    /// TWO placeholders are ambiguous and must point at `index` instead of
+    /// silently picking one.
     #[test]
     fn attachment_selection_handles_placeholder_names() {
         let single = names(&["report.pdf", "attachment"]);
@@ -2187,6 +2599,24 @@ mod tests {
         assert_eq!(filesystem_safe_filename("."), "attachment");
         assert_eq!(filesystem_safe_filename(""), "attachment");
         assert_eq!(filesystem_safe_filename("   "), "attachment");
+    }
+
+    /// File systems refuse names over 255 bytes; a long sender-chosen name
+    /// made the download fail outright. The cut keeps the extension and
+    /// never splits a character.
+    #[test]
+    fn filesystem_safe_filename_caps_long_names_keeping_the_extension() {
+        let long = format!("{}.pdf", "ä".repeat(300));
+        let safe = filesystem_safe_filename(&long);
+        assert!(safe.len() <= MAX_FILENAME_BYTES, "{} bytes", safe.len());
+        assert!(safe.starts_with('ä') && safe.ends_with("ä.pdf"), "{safe}");
+
+        // No usable extension: a plain cut.
+        let safe = filesystem_safe_filename(&"x".repeat(400));
+        assert_eq!(safe.len(), MAX_FILENAME_BYTES);
+
+        // Short names are untouched.
+        assert_eq!(filesystem_safe_filename("report.pdf"), "report.pdf");
     }
 
     #[test]
