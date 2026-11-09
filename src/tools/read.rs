@@ -1332,6 +1332,7 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
     let limit = req.limit.unwrap_or(20).clamp(1, 500);
     let offset = req.offset.unwrap_or(0);
     let group_by_thread = req.group_by_thread.unwrap_or(false);
+    let folder = super::named(req.folder.as_deref());
     // As in list_emails: collapsing eats rows, so fetch ~3× per folder to
     // still fill the requested page. Capped at the same ceiling.
     let fetch_limit = if group_by_thread {
@@ -1344,7 +1345,7 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
     // silently dropping matches instead of paging past them. Refuse rather
     // than return a plausible-looking but incomplete page. The same holds
     // for several accounts.
-    if offset > 0 && req.folder.is_none() {
+    if offset > 0 && folder.is_none() {
         return Err(error_json(
             "offset requires a single `folder` — across all folders it would skip messages in each one instead of paging through the combined result; narrow the criteria (e.g. a date range) instead",
         ));
@@ -1355,7 +1356,7 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
 
     let single = targets.len() == 1;
     let search = Search {
-        folder: req.folder.as_deref(),
+        folder,
         single,
         fetch_limit,
         offset,
@@ -1375,7 +1376,7 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
     .await;
     let done = std::mem::take(&mut answers.done);
     if done.is_empty() {
-        let folder = req.folder.as_deref().unwrap_or_default();
+        let folder = folder.unwrap_or_default();
         return Err(if single {
             answers
                 .failure()
@@ -1429,7 +1430,7 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
             limit_capped,
             group_by_thread,
             compact: req.compact.unwrap_or(false),
-            hint: nothing_found.then(|| empty_search_hint(req.folder.is_some(), newest.is_some())),
+            hint: nothing_found.then(|| empty_search_hint(folder.is_some(), newest.is_some())),
             newest,
         },
     )

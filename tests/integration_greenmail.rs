@@ -1084,6 +1084,42 @@ async fn moves_that_cannot_move_anything_are_refused() {
     client.disconnect().await;
 }
 
+/// Both listings come newest first: the unread one picks its UIDs newest
+/// first and must keep that order, whatever order the server answers in
+/// (`GreenMail` and Dovecot answer ascending).
+#[tokio::test]
+#[ignore = "requires GreenMail via ./test-server.sh"]
+async fn unread_listings_come_newest_first() {
+    let _serial = serial().await;
+    let Some(mut client) = client_or_skip().await else {
+        return;
+    };
+    let (all, _, _) = client
+        .list_emails("INBOX", 50, 0, false)
+        .await
+        .expect("list_emails failed");
+    let uids: Vec<u32> = all.iter().map(|e| e.uid).collect();
+    assert!(uids.windows(2).all(|w| w[0] > w[1]), "{uids:?}");
+    let newest: Vec<u32> = uids.iter().take(3).copied().collect();
+    assert!(newest.len() >= 2, "test-server.sh seeds 4 emails");
+    client
+        .mark_flags("INBOX", &newest, "\\Seen", false)
+        .await
+        .expect("marking unread failed");
+    let (unread, _, matched) = client
+        .list_emails("INBOX", 50, 0, true)
+        .await
+        .expect("unread listing failed");
+    let unread_uids: Vec<u32> = unread.iter().map(|e| e.uid).collect();
+    assert!(matched as usize >= newest.len(), "{unread_uids:?}");
+    assert!(
+        unread_uids.windows(2).all(|w| w[0] > w[1]),
+        "unread listing not newest first: {unread_uids:?}"
+    );
+    assert_eq!(&unread_uids[..newest.len()], newest.as_slice());
+    client.disconnect().await;
+}
+
 /// A folder that does not exist is refused with the names of those that do,
 /// for reading as for a move target, and the move refuses before anything
 /// is copied.

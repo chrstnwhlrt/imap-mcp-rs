@@ -237,6 +237,15 @@ ok(
     str([r.get("date") for r in rows]),
 )
 uid0 = rows[0]["uid"]
+# The seeds arrive unread: the unread listing comes newest first as well
+# (it came oldest first, in the order the server answered the FETCH).
+unread_rows = call("list_emails", {"folder": "INBOX", "unread_only": True})["emails"]
+unread_uids = [r["uid"] for r in unread_rows]
+ok(
+    "list_emails unread_only: newest first",
+    len(unread_uids) >= 2 and unread_uids == sorted(unread_uids, reverse=True),
+    str(unread_uids),
+)
 
 # --- 4 get_email ---
 full = call("get_email", {"folder": "INBOX", "uid": uid0})
@@ -301,6 +310,37 @@ ok(
     named.get("to") == ["bob@example.com"] and isinstance(named.get("uid"), int),
     str(named)[:150],
 )
+# A revision sends the new text and replaces_uid: recipients and subject
+# come from the draft it replaces.
+revised_named = call("draft_email", {"body": "hi again", "replaces_uid": named["uid"]})
+ok(
+    "draft_email revision: to and subject kept from the replaced draft",
+    revised_named.get("to") == ["bob@example.com"]
+    and revised_named.get("subject") == "E2E named"
+    and revised_named.get("replaced_uid") == named["uid"],
+    str(revised_named)[:200],
+)
+named = revised_named
+# A revision keeps the cc it leaves out, also when it repeats to and subject.
+with_cc = call(
+    "draft_email",
+    {"to": ["bob@example.com"], "cc": ["carol@example.com"], "subject": "E2E cc", "body": "v1"},
+)
+cc_kept = call(
+    "draft_email",
+    {"to": ["bob@example.com"], "subject": "E2E cc", "body": "v2", "replaces_uid": with_cc["uid"]},
+)
+ok(
+    "draft_email revision: the cc it leaves out is kept",
+    cc_kept.get("cc") == ["carol@example.com"] and cc_kept.get("replaced_uid") == with_cc["uid"],
+    str(cc_kept)[:200],
+)
+missing = call("draft_email", {"body": "no recipients"})
+ok(
+    "draft_email without to and subject: one error naming both",
+    "to and subject are missing" in (missing.get("error") or ""),
+    str(missing),
+)
 bad_rcpt = call(
     "draft_email",
     {"to": ["bob@example.com, carol@example.com"], "subject": "x", "body": "y"},
@@ -332,6 +372,16 @@ f1 = call(
     {"folder": "INBOX", "uid": uid0, "to": ["carol@example.com"], "body": "fyi"},
 )
 ok("draft_forward: uid", isinstance(f1.get("uid"), int), str(f1)[:150])
+f2 = call(
+    "draft_forward",
+    {"folder": "INBOX", "uid": uid0, "body": "fyi, again", "replaces_uid": f1["uid"]},
+)
+ok(
+    "draft_forward revision: to kept from the replaced draft",
+    f2.get("to") == ["carol@example.com"] and f2.get("replaced_uid") == f1["uid"],
+    str(f2)[:200],
+)
+f1 = f2
 
 # --- 12 list_drafts ---
 ld = call("list_drafts")
@@ -342,11 +392,13 @@ ok(
 )
 
 # --- 13 delete_draft (real + stale) ---
-del1 = call("delete_draft", {"uids": [d1["uid"], r1["uid"], f1["uid"], named["uid"]]})
+del1 = call(
+    "delete_draft", {"uids": [d1["uid"], r1["uid"], f1["uid"], named["uid"], cc_kept["uid"]]}
+)
 ok(
     "delete_draft: all succeeded, failed empty",
     sorted(del1.get("succeeded", []))
-    == sorted([d1["uid"], r1["uid"], f1["uid"], named["uid"]])
+    == sorted([d1["uid"], r1["uid"], f1["uid"], named["uid"], cc_kept["uid"]])
     and del1.get("failed") == [],
     str(del1),
 )
@@ -531,6 +583,21 @@ ok(
     "list_emails on a folder no account has: an error with the folders of each",
     "error" in nowhere and "Greenmail" in nowhere["error"] and "Zweit" in nowhere["error"],
     str(nowhere)[:300],
+)
+# A model fills an optional parameter with "" rather than leaving it out.
+blank = call("list_emails", {"folder": "INBOX", "account": "", "limit": 50})
+ok(
+    "list_emails with account \"\": both accounts, as when left out",
+    [a["account"] for a in blank.get("accounts", [])] == ["Greenmail", "Zweit"],
+    str(blank)[:200],
+)
+as_folder = call("list_emails", {"folder": "Zweit"})
+ok(
+    "an account name passed as the folder: the error points to the account",
+    (as_folder.get("error") or "").startswith(
+        '"Zweit" is an account: to read its inbox, pass account "Zweit" and folder "INBOX".'
+    ),
+    str(as_folder)[:200],
 )
 paged = call("list_emails", {"folder": "INBOX", "offset": 1})
 ok(

@@ -112,6 +112,19 @@ impl<T> Answers<T> {
     /// the call asked for, as the accounts were asked for it. `retryable`
     /// when one of the failures is.
     pub fn nothing_read(&self, folder: &str) -> String {
+        // "Was gibt es Neues bei der Arbeit?" made Gemma pass the account
+        // as the folder; the way to what it meant goes first.
+        let wanted = folder.trim().to_lowercase();
+        let hint = self
+            .missing
+            .iter()
+            .find(|(account, _)| account.to_lowercase() == wanted)
+            .map(|(account, _)| {
+                format!(
+                    "\"{folder}\" is an account: to read its inbox, pass account \"{account}\" \
+                     and folder \"INBOX\". "
+                )
+            });
         let mut parts: Vec<String> = Vec::new();
         let mut retryable = false;
         for (account, raw) in &self.failed {
@@ -138,7 +151,11 @@ impl<T> Answers<T> {
                 ));
             }
         }
-        let error = crate::email::sanitize_external_str(&parts.join("; "));
+        let error = crate::email::sanitize_external_str(&format!(
+            "{}{}",
+            hint.unwrap_or_default(),
+            parts.join("; ")
+        ));
         serde_json::to_string(&json!({"error": error, "retryable": retryable})).unwrap_or_default()
     }
 }
@@ -226,6 +243,23 @@ mod tests {
             "Arbeit: Connection refused; Privat has no folder \"X\" (its folders: INBOX, Archiv)"
         );
         assert_eq!(v["retryable"], true);
+    }
+
+    /// An account name passed as the folder: the error says how to read
+    /// that account's inbox before it lists the folders.
+    #[test]
+    fn nothing_read_points_from_an_account_name_to_the_account() {
+        let v: Value =
+            serde_json::from_str(&answers(&[], &[], &["Privat", "Arbeit"]).nothing_read("arbeit"))
+                .unwrap();
+        let error = v["error"].as_str().unwrap();
+        assert!(
+            error.starts_with(
+                "\"arbeit\" is an account: to read its inbox, pass account \"Arbeit\" and folder \
+                 \"INBOX\". No account has the folder"
+            ),
+            "{error}"
+        );
     }
 
     #[test]

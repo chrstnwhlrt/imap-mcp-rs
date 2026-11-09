@@ -76,7 +76,7 @@ Every client gets the same tool surface, written for the smallest model it was m
 
 - A tool that no configured account may use is not offered, and no text points at it. With every account `read_only`, a client sees the eight reading tools and `download_attachment`, and the instructions say in the user's own terms what cannot be done ("to reply, write, forward, move, mark or delete, tell the user that you can only read their mail here"), so the model tells the user instead of claiming it did
 - With one account, `account` is left out of every schema. With several, the tools that work on one email require it, and the four reading tools take it as an option (see [Multi-Account](#multi-account))
-- The sentences about the signature appear only where every account that can draft has one, so the model leaves the closing greeting to the server
+- Where every account that can draft has a signature, the instructions and the draft texts say that the server adds it; where only some have one, the draft texts name those accounts. Either way the model leaves the closing greeting to the server instead of signing twice
 - Schema detail that changes nothing for the caller is left out (`$schema`, integer formats, `null` beside an optional type), and the parameters are listed in the order a model should read them
 
 A search for words that finds nothing comes with a `hint` and the ten newest INBOX emails (`newest`), from which a model picks the person the user named by role. Responses list their counts before the rows, since a small model often answers from the start of a result.
@@ -154,7 +154,7 @@ The MIME tree follows RFC 2387: inline parts sit in a `multipart/related` (carry
 
 Only raster images can be inlined (`image/*` minus SVG). A marker always renders an `<img>` tag, so a PDF marked `inline` would arrive as a broken picture; SVG is refused because it can carry script and inline files often originate from a received message via `download_attachment`. Type detection is extension-based, so the file needs a correct suffix.
 
-**Revising a draft** — IMAP has no update-in-place: replacing a draft means writing a new message and removing the old one. Pass `replaces_uid` to `draft_reply` / `draft_forward` / `draft_email` and the server does exactly that, in the safe order — the new version is appended first, the old one deleted only after it succeeded, so a failure can never leave you with neither. The response then carries `replaced_uid`, or `replace_warning` if the new draft was saved but the old one could not be removed. Doing it by hand (`delete_draft` then `draft_*`) risks losing the text if the second call fails. One caveat for inline images: `get_email` on a saved draft shows them as `[alt]` placeholders, not as `![alt](cid:…)` markers — when revising such a draft, re-write the markers and pass the inline attachments again, otherwise the images arrive as regular attachments.
+**Revising a draft** — IMAP has no update-in-place: replacing a draft means writing a new message and removing the old one. Pass `replaces_uid` to `draft_reply` / `draft_forward` / `draft_email` and the server does exactly that, in the safe order — the new version is appended first, the old one deleted only after it succeeded, so a failure can never leave you with neither. The response then carries `replaced_uid`, or `replace_warning` if the new draft was saved but the old one could not be removed. Doing it by hand (`delete_draft` then `draft_*`) risks losing the text if the second call fails. A revision keeps what it leaves out of `to`, `cc` and `subject` (`draft_email`) or `to` and `cc` (`draft_forward`): those come from the draft it replaces. `bcc` and attachments are not carried over. One caveat for inline images: `get_email` on a saved draft shows them as `[alt]` placeholders, not as `![alt](cid:…)` markers — when revising such a draft, re-write the markers and pass the inline attachments again, otherwise the images arrive as regular attachments.
 
 Every `draft_*` response also carries the new draft's own `uid`, so a revision loop can feed it straight back as the next `replaces_uid` without a `list_drafts` in between. `APPEND` does not return the UID through the IMAP client library, so it is looked up by `Message-ID` right after saving; on a server where that lookup finds nothing the field is simply absent — the draft is saved either way.
 
@@ -745,7 +745,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 346 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 349 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
@@ -781,7 +781,7 @@ End-to-end tests against the GreenMail container live in `tests/integration_gree
 
 ```bash
 ./test-server.sh                                            # start container
-cargo test --test integration_greenmail -- --ignored        # run all 22 tests
+cargo test --test integration_greenmail -- --ignored        # run all 23 tests
 podman rm -f imap-test                                      # stop container when done
 ```
 
@@ -792,7 +792,7 @@ One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 to
 ```bash
 ./test-server.sh                     # fresh container (run right before — the sub-day search asserts a 1-hour window)
 cargo build --release                # or nix build, then pass result/bin/imap-mcp-rs
-python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 61 checks across all 19 tools
+python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 68 checks across all 19 tools
 podman rm -f imap-test
 ```
 
@@ -837,9 +837,9 @@ src/
         │                   delete_draft (25-UID cap), attachment handling, header sanitization
         └── render.rs       Locale presets (EN/DE), Outlook-Web-style HTML bodies, date formatting
 tests/
-├── integration_greenmail.rs  End-to-end tests against GreenMail container (22 tests, `#[ignore]`-gated)
+├── integration_greenmail.rs  End-to-end tests against GreenMail container (23 tests, `#[ignore]`-gated)
 └── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls, then
-                              two accounts and two read-only accounts (61 checks)
+                              two accounts and two read-only accounts (68 checks)
 mcp-tool-test/gemma/          Measurement kit for small models: mail world, request catalog, runners
                               (see "Measuring with a small model")
 ```

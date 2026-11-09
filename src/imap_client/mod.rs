@@ -1127,7 +1127,11 @@ impl ImapClient {
 
         let uid_set = uid_set_string(&paged_uids);
         let stream = session.uid_fetch(&uid_set, SUMMARY_FETCH_ITEMS).await?;
-        let fetches: Vec<Fetch> = stream.try_collect().await?;
+        let mut fetches: Vec<Fetch> = stream.try_collect().await?;
+        // The server answers in its own order, ascending on Dovecot and
+        // GreenMail: without this the unread listing came oldest first,
+        // although the UIDs were picked newest first.
+        fetches.sort_by_key(|f| std::cmp::Reverse(f.uid));
         let summaries = summarize_fetches(&fetches, folder, &PostFetchFilter::EMPTY);
         Ok((summaries, total, matched))
     }

@@ -116,6 +116,7 @@ impl ImapMcpServer {
         &self,
         account: Option<&str>,
     ) -> Result<(&AccountConfig, Arc<Mutex<ImapClient>>), String> {
+        let account = named(account);
         let available = || {
             self.config
                 .accounts
@@ -181,6 +182,7 @@ impl ImapMcpServer {
     /// several are configured and the call names none, all of them in the
     /// order of the configuration (see `across.rs`).
     pub fn read_targets(&self, account: Option<&str>) -> Result<Vec<Target<'_>>, String> {
+        let account = named(account);
         if account.is_some() || !self.several_accounts() {
             return self.resolve_client(account).map(|target| vec![target]);
         }
@@ -194,6 +196,13 @@ impl ImapMcpServer {
 
 /// An account and its client, as a read works on them.
 pub type Target<'a> = (&'a AccountConfig, Arc<Mutex<ImapClient>>);
+
+/// An optional name as a call gives it, an empty one counting as none: a
+/// model fills an optional parameter with `""` rather than leaving it out,
+/// and `account: ""` meant an account that does not exist.
+pub(crate) fn named(value: Option<&str>) -> Option<&str> {
+    value.filter(|v| !v.trim().is_empty())
+}
 
 #[derive(Debug, serde::Deserialize, schemars::JsonSchema)]
 pub struct ListAccountsRequest {}
@@ -636,6 +645,20 @@ mod tests {
         let err = multi.resolve_client(Some("Typo")).unwrap_err();
         assert!(err.contains("\"Typo\" not found"), "{err}");
         assert!(err.contains("Acct0") && err.contains("Acct1"), "{err}");
+    }
+
+    /// A model fills an optional parameter with `""` rather than leaving it
+    /// out: an empty account name counts as none, so reads cover every
+    /// account and a call on one email asks for the account by name.
+    #[test]
+    fn an_empty_account_counts_as_none() {
+        let single = server_with_accounts(1);
+        assert!(single.resolve_client(Some("")).is_ok());
+        let multi = server_with_accounts(2);
+        assert_eq!(multi.read_targets(Some("  ")).unwrap().len(), 2);
+        let err = multi.resolve_client(Some("")).unwrap_err();
+        assert!(err.contains("Available: Acct0, Acct1"), "{err}");
+        assert!(!err.contains("not found"), "{err}");
     }
 
     /// `list_accounts` promises what each account may do, so the response

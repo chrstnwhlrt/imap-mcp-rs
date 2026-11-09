@@ -15,8 +15,8 @@
 //! - a tool no account may use is left out, and no served text points at it;
 //! - `account` is left out when there is only one account, and required
 //!   where a call works on one email's account while there are several;
-//! - the sentences about the signature appear only when every account that
-//!   can draft signs its drafts.
+//! - the sentences about the signature appear when every account that can
+//!   draft signs its drafts; where only some do, the draft texts name them.
 
 use std::borrow::Cow;
 use std::sync::Arc;
@@ -129,6 +129,12 @@ const SIGNED: &str = ", without a closing greeting or name: the server adds the 
 /// the draft bodies, and strip what changes nothing for the caller.
 pub fn apply<S>(router: &mut ToolRouter<S>, config: &ServerConfig) {
     let abilities = Abilities::of(config);
+    let signers: Vec<&str> = config
+        .accounts
+        .iter()
+        .filter(|a| !a.read_only && signs_drafts(a))
+        .map(|a| a.name.as_str())
+        .collect();
     router.map.retain(|name, _| abilities.serves(name));
     for (name, route) in &mut router.map {
         let name: &str = name;
@@ -155,8 +161,12 @@ pub fn apply<S>(router: &mut ToolRouter<S>, config: &ServerConfig) {
             require(&mut schema, "account");
         }
         remove_properties(&mut schema, &hidden);
-        if abilities.signed && DRAFT_BODIES.contains(&name) {
-            sign_body(&mut schema);
+        if DRAFT_BODIES.contains(&name) {
+            if abilities.signed {
+                sign_body(&mut schema);
+            } else if !signers.is_empty() {
+                name_signers(&mut schema, &signers);
+            }
         }
         route.attr.input_schema = Arc::new(schema);
     }
@@ -200,6 +210,21 @@ fn sign_body(schema: &mut JsonObject) {
     {
         let base = text.strip_suffix('.').unwrap_or(text);
         *text = format!("{base}{SIGNED}.");
+    }
+}
+
+/// Where only some accounts sign their drafts: the `body` description names
+/// them. Said of every draft it would be wrong for the others, and said of
+/// none, a model signed a draft that got the signature below it as well.
+fn name_signers(schema: &mut JsonObject, signers: &[&str]) {
+    if let Some(Value::Object(body)) = schema.get_mut("properties").and_then(|p| p.get_mut("body"))
+        && let Some(Value::String(text)) = body.get_mut("description")
+    {
+        *text = format!(
+            "{text} The server adds the user's signature to drafts from {}: write those without \
+             a closing greeting or name.",
+            either(signers, "and")
+        );
     }
 }
 
@@ -718,6 +743,50 @@ mod tests {
             assert!(!body(&unsigned, name).contains("signature"), "{name}");
             assert!(
                 body(&unsigned, name).ends_with("in the user's words."),
+                "{name}"
+            );
+        }
+    }
+
+    /// Where only some accounts that can draft sign, the draft texts name
+    /// them; a read-only account's signature changes nothing, since it
+    /// drafts nothing.
+    #[test]
+    fn the_draft_body_names_the_accounts_that_sign_where_only_some_do() {
+        let body = |tools: &[rmcp::model::Tool], name: &str| {
+            tool(tools, name).input_schema["properties"]["body"]["description"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let mixed = served(&config(&[
+            account("Gmail", ""),
+            account("Office", SIGNATURE),
+        ]));
+        for name in DRAFT_BODIES {
+            assert!(
+                body(&mixed, name).ends_with(
+                    "The server adds the user's signature to drafts from Office: write those \
+                     without a closing greeting or name."
+                ),
+                "{name}: {}",
+                body(&mixed, name)
+            );
+        }
+        assert!(
+            !instructions(&config(&[
+                account("Gmail", ""),
+                account("Office", SIGNATURE)
+            ]))
+            .contains("signature")
+        );
+        let read_only_signer = served(&config(&[
+            account("Gmail", ""),
+            account("Office", &format!("read_only = true\n{SIGNATURE}")),
+        ]));
+        for name in DRAFT_BODIES {
+            assert!(
+                !body(&read_only_signer, name).contains("signature"),
                 "{name}"
             );
         }

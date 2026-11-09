@@ -3,6 +3,45 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.0.1
+
+Fixes from a review of 3.0.0 and of the tool calls recorded while measuring
+it with Gemma 4 E4B.
+
+### Fixed
+
+- **`list_emails` with `unread_only` listed the oldest unread email
+  first.** The server picked the newest unread messages but passed them on
+  in the order the IMAP server answered the FETCH, ascending on Dovecot and
+  GreenMail, so "what is new?" began with the oldest of them. The recorded
+  calls had it 14 times. The rows come newest first again, as the
+  description says.
+- **A revised draft had to repeat its recipients and subject.**
+  `draft_email` and `draft_forward` with `replaces_uid` but without `to`
+  (or `subject`) failed, and in the recorded calls Gemma needed three
+  attempts to revise a draft. A revision now keeps what it leaves out of
+  `to`, `cc` and `subject` from the draft it replaces; until now a left-out
+  `cc` was dropped silently. `bcc` and attachments are not carried over.
+  Without `replaces_uid` the error names everything missing at once. The
+  schemas are unchanged.
+- **Where only some accounts sign, a draft could end in two closings.**
+  The draft texts mention the signature only where every account that can
+  draft has one. With a signature on one account alone, a model was told
+  nothing, signed the draft itself and got the signature below its own
+  greeting. The draft texts now name the accounts that sign ("The server
+  adds the user's signature to drafts from Office: write those without a
+  closing greeting or name.").
+- `account: ""` counts as no account: a read covers every account, and a
+  call on one email asks for the account by name instead of reporting an
+  account "" that does not exist. `folder: ""` in `search_emails` searches
+  every folder.
+- An account name passed as the folder of a read over several accounts
+  ("Arbeit") is answered with how to read that account's inbox, before the
+  folder lists.
+
+349 unit tests, 23 GreenMail integration tests and 68 checks in the MCP
+end-to-end script.
+
 ## 3.0.0
 
 One tool surface for every client, written for the smallest model it was

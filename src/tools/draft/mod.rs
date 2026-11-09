@@ -214,7 +214,9 @@ fn stamp_identity_headers<'a>(
 // Field order and texts as for the read tools (see `read.rs`): what a model
 // reads, in the order it should fill them. The `body` texts end in a full
 // stop that `surface.rs` turns into the signature clause where the server
-// signs the draft.
+// signs the draft. `to` and `subject` are required in the schema but
+// `Option` here: a revision that leaves them out takes them from the draft
+// it replaces (see `Revision`).
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DraftReplyRequest {
@@ -253,9 +255,10 @@ pub struct DraftForwardRequest {
     #[schemars(description = "Email UID to forward (from list_emails or search_emails results)")]
     pub uid: u32,
     #[schemars(
+        required,
         description = "Email addresses, one per entry, such as \"ben@example.de\" or \"Ben <ben@example.de>\". Look an address up before asking the user: search_emails from: the name; for a person named by role, list_emails INBOX shows who wrote."
     )]
-    pub to: Vec<String>,
+    pub to: Option<Vec<String>>,
     #[schemars(description = "A note above the forwarded email, in the user's words.")]
     pub body: Option<String>,
     #[schemars(description = "Addresses to put in copy (CC), one per entry.")]
@@ -283,11 +286,12 @@ pub struct DraftEmailRequest {
     #[schemars(description = "The account to write from.")]
     pub account: Option<String>,
     #[schemars(
+        required,
         description = "Email addresses, one per entry, such as \"ben@example.de\" or \"Ben <ben@example.de>\". Look an address up before asking the user: search_emails from: the name; for a person named by role, list_emails INBOX shows who wrote."
     )]
-    pub to: Vec<String>,
-    #[schemars(description = "Email subject line (plain text)")]
-    pub subject: String,
+    pub to: Option<Vec<String>>,
+    #[schemars(required, description = "Email subject line (plain text)")]
+    pub subject: Option<String>,
     #[schemars(description = "The message in the user's words.")]
     pub body: String,
     #[schemars(description = "Addresses to put in copy (CC), one per entry.")]
@@ -327,6 +331,104 @@ async fn fetch_original(
         ))),
         Err(e) => Err(error_json(&client.check_error(e).to_string())),
     }
+}
+
+/// What a revision leaves out, taken from the draft it replaces. A model
+/// revising a draft sends the new text and `replaces_uid`, not the
+/// addresses and the subject again: Gemma failed twice on the missing
+/// `to` and `subject` before its third call carried them.
+struct Revision {
+    to: Vec<String>,
+    cc: Vec<String>,
+    subject: String,
+}
+
+impl Revision {
+    /// The recipients and the subject of draft `uid`, as entries the
+    /// recipient check takes (`Name <address>`); `None` when there is no
+    /// such draft.
+    async fn of(client_arc: &Arc<Mutex<ImapClient>>, uid: u32) -> Result<Option<Self>, String> {
+        let entry = |a: &crate::email::EmailAddress| match a.name.as_deref() {
+            Some(name) if !name.trim().is_empty() => format!("{name} <{}>", a.address),
+            _ => a.address.clone(),
+        };
+        let mut client = client_arc.lock().await;
+        let drafts = match client.detect_drafts_folder().await {
+            Ok(Some(folder)) => folder,
+            Ok(None) => {
+                return Err(error_json(
+                    "No Drafts folder found on server. Create one manually via your webmail \
+                     client.",
+                ));
+            }
+            Err(e) => return Err(error_json(&client.check_error(e).to_string())),
+        };
+        match client.get_email(&drafts, uid).await {
+            Ok(draft) => Ok(draft.map(|draft| Self {
+                to: draft.to.iter().map(entry).collect(),
+                cc: draft.cc.iter().map(entry).collect(),
+                subject: draft.subject,
+            })),
+            Err(e) => Err(error_json(&client.check_error(e).to_string())),
+        }
+    }
+}
+
+/// The addressing of a draft as a call gives it.
+struct DraftFields {
+    to: Option<Vec<String>>,
+    cc: Option<Vec<String>>,
+    subject: Option<String>,
+    /// Whether the tool takes a subject; a forward derives its own.
+    takes_subject: bool,
+}
+
+/// `fields` complete. A revision (`replaces_uid`) keeps what it leaves out
+/// of `to`, `cc` and the subject from the draft it replaces; a new draft
+/// that leaves out `to` or the subject is the error naming everything
+/// missing at once.
+async fn revised(
+    client_arc: &Arc<Mutex<ImapClient>>,
+    replaces_uid: Option<u32>,
+    mut fields: DraftFields,
+) -> Result<DraftFields, String> {
+    fields.to = fields.to.filter(|t| !t.is_empty());
+    let subject_missing = fields.takes_subject && fields.subject.is_none();
+    let required_missing = fields.to.is_none() || subject_missing;
+    let (missing, what) = match (fields.to.is_none(), subject_missing) {
+        (true, true) => ("to and subject are", "recipients and the subject"),
+        (true, false) => ("to is", "recipients"),
+        _ => ("subject is", "subject"),
+    };
+    let Some(uid) = replaces_uid else {
+        if required_missing {
+            return Err(error_json(&format!(
+                "{missing} missing: pass the {what}. A revision with replaces_uid keeps those of \
+                 the draft it replaces."
+            )));
+        }
+        return Ok(fields);
+    };
+    if !required_missing && fields.cc.is_some() {
+        return Ok(fields);
+    }
+    let Some(old) = Revision::of(client_arc, uid).await? else {
+        if required_missing {
+            return Err(error_json(&format!(
+                "{missing} missing, and there is no draft with uid {uid} to keep them from: pass \
+                 the {what}, or a draft's uid from list_drafts as replaces_uid."
+            )));
+        }
+        // Only the cc was left to keep: the draft goes ahead without one,
+        // and the reply says the uid named no draft (`replace_warning`).
+        return Ok(fields);
+    };
+    fields.to = fields.to.or(Some(old.to));
+    fields.cc = fields.cc.or(Some(old.cc));
+    if fields.takes_subject {
+        fields.subject = fields.subject.or(Some(old.subject));
+    }
+    Ok(fields)
 }
 
 /// Common tail of all three draft tools: report the new draft's UID, honour
@@ -557,10 +659,17 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
             "Forward body exceeds {MAX_BODY_BYTES}-byte cap"
         )));
     }
+    let fields = DraftFields {
+        to: req.to,
+        cc: req.cc,
+        subject: None,
+        takes_subject: false,
+    };
+    let fields = revised(&client_arc, req.replaces_uid, fields).await?;
     // Before the original is fetched — see draft_reply.
     let (to, cc) = match (
-        required_recipients(&req.to),
-        parse_recipients(req.cc.as_deref()),
+        required_recipients(fields.to.as_deref().unwrap_or_default()),
+        parse_recipients(fields.cc.as_deref()),
     ) {
         (Ok(to), Ok(cc)) => (to, cc),
         (Err(e), _) | (_, Err(e)) => return Err(error_json(&e)),
@@ -662,14 +771,22 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Tool
             "Draft body exceeds {MAX_BODY_BYTES}-byte cap"
         )));
     }
-    if req.subject.len() > MAX_SUBJECT_BYTES {
+    let fields = DraftFields {
+        to: req.to,
+        cc: req.cc,
+        subject: req.subject,
+        takes_subject: true,
+    };
+    let fields = revised(&client_arc, req.replaces_uid, fields).await?;
+    let subject = fields.subject.unwrap_or_default();
+    if subject.len() > MAX_SUBJECT_BYTES {
         return Err(error_json(&format!(
             "Draft subject exceeds {MAX_SUBJECT_BYTES}-byte cap"
         )));
     }
     let (to, cc, bcc) = match (
-        required_recipients(&req.to),
-        parse_recipients(req.cc.as_deref()),
+        required_recipients(fields.to.as_deref().unwrap_or_default()),
+        parse_recipients(fields.cc.as_deref()),
         parse_recipients(req.bcc.as_deref()),
     ) {
         (Ok(to), Ok(cc), Ok(bcc)) => (to, cc, bcc),
@@ -696,7 +813,7 @@ pub async fn draft_email(server: &ImapMcpServer, req: DraftEmailRequest) -> Tool
     };
 
     // Sanitize subject + recipients against header injection from LLM input.
-    let subject = sanitize_header_value(&req.subject);
+    let subject = sanitize_header_value(&subject);
     let mut builder = MessageBuilder::new().subject(&subject);
     builder = apply_from(builder, &acct.from, acct.display_name.as_deref());
     builder = stamp_identity_headers(builder, &acct.message_id_domain);
@@ -1937,8 +2054,8 @@ mod tests {
         let s = offline_server();
         let email = |to: &[&str], subject: String| DraftEmailRequest {
             account: None,
-            to: to.iter().map(|t| (*t).to_string()).collect(),
-            subject,
+            to: Some(to.iter().map(|t| (*t).to_string()).collect()),
+            subject: Some(subject),
             body: "b".into(),
             cc: None,
             bcc: None,
@@ -1948,7 +2065,7 @@ mod tests {
         // Each refusal must reach the client as an error result
         // (`isError: true`), not as a success that happens to say "error".
         let err = draft_email(&s, email(&[], "s".into())).await.unwrap_err();
-        assert!(err.contains("At least one"), "{err}");
+        assert!(err.contains("to is missing"), "{err}");
         let err = draft_email(&s, email(&["Alice Example"], "s".into()))
             .await
             .unwrap_err();
@@ -1967,7 +2084,7 @@ mod tests {
                 account: None,
                 folder: "INBOX".into(),
                 uid: 1,
-                to: vec![],
+                to: Some(vec![]),
                 body: None,
                 cc: None,
                 attachments: None,
@@ -1976,7 +2093,18 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(err.contains("At least one"), "{err}");
+        assert!(err.contains("to is missing"), "{err}");
+
+        // Both left out of a new email: one error names both, so the next
+        // call can carry them at once.
+        let missing = DraftEmailRequest {
+            to: None,
+            subject: None,
+            ..email(&[], String::new())
+        };
+        let err = draft_email(&s, missing).await.unwrap_err();
+        assert!(err.contains("to and subject are missing"), "{err}");
+        assert!(err.contains("replaces_uid"), "{err}");
     }
 
     #[test]
