@@ -79,7 +79,7 @@ Every client gets the same tool surface, written for the smallest model it was m
 - Where every account that can draft has a signature, the instructions and the draft texts say that the server adds it; where only some have one, the draft texts name those accounts. Either way the model leaves the closing greeting to the server instead of signing twice
 - Schema detail that changes nothing for the caller is left out (`$schema`, integer formats, `null` beside an optional type), and the parameters are listed in the order a model should read them
 
-A search for words that finds nothing comes with a `hint` and the ten newest INBOX emails (`newest`), from which a model picks the person the user named by role. Responses list their counts before the rows, since a small model often answers from the start of a result.
+A search for words that finds nothing comes with a `hint` and the ten newest INBOX emails (`newest`), each with the start of its text, from which a model picks the person the user named by role and often reads the answer right away. Where a search word is the name of an account, the hint first says how to search that account. Responses list their counts before the rows, since a small model often answers from the start of a result.
 
 ### Accounts
 
@@ -93,7 +93,7 @@ A search for words that finds nothing comes with a `hint` and the ten newest INB
 | Tool | Description |
 |------|-------------|
 | `list_folders` | List all email folders with total and unread message counts. Well-known folders (Drafts, Sent, Trash) include a `role` field set to `"drafts"` / `"sent"` / `"trash"` so the LLM can pick the right folder without heuristically matching localized names. Names arrive in IMAP's modified UTF-7; when that differs from the readable form, `display_name` carries the decoded version (`Entw&APw-rfe` → `Entwürfe`). `name` is what the server accepts, and the other tools also take the readable form and role words (see [Folder Names](#folder-names)). `prefix` (matches the decoded name too) and `unread_only` narrow a large mailbox; `total` still reports the unfiltered count. |
-| `list_emails` | List emails in a folder with preview snippets (~200 chars). Supports pagination via `limit`/`offset`, filtering with `unread_only`, and conversation collapsing via `group_by_thread: true` (annotates `thread_message_count`, fetches 3× the limit internally). Summary rows include `to` truncated to 3 addresses plus `to_count` / `cc_count` for the real sizes — mass-mails don't inflate the response. Returns `total` (folder count) and `matched` (filter count, counted in messages even when grouping); if collapsing left more threads than `limit`, `threads_truncated_from` says how many there were. `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` when grouping; ~80% smaller) for large scans. |
+| `list_emails` | List emails in a folder with preview snippets (~200 chars). Supports pagination via `limit`/`offset`, filtering with `unread_only`, and conversation collapsing via `group_by_thread: true` (annotates `thread_message_count`, fetches 3× the limit internally). Summary rows include `to` truncated to 3 addresses plus `to_count` / `cc_count` for the real sizes — mass-mails don't inflate the response. Returns `total` (folder count) and `matched` (filter count, counted in messages even when grouping), with `unread_only` also as `unread`, ahead of `total`; if collapsing left more threads than `limit`, `threads_truncated_from` says how many there were. `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` when grouping; ~80% smaller) for large scans. |
 | `get_email` | Get a single email with full content: headers, body text, attachment metadata (each with its `index` for `download_attachment`), and flags. `date` is the machine's local time with its offset, `date_original` keeps the sender's own rendition when its offset differs. Uses `BODY.PEEK[]` so it does **not** mark the email as read. The response carries `content_warning` (bodies are untrusted input) and, if the message's plain-text and HTML parts disagree in a suspicious way, `body_parts_diverge`. Pass `include_html: true` to include `body_html` (off by default — HTML bodies of marketing/order emails are typically 40–60 KB of inlined CSS); it stays `null` for a message without an HTML part. `body_text` joins all text parts in reading order, so text after an inline photo is not lost, and HTML-only mail arrives converted to text. Inline images (a phone's photo between two text parts, a logo referenced by the HTML) are listed in `attachments` like any other file. |
 | `get_thread` | Reconstruct a full conversation thread from any email in it. Searches by Message-ID, References, and In-Reply-To headers, sibling branches of the thread root included, with an opt-in subject-line fallback (`strict: false`). Automatically includes your own replies from the Sent folder and deduplicates across folders by Message-ID. `include_html: true` to include HTML bodies. |
 | `search_emails` | Search with multiple criteria combined via AND: `from`/`from_any`/`from_all`, `to`, `subject`/`subject_all`, `text`/`text_any`/`text_all`, `since`/`before`, `is_read`, `is_flagged`, `is_answered`, `has_attachments`, `min_size`/`max_size` (bytes, IMAP-native). `_any` variants OR within a field (`["amazon.de", "paypal.com"]`); `_all` variants AND within a field. Several words in `text` or `subject` must all occur, `"quoted words"` stay one phrase, and filler words (der, vom, the, Mail …) are left out, so `"Newsletter vom Radhaus"` finds the newsletter. A word joined by hyphens counts as its parts when each has three letters or more, so `Telekom-Rechnung` also finds "Rechnung der Telekom". `since`/`before` also take a time of day (`2026-08-15T12:20`, local; or with `Z`/`±HH:MM`) — the sub-day part is cut client-side against INTERNALDATE (arrival time), and result rows then carry it as `internal_date`, so a `date` outside the bound (the sender's header) is explainable in place. `group_by_thread: true` collapses into conversations exactly as in `list_emails`, so "unread since 12:20, grouped" is one call. `unread_only` is still accepted as an alias for `is_read`, though no longer offered in the schema. Non-ASCII search terms automatically use `CHARSET UTF-8`. At least one criterion required. Omit `folder` to search all folders — every folder is searched, and Gmail's label duplicates (including the `[Gmail]/All Mail` mirror) are deduplicated by Message-ID afterwards, so archived mail that exists only in All Mail is still found. A folder that refuses a search, such as the `\Noselect` parent `[Gmail]`, is skipped, while a dropped connection fails the whole call with `retryable: true`. A search for words that finds nothing says what to try instead (`hint`). Returns `matched` (server-side count), `returned`, and `has_more` — check `has_more` instead of doing arithmetic; client-side filters (`has_attachments`, diverted non-ASCII terms) can push `returned` below `matched` without anything missing, while sub-day time bounds are already inside the count. `offset` pages within a single folder (across folders it would skip in each one, so that combination is refused). `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` / `internal_date` when applicable). |
@@ -160,7 +160,7 @@ Every `draft_*` response also carries the new draft's own `uid`, so a revision l
 
 **Recipients** (`to`, `cc`, `bcc`) take one entry per recipient, either a bare `alice@example.com` or `Alice Example <alice@example.com>`. Entries that would end up as a broken header (a comma-separated list in one entry, a name without an address, an empty string) are refused with an error naming the entry, and `draft_forward` and `draft_email` need at least one `to`. Reply-all addresses everyone once and leaves out your own address.
 
-**All drafts** are saved to the Drafts folder for manual review and sending. Nothing is ever sent automatically.
+**All drafts** are saved to the Drafts folder for manual review and sending. Nothing is ever sent automatically, and every draft response says so right after its `status` (`"saved": "as a draft in Drafts; nothing was sent, the user sends it"`): told only `"status": "ok"`, a model reported a forward as done.
 
 With several accounts configured, every tool that works on one email or writes (`get_email`, `get_thread`, `download_attachment`, the organizing and composing tools) **requires** `account`: a silent fallback to the first account once composed drafts from the wrong mailbox under the wrong sender, so an omitted name errors and lists the accounts. The rows of a listing or search name the account to pass. `list_folders`, `list_emails`, `search_emails` and `list_drafts` read all accounts when `account` is left out (see [Multi-Account](#multi-account)). With a single account, `account` is not offered at all.
 
@@ -745,7 +745,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 349 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 350 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
@@ -792,7 +792,7 @@ One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 to
 ```bash
 ./test-server.sh                     # fresh container (run right before — the sub-day search asserts a 1-hour window)
 cargo build --release                # or nix build, then pass result/bin/imap-mcp-rs
-python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 68 checks across all 19 tools
+python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 73 checks across all 19 tools
 podman rm -f imap-test
 ```
 
@@ -839,7 +839,7 @@ src/
 tests/
 ├── integration_greenmail.rs  End-to-end tests against GreenMail container (23 tests, `#[ignore]`-gated)
 └── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls, then
-                              two accounts and two read-only accounts (68 checks)
+                              two accounts and two read-only accounts (73 checks)
 mcp-tool-test/gemma/          Measurement kit for small models: mail world, request catalog, runners
                               (see "Measuring with a small model")
 ```

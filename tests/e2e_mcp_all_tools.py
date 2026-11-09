@@ -239,12 +239,29 @@ ok(
 uid0 = rows[0]["uid"]
 # The seeds arrive unread: the unread listing comes newest first as well
 # (it came oldest first, in the order the server answered the FETCH).
-unread_rows = call("list_emails", {"folder": "INBOX", "unread_only": True})["emails"]
+unread_list = call("list_emails", {"folder": "INBOX", "unread_only": True})
+unread_rows = unread_list["emails"]
 unread_uids = [r["uid"] for r in unread_rows]
 ok(
     "list_emails unread_only: newest first",
     len(unread_uids) >= 2 and unread_uids == sorted(unread_uids, reverse=True),
     str(unread_uids),
+)
+# Asked "how many unread?", the count carries the word of the question.
+ok(
+    "list_emails unread_only: unread count before total",
+    unread_list.get("unread") == unread_list.get("matched")
+    and list(unread_list).index("unread") < list(unread_list).index("total"),
+    str({k: unread_list.get(k) for k in ("unread", "total", "matched")}),
+)
+# A search for words that finds nothing lists the newest emails, each with
+# the start of its text.
+nothing = call("search_emails", {"from": "nobody-like-this"})
+newest_rows = nothing.get("newest") or []
+ok(
+    "search without a match: hint and newest rows with their text",
+    nothing.get("hint") and newest_rows and all("snippet" in r for r in newest_rows),
+    str(nothing)[:200],
 )
 
 # --- 4 get_email ---
@@ -299,6 +316,11 @@ d1 = call(
     },
 )
 ok("draft_email: uid", isinstance(d1.get("uid"), int), str(d1)[:150])
+ok(
+    "draft_email: the reply says nothing was sent, right after the status",
+    list(d1)[:2] == ["status", "saved"] and "nothing was sent" in d1.get("saved", ""),
+    str(d1)[:150],
+)
 # Recipients: `Name <address>` is accepted (the response echoes the address),
 # a malformed entry is refused before anything is saved.
 named = call(
@@ -590,6 +612,18 @@ ok(
     "list_emails with account \"\": both accounts, as when left out",
     [a["account"] for a in blank.get("accounts", [])] == ["Greenmail", "Zweit"],
     str(blank)[:200],
+)
+as_word = call("search_emails", {"from": "zweit", "is_read": False})
+ok(
+    "a search for an account name: the hint points to the account",
+    (as_word.get("hint") or "").startswith('"zweit" is an account: to search it, pass account "Zweit".'),
+    str(as_word)[:200],
+)
+named_already = call("search_emails", {"account": "Zweit", "from": "zweit"})
+ok(
+    "a search that names the account itself gets no pointer to it",
+    "is an account" not in (named_already.get("hint") or ""),
+    str(named_already)[:200],
 )
 as_folder = call("list_emails", {"folder": "Zweit"})
 ok(

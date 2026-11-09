@@ -333,6 +333,9 @@ async fn fetch_original(
     }
 }
 
+/// The `saved` of every draft response.
+const SAVED_AS_DRAFT: &str = "as a draft in Drafts; nothing was sent, the user sends it";
+
 /// What a revision leaves out, taken from the draft it replaces. A model
 /// revising a draft sends the new text and `replaces_uid`, not the
 /// addresses and the subject again: Gemma failed twice on the missing
@@ -448,16 +451,23 @@ async fn finish_draft(
     replaces_uid: Option<u32>,
     mut response: serde_json::Value,
 ) -> ToolResult {
-    // Right after `account`, before the preview text: the handle a revision
-    // passes back as `replaces_uid`.
-    if let Some(uid) = uid
-        && let Some(fields) = response.as_object_mut()
-    {
+    if let Some(fields) = response.as_object_mut() {
+        // What happened, in words, right after `status`: told only "ok", a
+        // model reported a forward as "weitergeleitet" and a reply as sent.
         let at = fields
             .keys()
-            .position(|k| k == "account")
-            .map_or(fields.len(), |i| i + 1);
-        fields.shift_insert(at, "uid".into(), uid.into());
+            .position(|k| k == "status")
+            .map_or(0, |i| i + 1);
+        fields.shift_insert(at, "saved".into(), SAVED_AS_DRAFT.into());
+        // Right after `account`, before the preview text: the handle a
+        // revision passes back as `replaces_uid`.
+        if let Some(uid) = uid {
+            let at = fields
+                .keys()
+                .position(|k| k == "account")
+                .map_or(fields.len(), |i| i + 1);
+            fields.shift_insert(at, "uid".into(), uid.into());
+        }
     }
     match replaces_uid {
         Some(old_uid) if uid == Some(old_uid) => {
@@ -1916,6 +1926,13 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["uid"], 9);
         assert!(v.get("replaced_uid").is_none(), "{v}");
+        // Right behind the status, in words: nothing was sent.
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys[..2], ["status", "saved"], "{v}");
+        assert!(
+            v["saved"].as_str().unwrap().contains("nothing was sent"),
+            "{v}"
+        );
         let warning = v["replace_warning"].as_str().unwrap();
         assert!(warning.contains("nothing was deleted"), "{warning}");
     }

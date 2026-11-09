@@ -1,0 +1,7 @@
+{
+ "tools": {
+  "search_emails": {
+   "description": "Search the user's emails: what family or colleagues wrote, invoices, parcels and deliveries, appointments. By sender, subject, words or date, in every folder unless folder is given. Terms match as parts of words in any case, so one word finds most. Give at least one criterion. has_more: true means more matched than were returned: narrow the search to see them. Rows come newest first: when the user means one email, it is the first row."
+  }
+ }
+}

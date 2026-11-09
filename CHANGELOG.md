@@ -3,6 +3,47 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.1.0
+
+Answers that leave a small model less to infer, found in the tool calls
+recorded while measuring 3.0.1 with Gemma 4 E4B. No tool, schema or
+instruction changes.
+
+### Added
+
+- **The newest emails after an empty search carry the start of their
+  text** (`snippet`). Asked "Was braucht die Steuerberaterin noch von
+  mir?", Gemma found Selin Kaya among them but did not open her email
+  (0 of 3). With the text in the row it answered from there (3 of 3).
+- **Every draft response says that nothing was sent**, right after its
+  `status`: `"saved": "as a draft in Drafts; nothing was sent, the user
+  sends it"`. Told only `"status": "ok"`, Gemma reported a forward as
+  "weitergeleitet" and a reply as sent. `status` stays as it was.
+- **`list_emails` with `unread_only` gives its count as `unread`** as well,
+  ahead of `total`, at the top and per account. Asked how many unread
+  emails there are, Gemma once named `total`, every email of both
+  inboxes.
+- **A search for an account's name points to the account.** When a search
+  for words finds nothing and one of them is the name of an account, the
+  hint begins with how to search that account ("\"arbeit\" is an account:
+  to search it, pass account \"Arbeit\"."). Asked which unread email was
+  from work, Gemma had searched `from: "Arbeit"` and answered "none".
+
+Measured against 3.0.1 with Gemma behind Otomo: the catalog went from 86
+to 94 of 99 requests (three runs each), the read-only set from 24 to 26 of
+28. The held-out requests (25 of 28 against 26), the fresh set (13 of 14
+against 14) and the fresh read-only set (8 of 12 against 10) moved by a
+request or two, with no link to these changes in the recorded answers.
+Repeated six times, the read-only requests to forward or delete came to 11
+of 12 against 10, and "Markier die Rechnung von den Stadtwerken als
+wichtig", where 3.0.1 twice flagged both invoices, to 6 of 6 against 4.
+Claude Sonnet 5.5 handled every request of all five sets. A sentence that
+told the model the first row is the one meant brought nothing measurable
+and stayed out.
+
+350 unit tests, 23 GreenMail integration tests and 73 checks in the MCP
+end-to-end script.
+
 ## 3.0.1
 
 Fixes from a review of 3.0.0 and of the tool calls recorded while measuring

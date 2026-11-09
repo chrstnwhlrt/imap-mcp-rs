@@ -374,12 +374,14 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Tool
     // Clamp to a hard ceiling so a prompt-injected limit can't ask for 100k
     // emails and OOM the host. Users needing more should paginate via offset.
     let limit = req.limit.unwrap_or(20).clamp(1, 500);
+    let unread_only = req.unread_only.unwrap_or(false);
     let page = Page {
         limit,
         limit_capped: req.limit.is_some_and(|l| l > 500),
         offset: req.offset.unwrap_or(0),
         group_by_thread,
         compact: req.compact.unwrap_or(false),
+        unread_only,
     };
     if page.offset > 0 && targets.len() > 1 {
         return Err(across::offset_needs_account(&account_names(&targets)));
@@ -391,7 +393,6 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Tool
     } else {
         limit
     };
-    let unread_only = req.unread_only.unwrap_or(false);
     let single = targets.len() == 1;
     let folder = req.folder.as_str();
     let offset = page.offset;
@@ -454,12 +455,16 @@ struct Listing {
 }
 
 /// How a listing is cut into the page a call asked for.
+#[allow(clippy::struct_excessive_bools)]
 struct Page {
     limit: u32,
     limit_capped: bool,
     offset: u32,
     group_by_thread: bool,
     compact: bool,
+    /// Only unread emails: the count is also given as `unread`, the word of
+    /// the question. Asked "how many unread?", Gemma once read `total`.
+    unread_only: bool,
 }
 
 /// The listing of one account: the account and folder, then the counts,
@@ -483,6 +488,9 @@ fn one_listing(account: &str, listing: Listing, page: &Page) -> ToolResult {
     let mut payload = Map::new();
     payload.insert("account".into(), account.into());
     payload.insert("folder".into(), listing.folder.into());
+    if page.unread_only {
+        payload.insert("unread".into(), listing.matched.into());
+    }
     payload.insert("total".into(), listing.total.into());
     payload.insert("matched".into(), listing.matched.into());
     payload.insert("offset".into(), page.offset.into());
@@ -519,12 +527,15 @@ fn merged_listing(
         if page.group_by_thread {
             listing.emails = group_summaries_by_thread(listing.emails);
         }
-        per_account.push(json!({
-            "account": account,
-            "folder": listing.folder,
-            "total": listing.total,
-            "matched": listing.matched,
-        }));
+        let mut entry = Map::new();
+        entry.insert("account".into(), account.as_str().into());
+        entry.insert("folder".into(), listing.folder.into());
+        if page.unread_only {
+            entry.insert("unread".into(), listing.matched.into());
+        }
+        entry.insert("total".into(), listing.total.into());
+        entry.insert("matched".into(), listing.matched.into());
+        per_account.push(Value::Object(entry));
         total += u64::from(listing.total);
         matched += u64::from(listing.matched);
         rows.extend(listing.emails);
@@ -538,6 +549,9 @@ fn merged_listing(
         (rows, None)
     };
     let mut payload = Map::new();
+    if page.unread_only {
+        payload.insert("unread".into(), matched.into());
+    }
     payload.insert("total".into(), total.into());
     payload.insert("matched".into(), matched.into());
     payload.insert("accounts".into(), per_account.into());
@@ -1430,7 +1444,8 @@ pub async fn search_emails(server: &ImapMcpServer, req: SearchEmailsRequest) -> 
             limit_capped,
             group_by_thread,
             compact: req.compact.unwrap_or(false),
-            hint: nothing_found.then(|| empty_search_hint(folder.is_some(), newest.is_some())),
+            hint: nothing_found
+                .then(|| search_hint(server, &req, folder.is_some(), newest.is_some())),
             newest,
         },
     )
@@ -1576,6 +1591,57 @@ fn searches_words(req: &SearchEmailsRequest) -> bool {
         .any(|v| v.as_ref().is_some_and(|list| !list.is_empty()))
 }
 
+/// The help after a search for words found nothing: where a search word is
+/// an account, the way to search that account first.
+fn search_hint(
+    server: &ImapMcpServer,
+    req: &SearchEmailsRequest,
+    folder_given: bool,
+    newest: bool,
+) -> String {
+    let hint = empty_search_hint(folder_given, newest);
+    // A search that already names that account needs no pointer to it.
+    let given = super::named(req.account.as_deref()).map(str::to_lowercase);
+    match account_named(req, &server.config.accounts).filter(|(_, account)| {
+        server.several_accounts() && given.as_deref() != Some(account.to_lowercase().as_str())
+    }) {
+        Some((word, account)) => {
+            format!("\"{word}\" is an account: to search it, pass account \"{account}\". {hint}")
+        }
+        None => hint,
+    }
+}
+
+/// A search word that is the name of an account, with that account's name:
+/// asked "which of them is from work?", Gemma searched `from: "Arbeit"`,
+/// the account, found nothing and answered "none".
+fn account_named<'a>(
+    req: &'a SearchEmailsRequest,
+    accounts: &'a [crate::config::AccountConfig],
+) -> Option<(&'a str, &'a str)> {
+    let single = [&req.text, &req.from, &req.to, &req.subject]
+        .into_iter()
+        .flatten()
+        .map(String::as_str);
+    let lists = [
+        &req.text_any,
+        &req.text_all,
+        &req.from_any,
+        &req.from_all,
+        &req.subject_all,
+    ]
+    .into_iter()
+    .flatten()
+    .flatten()
+    .map(String::as_str);
+    single.chain(lists).map(str::trim).find_map(|word| {
+        accounts
+            .iter()
+            .find(|a| a.name.to_lowercase() == word.to_lowercase())
+            .map(|a| (word, a.name.as_str()))
+    })
+}
+
 /// What to try after a search for words found nothing.
 fn empty_search_hint(folder_given: bool, newest: bool) -> String {
     let mut hint = String::from(
@@ -1595,7 +1661,10 @@ fn empty_search_hint(folder_given: bool, newest: bool) -> String {
 }
 
 /// The ten newest INBOX emails of the accounts a search covered, as compact
-/// rows, the sender as `Name <address>`: the name is what a model matches
+/// rows with the start of the text, the sender as `Name <address>`. The
+/// text is what answers "what does the tax adviser still need?" once the
+/// row is found: Gemma found Selin Kaya's row and did not open the email.
+/// The name is what a model matches
 /// "Mama" or "the tax adviser" against. `None` when no INBOX can be listed.
 async fn newest_inbox_rows(
     targets: &[super::Target<'_>],
@@ -1627,11 +1696,21 @@ async fn newest_inbox_rows(
             .iter()
             .map(|email| {
                 let mut row = email.compact();
-                if let Some(from) = &email.from {
-                    row["from"] = json!(from.name.as_deref().map_or_else(
-                        || from.address.clone(),
-                        |name| format!("{name} <{}>", from.address)
-                    ));
+                if let Some(fields) = row.as_object_mut() {
+                    if let Some(from) = &email.from {
+                        fields.insert(
+                            "from".into(),
+                            json!(from.name.as_deref().map_or_else(
+                                || from.address.clone(),
+                                |name| format!("{name} <{}>", from.address)
+                            )),
+                        );
+                    }
+                    let at = fields
+                        .keys()
+                        .position(|k| k == "subject")
+                        .map_or(fields.len(), |i| i + 1);
+                    fields.shift_insert(at, "snippet".into(), email.snippet.as_str().into());
                 }
                 row
             })
@@ -2270,6 +2349,7 @@ mod tests {
             offset: 0,
             group_by_thread: false,
             compact: true,
+            unread_only: false,
         };
         let v: Value =
             serde_json::from_str(&merged_listing(done, &answers, &page).unwrap()).unwrap();
@@ -2306,6 +2386,24 @@ mod tests {
                 ("Privat".into(), 2)
             ]
         );
+
+        // Only unread emails: the count is also named as asked, first.
+        let done = vec![("Privat".to_string(), listing(&[11, 9], 2))];
+        let unread = Page {
+            unread_only: true,
+            ..page
+        };
+        let v: Value =
+            serde_json::from_str(&merged_listing(done, &answers, &unread).unwrap()).unwrap();
+        let keys: Vec<&String> = v.as_object().unwrap().keys().collect();
+        assert_eq!(keys[..3], ["unread", "total", "matched"], "{v}");
+        let entry: Vec<&String> = v["accounts"][0].as_object().unwrap().keys().collect();
+        assert_eq!(
+            entry,
+            ["account", "folder", "unread", "total", "matched"],
+            "{v}"
+        );
+        assert_eq!(v["unread"], 2);
     }
 
     /// The whole point: a caller must be able to see that rows were dropped.
@@ -2478,6 +2576,38 @@ mod tests {
 
     fn build(req: &SearchEmailsRequest, unicode: bool) -> (String, ClientFilter) {
         build_search_criteria(req, unicode).unwrap()
+    }
+
+    /// A search word that names an account is found in any criterion and
+    /// any case, with the account's own spelling; other words are not.
+    #[test]
+    fn account_named_finds_an_account_among_the_search_words() {
+        let config: crate::config::ServerConfig = toml::from_str(
+            "[[accounts]]\nname = \"Privat\"\nhost = \"h\"\nusername = \"u@h\"\npassword = \"p\"\n\
+             [[accounts]]\nname = \"Arbeit\"\nhost = \"h\"\nusername = \"v@h\"\npassword = \"p\"\n",
+        )
+        .unwrap();
+        let from = SearchEmailsRequest {
+            from: Some(" arbeit ".into()),
+            ..empty_req()
+        };
+        assert_eq!(
+            account_named(&from, &config.accounts),
+            Some(("arbeit", "Arbeit"))
+        );
+        let listed = SearchEmailsRequest {
+            text_any: Some(vec!["Urlaub".into(), "Privat".into()]),
+            ..empty_req()
+        };
+        assert_eq!(
+            account_named(&listed, &config.accounts),
+            Some(("Privat", "Privat"))
+        );
+        let sender = SearchEmailsRequest {
+            from: Some("Stadtwerke".into()),
+            ..empty_req()
+        };
+        assert_eq!(account_named(&sender, &config.accounts), None);
     }
 
     fn summary_with(subject: &str, snippet: &str, from: &str) -> EmailSummary {
