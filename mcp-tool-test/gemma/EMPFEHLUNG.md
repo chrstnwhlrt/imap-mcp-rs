@@ -1,6 +1,6 @@
 # Ergebnis der Messung für imap-mcp-rs
 
-Stand 09.11.2026, Messkit in diesem Ordner (README.md). Gemessen wurde Gemma 4 E4B in Otomo (Ollama, gemma4-e4b-mtp, 32k Kontext) gegen die Welt aus `welt.py`, dazu Claude Sonnet 5.5 als Gegenprobe. Vorher meint die Texte von 2.0.0 vor `tool_set` (heute `full`). Nachher meint für Gemma `tool_set = "voice"` und für Claude `full`, beides mit allen Serveränderungen aus diesem Loop und gemessen gegen das gebaute Binary ohne Nachbildung.
+Stand 09.11.2026, Messkit in diesem Ordner (README.md). Gemessen wurde Gemma 4 E4B in Otomo (Ollama, gemma4-e4b-mtp, 32k Kontext) gegen die Welt aus `welt.py`, dazu Claude Sonnet 5.5 als Gegenprobe. Vorher meint die Texte von 2.0.0 vor `tool_set` (heute `full`). Nachher meint für Gemma `tool_set = "voice"` und für Claude `full`, beides mit allen Serveränderungen aus diesem Loop und gemessen gegen das gebaute Binary ohne Nachbildung. Den Stand danach, eine Oberfläche ohne `tool_set`, beschreibt der Abschnitt "Eine Oberfläche für Gemma und Claude".
 
 ## Ergebnis
 
@@ -14,6 +14,30 @@ Stand 09.11.2026, Messkit in diesem Ordner (README.md). Gemessen wurde Gemma 4 E
 | Claude, zurückgehaltene ohne Folgefragen | 12/12 | 12/12 |
 
 Gemma nach Gruppen, vorher gegen nachher: Lesen 15/24 gegen 35/39, Ordnen 6/14 gegen 18/21, Entwürfe 2/10 gegen 11/18, Folgefragen 5/8 gegen 11/12, Mail mit Anweisungen an die KI 4/4 gegen 6/6, Bitte nicht für den Mail-Server 2/2 gegen 3/3.
+
+## Eine Oberfläche für Gemma und Claude
+
+Am Abend des 09.11.2026 hat Christian entschieden, dass es nur noch eine Oberfläche gibt. `tool_set` fällt weg, die in `voice` ausgeblendeten Parameter sind mit einzeiligen Texten zurück und Claude sieht dasselbe wie Gemma. Werkzeuge, die kein Konto benutzen darf, fehlen in der Liste. Ohne `account` lesen die lesenden Werkzeuge alle Konten und zählen jedes Konto vor den Zeilen. Gemessen wurde gegen die Binaries `run/bin/imap-mcp-rs-eine-oberflaeche-1` bis `-3` ohne Nachbildung. `NUR_LESEN` sind 14 neue Bitten mit `config-nur-lesen.toml`, zwei Konten, die beide nur lesen dürfen, so wie bei Christian in Otomo.
+
+| Messung | Gemma | Claude |
+|---|---|---|
+| Katalog mit `config.toml` (33 Bitten, 3 Läufe) | 86/99 (`voice`: 84/99) | 28/28 ohne Folgefragen |
+| zurückgehaltene Bitten (14, 2 Läufe) | 26/28 (`voice`: 25/28) | 12/12 |
+| `NUR_LESEN` (14 Bitten, 2 Läufe) | 24/28 (`-2`: 25/28) | 11/11 |
+| frischer Satz mit `config.toml` (7 Bitten, 2 Läufe) | 14/14 | |
+| frischer Satz nur lesend (6 Bitten, 2 Läufe) | 9/12 (`-2`: 10/12) | |
+| Prompt je Modellaufruf mit Werkzeugen, Median | 10.054 Token, nur lesend 6.836 | |
+| tools/list | 19,9 KB, nur lesend 8,9 KB | |
+
+Die zurückgekehrten Parameter kosten gegenüber `voice` rund 1.200 Token je Modellaufruf und keinen Treffer. In 210 Aufrufen aus Katalog und zurückgehaltenen Bitten setzte Gemma zweimal `compact`, `dry_run` nie.
+
+Bei Konten, die nur lesen dürfen, entschied ein Satz der Instructions. Gezielt gemessen auf den Absage- und Folgebitten, je vier Läufe:
+
+- "Reading only: nothing can be drafted, moved, marked or deleted; say so when the user asks for it." kam auf 12/16. Gemma sagte etwa "Ich antworte ihr, dass wir am Sonntag gerne kommen." ohne jeden Aufruf.
+- "Reading only: to reply, write, move, mark or delete, tell the user that you can only read their mail here." kam auf 16/16. Der Satz nennt die Handlungen so, wie der Nutzer sie sagt.
+- Der frische Satz zeigte danach, dass Weiterleiten in der Aufzählung fehlte. Mit "to reply, write, forward, move, mark or delete" kamen sieben Absage- und Folgebitten auf 27/28 statt 25/28. Diese Ergänzung ist am frischen Satz entstanden, er ist für sie also nicht mehr unabhängig. Sie steht in `-3`.
+
+Mit zwei Läufen schwanken die Zahlen um einen bis zwei Treffer, gegen `-3` kamen `NUR_LESEN` und der frische Satz je einen Treffer unter `-2` heraus. Die gezielten Läufe mit vier Wiederholungen sprechen für `-3`. Etwa eines von vier Malen geht eine Folgefrage daneben. Nach "Was schreibt Mama?" behauptet Gemma auf "Schreib ihr zurück, dass wir kommen." dann, sie habe geantwortet. Otomo prüft solche Antworten mit seinem Torwächter, der wertete "Ich habe eine E-Mail an die Personalabteilung formuliert ... Möchtest du, dass ich diese E-Mail jetzt versende?" aber nicht als Behauptung. Das ist ein Punkt für Otomo. In Otomo gab Gemma "Antworte Mama ..." zudem einmal an einen Agenten weiter, statt gleich abzusagen. "Muss ich am Samstag mit irgendwelchen Ausfällen rechnen?" nennt keine Mail, Gemma fragt dort zu Recht nach dem Ort.
 
 ## Was gewirkt hat
 
@@ -29,6 +53,7 @@ Die Regel für Wörter mit Bindestrich (Teile ab drei Buchstaben, "Telekom-Rechn
 ## Verworfen
 
 - **Die Mail im Fokus**, also die Mail des letzten Zugs als Ziel, wenn `uids` fehlt. Bei "Wann kommt mein Paket?" und danach "Markier die Mail als wichtig." fragte Gemma "Welche Mail?", ohne ein Werkzeug zu rufen, mit und ohne Fokus 0/4.
+- **`matched` vor `total` bei mehreren Konten.** Auf "Wie viele ungelesene Mails habe ich gerade?" nannte Gemma einmal "15 ungelesene", die Zahl aller Mails beider Posteingänge (`total`). Mit `matched` vor `total`, per Proxy nachgebildet, kam gezielt 7/8 wie ohne (`texts/matched-first.json`). Die Reihenfolge bleibt.
 - **Eine Umbenennung von list_drafts.** Gemma ruft das Werkzeug als "list_draft" oder "list_draft_emails" auf. Das gehört in Otomo, das bei einem unbekannten Namen die ähnlichsten vorschlägt und dabei "draft" und "drafts" für verschiedene Wörter hält.
 
 ## Grenzen, die kein Servertext löst

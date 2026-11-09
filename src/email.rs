@@ -95,9 +95,18 @@ impl EmailAddress {
 /// those alone can inflate a 20-row triage response by 50+ KB of JSON.
 pub const SUMMARY_TO_PREVIEW: usize = 3;
 
+/// One email as a listing or search row.
+///
+/// The fields serialize in the order declared here, which is the order a
+/// model reads them in: where the email is (the handles a follow-up call
+/// passes back), then who wrote what when, then the rest. Threading headers
+/// come last: they are long and matter to grouping only.
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailSummary {
-    pub uid: u32,
+    /// The account the email is in, set when several accounts are
+    /// configured: a call on the email has to name it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
     pub folder: String,
     /// The folder name as a human reads it, when `folder` is modified-UTF-7
     /// encoded (`Gel&APY-schte Elemente` → `Gelöschte Elemente`). For
@@ -107,27 +116,12 @@ pub struct EmailSummary {
     /// is recognizable in place.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub folder_display: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub message_id: Option<String>,
-    /// Threading hints passed through so callers can cluster by
-    /// conversation. Only serialised when set (a reply), otherwise
-    /// the summary stays compact.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub in_reply_to: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    pub references: Vec<String>,
-    pub from: Option<EmailAddress>,
-    /// Up to `SUMMARY_TO_PREVIEW` recipients for triage context. Real
-    /// length is in `to_count`; use `get_email` for the full list.
-    pub to: Vec<EmailAddress>,
-    pub to_count: usize,
-    /// Number of CC recipients. Addresses aren't echoed in summaries to
-    /// keep the payload bounded — use `get_email` when you need them.
-    pub cc_count: usize,
-    pub subject: String,
+    pub uid: u32,
     /// UTC-normalized ISO 8601 — compare and sort on this. See
     /// `NormalizedDate` for why the sender's offset is not passed through.
-    /// Serialized in the machine's time zone (see [`shown_local`]).
+    /// Serialized in the machine's time zone (see [`shown_local`]). The
+    /// arrival time (INTERNALDATE) where the message has no usable Date
+    /// header.
     #[serde(serialize_with = "serialize_shown")]
     pub date: Option<String>,
     /// The sender's original `Date` rendition, only when its offset differs
@@ -146,14 +140,32 @@ pub struct EmailSummary {
         skip_serializing_if = "Option::is_none"
     )]
     pub internal_date: Option<String>,
+    pub from: Option<EmailAddress>,
+    pub subject: String,
+    pub snippet: String,
     pub flags: Vec<String>,
     pub has_attachments: bool,
-    pub snippet: String,
     /// Only set when a response was grouped by thread
     /// (`list_emails(group_by_thread=true)`): total messages in this
     /// thread. Absent from ungrouped responses.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub thread_message_count: Option<usize>,
+    /// Up to `SUMMARY_TO_PREVIEW` recipients for triage context. Real
+    /// length is in `to_count`; use `get_email` for the full list.
+    pub to: Vec<EmailAddress>,
+    pub to_count: usize,
+    /// Number of CC recipients. Addresses aren't echoed in summaries to
+    /// keep the payload bounded — use `get_email` when you need them.
+    pub cc_count: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message_id: Option<String>,
+    /// Threading hints passed through so callers can cluster by
+    /// conversation. Only serialised when set (a reply), otherwise
+    /// the summary stays compact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_reply_to: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub references: Vec<String>,
 }
 
 impl EmailSummary {
@@ -165,60 +177,63 @@ impl EmailSummary {
     /// senders never reads — and large enough to blow a client's response
     /// budget, forcing it to page in small chunks and issue more round-trips
     /// than the data warrants. Everything omitted here is available per
-    /// message via `get_email`.
+    /// message via `get_email`. The fields keep the order of the full row.
     pub fn compact(&self) -> serde_json::Value {
-        let mut v = serde_json::json!({
-            "uid": self.uid,
-            "folder": self.folder,
-            "subject": self.subject,
-            "has_attachments": self.has_attachments,
-        });
-        // Keep optional fields absent rather than null, matching the full
+        let mut v = serde_json::Map::new();
+        // Optional fields stay absent rather than null, matching the full
         // shape: a caller checking `if row.date` behaves the same either way.
-        if let Some(from) = &self.from {
-            v["from"] = serde_json::json!(from.address);
+        if let Some(account) = &self.account {
+            v.insert("account".into(), account.as_str().into());
         }
+        v.insert("folder".into(), self.folder.as_str().into());
+        v.insert("uid".into(), self.uid.into());
         if let Some(date) = &self.date {
-            v["date"] = serde_json::json!(shown_local(date));
+            v.insert("date".into(), shown_local(date).into());
         }
         // Only ever set when a sub-day bound was active — there it explains
         // the filter decision, so it survives the compact cut too.
         if let Some(internal) = &self.internal_date {
-            v["internal_date"] = serde_json::json!(shown_local(internal));
+            v.insert("internal_date".into(), shown_local(internal).into());
         }
+        if let Some(from) = &self.from {
+            v.insert("from".into(), from.address.as_str().into());
+        }
+        v.insert("subject".into(), self.subject.as_str().into());
         if !self.flags.is_empty() {
-            v["flags"] = serde_json::json!(self.flags);
+            v.insert("flags".into(), serde_json::json!(self.flags));
         }
+        v.insert("has_attachments".into(), self.has_attachments.into());
         if let Some(n) = self.thread_message_count {
-            v["thread_message_count"] = serde_json::json!(n);
+            v.insert("thread_message_count".into(), n.into());
         }
-        v
+        serde_json::Value::Object(v)
     }
 }
 
+/// One email in full, as `get_email` and `get_thread` return it. Serialized
+/// in the order declared: the handles, who wrote what when, the attachments,
+/// the text, and the threading headers last.
 #[derive(Debug, Clone, Serialize)]
 pub struct EmailFull {
-    pub uid: u32,
     pub folder: String,
-    pub from: Option<EmailAddress>,
-    pub to: Vec<EmailAddress>,
-    pub cc: Vec<EmailAddress>,
-    pub subject: String,
+    pub uid: u32,
     /// UTC-normalized ISO 8601 — compare and sort on this. Serialized in
-    /// the machine's time zone (see [`shown_local`]).
+    /// the machine's time zone (see [`shown_local`]). The arrival time
+    /// (INTERNALDATE) where the message has no usable Date header.
     #[serde(serialize_with = "serialize_shown")]
     pub date: Option<String>,
     /// The sender's original `Date` rendition when its offset differs from
     /// the machine's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub date_original: Option<String>,
-    pub message_id: Option<String>,
-    pub in_reply_to: Option<String>,
-    pub references: Vec<String>,
+    pub from: Option<EmailAddress>,
+    pub to: Vec<EmailAddress>,
+    pub cc: Vec<EmailAddress>,
+    pub subject: String,
     pub flags: Vec<String>,
+    pub attachments: Vec<AttachmentInfo>,
     pub body_text: String,
     pub body_html: Option<String>,
-    pub attachments: Vec<AttachmentInfo>,
     /// `true` when this message ships both a plain-text and an HTML part and
     /// the plain text carries substantial content the HTML does not. Mail
     /// clients render the HTML part while an LLM reads the plain text, so a
@@ -227,6 +242,9 @@ pub struct EmailFull {
     /// `parts_diverge`. Only computed where the full body is returned.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub body_parts_diverge: bool,
+    pub message_id: Option<String>,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -887,6 +905,7 @@ pub fn summarize(email: EmailFull, snippet_len: usize) -> EmailSummary {
     to.truncate(SUMMARY_TO_PREVIEW);
 
     EmailSummary {
+        account: None,
         uid: email.uid,
         folder: email.folder,
         folder_display: None,
@@ -962,6 +981,7 @@ mod tests {
 
     fn summary_fixture() -> EmailSummary {
         EmailSummary {
+            account: None,
             uid: 42,
             folder: "INBOX".into(),
             folder_display: None,

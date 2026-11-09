@@ -43,6 +43,8 @@ by its own; a hidden one is left to the server's default.
       (returned 0) gets the field note
   {"local_dates": "Europe/Berlin"}   every date and internal_date of a result
       in that zone with its offset, date_original left out
+  {"matched_first": true}   in list_emails and search_emails results,
+      matched before total, at the top and for each account
 """
 import copy
 import datetime
@@ -244,6 +246,19 @@ def local_dates(node, zone):
     return out
 
 
+def matched_first(node):
+    """`node` with matched before total: what the filter found ahead of what the folder holds."""
+    if not isinstance(node, dict) or "matched" not in node:
+        return node
+    ordered = {}
+    for key, value in node.items():
+        if key == "total":
+            ordered["matched"] = node["matched"]
+        if key != "matched" or "total" not in node:
+            ordered[key] = value
+    return ordered
+
+
 def shown_tools(tools):
     out = []
     hidden = set(texts.get("hide_tools", []))
@@ -367,6 +382,11 @@ def to_client(child):
                     if (emulate.get("newest_on_empty") and entry["name"] == "search_emails"
                             and shown_result.get("returned") == 0):
                         shown_result["newest"] = newest(emulate["newest_on_empty"])
+                        changed = True
+                    if emulate.get("matched_first") and entry["name"] in ("list_emails", "search_emails"):
+                        shown_result = matched_first(shown_result)
+                        if isinstance(shown_result.get("accounts"), list):
+                            shown_result["accounts"] = [matched_first(a) for a in shown_result["accounts"]]
                         changed = True
                     if emulate.get("focus"):
                         with LOCK:

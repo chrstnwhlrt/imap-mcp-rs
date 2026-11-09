@@ -195,7 +195,8 @@ def ask(tag, cases, runs, texts, binary=BINARY, server_args=()):
 
 
 def pools(catalogue):
-    return {"cases": catalogue.CASES, "held": catalogue.HELD, "fresh": catalogue.FRESH, "extra": catalogue.EXTRA}
+    return {"cases": catalogue.CASES, "held": catalogue.HELD, "fresh": catalogue.FRESH, "extra": catalogue.EXTRA,
+            "nurlesen": catalogue.NUR_LESEN, "freshnurlesen": catalogue.FRESH_NUR_LESEN}
 
 
 def score(tag, only=""):
@@ -263,12 +264,11 @@ def main():
     p.add_argument("--only", default="")
     p.add_argument("--texts")
     p.add_argument("--judge", action="store_true")
-    p.add_argument("--set", choices=["cases", "held", "fresh", "extra"], default="cases",
+    p.add_argument("--set", choices=["cases", "held", "fresh", "extra", "nurlesen", "freshnurlesen"], default="cases",
                    help="the set of requests to ask")
     p.add_argument("--binary", default=BINARY, help="the imap-mcp-rs to measure (default: this repository's release build)")
     p.add_argument("--server-arg", action="append", default=[], help="an argument for the server")
-    p.add_argument("--config", default="config.toml", help="the server's configuration in the world's run/ "
-                                                            "(config-voice.toml for tool_set = \"voice\")")
+    p.add_argument("--config", default="config.toml", help="the server's configuration in the world's run/ (config-nur-lesen.toml: both accounts read only, for --set nurlesen)")
     a = p.parse_args()
     global CONFIG
     CONFIG = a.config

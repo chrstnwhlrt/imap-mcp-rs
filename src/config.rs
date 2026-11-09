@@ -25,29 +25,6 @@ pub struct ServerConfig {
     /// resolved via `canonicalize`.
     #[serde(default = "default_attachment_dirs")]
     pub allowed_attachment_dirs: Vec<String>,
-    /// Which tool surface the server shows; see [`ToolSet`].
-    #[serde(default)]
-    pub tool_set: ToolSet,
-}
-
-/// The tool surface the server presents. Every call works the same in both;
-/// `voice` describes the tools for a small model, stops offering what a
-/// spoken request rarely needs and adds help where such a model gives up.
-/// Hidden parameters are still accepted.
-#[derive(Debug, Default, Deserialize, Clone, Copy, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum ToolSet {
-    /// Every parameter, for assistants such as Claude.
-    #[default]
-    Full,
-    /// For a small model behind a voice assistant (see `tools/voice.rs`):
-    /// descriptions that begin with what a tool does for the user,
-    /// instructions within 1000 characters, fewer parameters and slim
-    /// schemas. `dry_run` is hidden, since such an assistant asks before
-    /// destructive calls itself and the preview made the model ask a second
-    /// time. A search for words that finds nothing lists the newest emails
-    /// of the INBOX.
-    Voice,
 }
 
 fn default_attachment_dirs() -> Vec<String> {
@@ -550,17 +527,14 @@ mod tests {
         assert!(load_config(path.to_str()).is_ok());
     }
 
+    /// `tool_set` chose between two tool surfaces before there was one for
+    /// every client. A config that still carries it must keep loading.
     #[test]
-    fn tool_set_defaults_to_full_and_takes_voice() {
+    fn a_leftover_tool_set_key_is_ignored() {
         let account =
             "[[accounts]]\nname = \"A\"\nhost = \"h\"\nusername = \"u@h\"\npassword = \"p\"\n";
-        let config: ServerConfig = toml::from_str(account).unwrap();
-        assert_eq!(config.tool_set, ToolSet::Full);
-        let config: ServerConfig =
-            toml::from_str(&format!("tool_set = \"voice\"\n{account}")).unwrap();
-        assert_eq!(config.tool_set, ToolSet::Voice);
         assert!(
-            toml::from_str::<ServerConfig>(&format!("tool_set = \"tiny\"\n{account}")).is_err()
+            toml::from_str::<ServerConfig>(&format!("tool_set = \"voice\"\n{account}")).is_ok()
         );
     }
 

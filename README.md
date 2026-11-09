@@ -7,7 +7,8 @@ Built in Rust. Packaged with Nix.
 ## Features
 
 - **19 tools** for complete email management: accounts, folders with role detection, reading, searching, organizing, drafting, attachments, plus `account_health` for connection diagnostics
-- **Multi-account** — configure multiple email accounts, switch between them by name
+- **Multi-account** — several accounts in one server. Without `account` the reading tools read all of them at once, with counts per account before the rows and every row naming its account
+- **Made for small models too** — the tool texts are measured with Gemma 4 E4B behind a voice assistant, and the server offers only the tools the configured accounts may use, with instructions that fit into 1000 characters
 - **Gmail, Outlook 365, and any IMAP server** — password auth, or OAuth2 with a one-command browser login (`imap-mcp-rs reauth <account>`). Refresh tokens are server-managed state: rotation is followed and persisted, so accounts don't expire on providers that rotate (Entra's 90-day window)
 - **Single binary**, no runtime dependencies
 - **Per-account permissions** — `read_only`, `allow_move`, `allow_delete`, `allow_flag_change`, `allow_unsafe_expunge`
@@ -71,13 +72,20 @@ The server finds `~/.config/imap-mcp-rs/config.toml` automatically. Override wit
 
 Every tool carries MCP annotations, so a client that asks before risky calls knows where to ask. The eight reading tools are marked read-only, and only `delete_email` and `delete_draft` are marked destructive.
 
-With `tool_set = "voice"` in the config the server presents itself to a small model behind a voice assistant, measured with Gemma 4 E4B behind the Otomo voice assistant. Descriptions begin with what a tool does for the user, because such an assistant decides from their first 140 characters whether a request needs the tool, and the instructions stay within the 1000 characters it keeps. Parameters a spoken request hardly needs are not offered, `dry_run` among them, since such an assistant asks before destructive calls itself. `account` goes as well when only one account is configured, and so does schema detail that changes nothing for the caller, which shrinks `tools/list` from 48 to 16 KB. Where every account has a signature, the draft texts say that the server adds it. A search for words that finds nothing comes with the ten newest INBOX emails to pick from. A hidden parameter still works when a call sends it, and the default `full` serves everything.
+Every client gets the same tool surface, written for the smallest model it was measured with: Gemma 4 E4B behind the Otomo voice assistant (see [Measuring with a small model](#measuring-with-a-small-model)). What works there works for larger models as well. Such an assistant shows the model only a tool's name, description and input schema, decides from the first 140 characters of a description whether a request needs the tool, and keeps 1000 characters of the instructions. The descriptions therefore begin with what a tool does for the user, every parameter has one short line in the user's terms, and the instructions stay within the 1000 characters. The surface follows the configuration:
+
+- A tool that no configured account may use is not offered, and no text points at it. With every account `read_only`, a client sees the eight reading tools and `download_attachment`, and the instructions say in the user's own terms what cannot be done ("to reply, write, forward, move, mark or delete, tell the user that you can only read their mail here"), so the model tells the user instead of claiming it did
+- With one account, `account` is left out of every schema. With several, the tools that work on one email require it, and the four reading tools take it as an option (see [Multi-Account](#multi-account))
+- The sentences about the signature appear only where every account that can draft has one, so the model leaves the closing greeting to the server
+- Schema detail that changes nothing for the caller is left out (`$schema`, integer formats, `null` beside an optional type), and the parameters are listed in the order a model should read them
+
+A search for words that finds nothing comes with a `hint` and the ten newest INBOX emails (`newest`), from which a model picks the person the user named by role. Responses list their counts before the rows, since a small model often answers from the start of a result.
 
 ### Accounts
 
 | Tool | Description |
 |------|-------------|
-| `list_accounts` | List all configured email accounts. Returns `{name, email, read_only, allow_move, allow_delete, allow_flag_change}` per account so the LLM can inspect permissions before planning destructive actions. Call this first. |
+| `list_accounts` | List all configured email accounts. Returns `{name, email, read_only, allow_move, allow_delete, allow_flag_change}` per account so the LLM can inspect permissions before planning destructive actions. Only needed with several accounts: their names also come with every error that asks for one, and the rows of a listing name theirs. |
 | `account_health` | Diagnose connection state per account. Returns `{accounts: [{name, email, auth_method, connected, last_error?, oauth_token_valid?, oauth_expires_in_secs?}]}` — `auth_method` is `"password"` or `"oauth2"`; `oauth_token_valid` / `oauth_expires_in_secs` are present only for OAuth2 accounts. Answers "why is my Gmail not working?" without tailing logs. Pure local — no IMAP roundtrip. |
 
 ### Reading
@@ -88,7 +96,7 @@ With `tool_set = "voice"` in the config the server presents itself to a small mo
 | `list_emails` | List emails in a folder with preview snippets (~200 chars). Supports pagination via `limit`/`offset`, filtering with `unread_only`, and conversation collapsing via `group_by_thread: true` (annotates `thread_message_count`, fetches 3× the limit internally). Summary rows include `to` truncated to 3 addresses plus `to_count` / `cc_count` for the real sizes — mass-mails don't inflate the response. Returns `total` (folder count) and `matched` (filter count, counted in messages even when grouping); if collapsing left more threads than `limit`, `threads_truncated_from` says how many there were. `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` when grouping; ~80% smaller) for large scans. |
 | `get_email` | Get a single email with full content: headers, body text, attachment metadata (each with its `index` for `download_attachment`), and flags. `date` is the machine's local time with its offset, `date_original` keeps the sender's own rendition when its offset differs. Uses `BODY.PEEK[]` so it does **not** mark the email as read. The response carries `content_warning` (bodies are untrusted input) and, if the message's plain-text and HTML parts disagree in a suspicious way, `body_parts_diverge`. Pass `include_html: true` to include `body_html` (off by default — HTML bodies of marketing/order emails are typically 40–60 KB of inlined CSS); it stays `null` for a message without an HTML part. `body_text` joins all text parts in reading order, so text after an inline photo is not lost, and HTML-only mail arrives converted to text. Inline images (a phone's photo between two text parts, a logo referenced by the HTML) are listed in `attachments` like any other file. |
 | `get_thread` | Reconstruct a full conversation thread from any email in it. Searches by Message-ID, References, and In-Reply-To headers, sibling branches of the thread root included, with an opt-in subject-line fallback (`strict: false`). Automatically includes your own replies from the Sent folder and deduplicates across folders by Message-ID. `include_html: true` to include HTML bodies. |
-| `search_emails` | Search with multiple criteria combined via AND: `from`/`from_any`/`from_all`, `to`, `subject`/`subject_all`, `text`/`text_any`/`text_all`, `since`/`before`, `is_read`, `is_flagged`, `is_answered`, `has_attachments`, `min_size`/`max_size` (bytes, IMAP-native). `_any` variants OR within a field (`["amazon.de", "paypal.com"]`); `_all` variants AND within a field. Several words in `text` or `subject` must all occur, `"quoted words"` stay one phrase, and filler words (der, vom, the, Mail …) are left out, so `"Newsletter vom Radhaus"` finds the newsletter. A word joined by hyphens counts as its parts when each has three letters or more, so `Telekom-Rechnung` also finds "Rechnung der Telekom". `since`/`before` also take a time of day (`2026-08-15T12:20`, local; or with `Z`/`±HH:MM`) — the sub-day part is cut client-side against INTERNALDATE (arrival time), and result rows then carry it as `internal_date`, so a `date` outside the bound (the sender's header) is explainable in place. `group_by_thread: true` collapses into conversations exactly as in `list_emails`, so "unread since 12:20, grouped" is one call. `unread_only` is accepted as an alias for `is_read`. Non-ASCII search terms automatically use `CHARSET UTF-8`. At least one criterion required. Omit `folder` to search all folders — every folder is searched, and Gmail's label duplicates (including the `[Gmail]/All Mail` mirror) are deduplicated by Message-ID afterwards, so archived mail that exists only in All Mail is still found. A folder that refuses a search, such as the `\Noselect` parent `[Gmail]`, is skipped, while a dropped connection fails the whole call with `retryable: true`. A search for words that finds nothing says what to try instead (`hint`). Returns `matched` (server-side count), `returned`, and `has_more` — check `has_more` instead of doing arithmetic; client-side filters (`has_attachments`, diverted non-ASCII terms) can push `returned` below `matched` without anything missing, while sub-day time bounds are already inside the count. `offset` pages within a single folder (across folders it would skip in each one, so that combination is refused). `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` / `internal_date` when applicable). |
+| `search_emails` | Search with multiple criteria combined via AND: `from`/`from_any`/`from_all`, `to`, `subject`/`subject_all`, `text`/`text_any`/`text_all`, `since`/`before`, `is_read`, `is_flagged`, `is_answered`, `has_attachments`, `min_size`/`max_size` (bytes, IMAP-native). `_any` variants OR within a field (`["amazon.de", "paypal.com"]`); `_all` variants AND within a field. Several words in `text` or `subject` must all occur, `"quoted words"` stay one phrase, and filler words (der, vom, the, Mail …) are left out, so `"Newsletter vom Radhaus"` finds the newsletter. A word joined by hyphens counts as its parts when each has three letters or more, so `Telekom-Rechnung` also finds "Rechnung der Telekom". `since`/`before` also take a time of day (`2026-08-15T12:20`, local; or with `Z`/`±HH:MM`) — the sub-day part is cut client-side against INTERNALDATE (arrival time), and result rows then carry it as `internal_date`, so a `date` outside the bound (the sender's header) is explainable in place. `group_by_thread: true` collapses into conversations exactly as in `list_emails`, so "unread since 12:20, grouped" is one call. `unread_only` is still accepted as an alias for `is_read`, though no longer offered in the schema. Non-ASCII search terms automatically use `CHARSET UTF-8`. At least one criterion required. Omit `folder` to search all folders — every folder is searched, and Gmail's label duplicates (including the `[Gmail]/All Mail` mirror) are deduplicated by Message-ID afterwards, so archived mail that exists only in All Mail is still found. A folder that refuses a search, such as the `\Noselect` parent `[Gmail]`, is skipped, while a dropped connection fails the whole call with `retryable: true`. A search for words that finds nothing says what to try instead (`hint`). Returns `matched` (server-side count), `returned`, and `has_more` — check `has_more` instead of doing arithmetic; client-side filters (`has_attachments`, diverted non-ASCII terms) can push `returned` below `matched` without anything missing, while sub-day time bounds are already inside the count. `offset` pages within a single folder (across folders it would skip in each one, so that combination is refused). `compact: true` trims each row to identity, sender, subject, date and flags (plus `thread_message_count` / `internal_date` when applicable). |
 | `download_attachment` | Download an email attachment to a local file under an allowed attachment directory. Pick it by `index` (from `get_email`'s `attachments[].index` — the unambiguous handle) or by `filename`; an ambiguous name (nameless parts all render as `"attachment"`) errors with the candidate indices instead of silently picking one. Each download gets its own UUID subdirectory containing the file under its **original sanitized filename** (e.g. `<base>/<uuid>/Lebenslauf.pdf`) — so re-attaching via `draft_*(attachments=[...])` preserves the original filename for the recipient. |
 
 ### Organizing
@@ -154,9 +162,9 @@ Every `draft_*` response also carries the new draft's own `uid`, so a revision l
 
 **All drafts** are saved to the Drafts folder for manual review and sending. Nothing is ever sent automatically.
 
-Every tool (except `list_accounts` and `account_health`, which cover all accounts) takes an `account` parameter. With a single configured account it may be omitted; with several it is **required** — the old silent first-account fallback could compose drafts from the wrong mailbox under the wrong sender, so an omitted name now errors and lists the available accounts.
+With several accounts configured, every tool that works on one email or writes (`get_email`, `get_thread`, `download_attachment`, the organizing and composing tools) **requires** `account`: a silent fallback to the first account once composed drafts from the wrong mailbox under the wrong sender, so an omitted name errors and lists the accounts. The rows of a listing or search name the account to pass. `list_folders`, `list_emails`, `search_emails` and `list_drafts` read all accounts when `account` is left out (see [Multi-Account](#multi-account)). With a single account, `account` is not offered at all.
 
-A failed call returns a tool result flagged `isError: true` whose text is the JSON object `{"error": "...", "retryable": bool}`. A folder that does not exist is refused with the names of the folders there are. Error responses always carry `retryable`: `true` marks transient conditions (server temporarily unavailable, dropped connection — retrying is sensible), `false` marks facts (folder doesn't exist, UID unknown, permission denied — fix the call instead). Timestamps in results (`date`, `internal_date`) are the machine's local time with its offset, so a model tells the user the time they live in; read from a UTC timestamp, it gave the hour an hour off. The sender's own rendition stays in `date_original` where its offset differs.
+A failed call returns a tool result flagged `isError: true` whose text is the JSON object `{"error": "...", "retryable": bool}`. A folder that does not exist is refused with the names of the folders there are. Error responses always carry `retryable`: `true` marks transient conditions (server temporarily unavailable, dropped connection — retrying is sensible), `false` marks facts (folder doesn't exist, UID unknown, permission denied — fix the call instead). Timestamps in results (`date`, `internal_date`) are the machine's local time with its offset, so a model tells the user the time they live in; read from a UTC timestamp, it gave the hour an hour off. The sender's own rendition stays in `date_original` where its offset differs. A message without a usable `Date` header gets its arrival time (INTERNALDATE) as `date` instead of `null`.
 
 ## Command line
 
@@ -205,7 +213,27 @@ client_id = "your-client-id"
 # no client_secret / refresh_token — see OAuth2 setup below
 ```
 
-The LLM discovers accounts via `list_accounts`, then uses the `account` parameter on any tool:
+`list_folders`, `list_emails`, `search_emails` and `list_drafts` read every account when a call names none, all at once, each over its own connection. "How many unread emails do I have?" then needs one call, and a model does not have to know there are several accounts:
+
+```
+→ list_emails(folder: "INBOX", unread_only: true, compact: true)
+  {"total": 15, "matched": 6,
+   "accounts": [{"account": "Personal", "folder": "INBOX", "total": 12, "matched": 5},
+                {"account": "Work", "folder": "INBOX", "total": 3, "matched": 1}],
+   "limit": 20, "returned": 6, "has_more": false,
+   "emails": [{"account": "Personal", "folder": "INBOX", "uid": 12, ...},
+              {"account": "Work", "folder": "INBOX", "uid": 3, ...}, ...]}
+```
+
+The totals and the counts per account come first. An account that failed is listed in `failed` with its `error` and `retryable`, and one without the folder asked for in `folder_missing_in`, both before the rows. The rows of all accounts are merged newest first, and each names its account, which a call on that email passes back:
+
+```
+→ get_email(account: "Work", folder: "INBOX", uid: 3)
+→ draft_reply(account: "Personal", folder: "INBOX", uid: 12, body: "Thanks!")
+→ search_emails(account: "work", from: "boss@")  # one account, case-insensitive
+```
+
+`offset` pages through one account, so with several it needs `account` as well. A folder that no account has is an error naming the folders of each. `list_accounts` reports what each account may do:
 
 ```
 → list_accounts()
@@ -213,10 +241,6 @@ The LLM discovers accounts via `list_accounts`, then uses the `account` paramete
     "allow_move": true, "allow_delete": true, "allow_flag_change": true},
    {"name": "Work", "email": "user@company.com", "read_only": true,
     "allow_move": false, "allow_delete": false, "allow_flag_change": false}]
-
-→ list_emails(account: "Personal", folder: "INBOX", unread_only: true)
-→ draft_reply(account: "Work", folder: "INBOX", uid: 5, body: "Thanks!")
-→ search_emails(account: "personal", from: "boss@")  # case-insensitive
 ```
 
 Account name matching is case-insensitive. Each account has its own IMAP connection, folder cache, and reconnect logic. Failed accounts reconnect automatically on first use.
@@ -254,7 +278,7 @@ allow_unsafe_expunge = false # true = permit plain EXPUNGE fallback on servers w
 - **`allow_flag_change = false`** — protect the unread state when it is a human's work queue: an accidental bulk `mark_as_read` erases that queue with no trash and no record of which messages it hit
 - **`allow_unsafe_expunge = true`** — enable only on single-client servers without UIDPLUS (very rare; Gmail, Outlook 365, Dovecot, Cyrus all support UIDPLUS)
 
-You can mix read-only and read-write accounts in the same config.
+You can mix read-only and read-write accounts in the same config. A tool is offered when at least one account may use it, and a call on an account that may not is refused with an error that says why. A tool no account may use is not offered at all: with every account `read_only`, a client sees only the eight reading tools and `download_attachment`.
 
 ## Folder Auto-Detection
 
@@ -290,6 +314,7 @@ The server maintains one persistent IMAP connection per account with several res
 - **Server-closed sessions** count as dead connections. A session the server has ended (an idle timeout, an admin's kick) makes the next command fail instead of "succeed" with an empty answer, which is how async-imap reads a closed connection. Reads then reconnect and repeat; before a write a NOOP checks the session and reconnects when needed
 - **Transparent retry** — idempotent read-only operations (SEARCH, FETCH, LIST, STATUS) automatically retry once on connection errors, so transient `broken pipe` failures don't bubble up to the caller. Write operations (APPEND, COPY) never retry to avoid duplicate messages
 - **Connection error detection** — heuristic detection of network errors vs. IMAP protocol errors. Only network errors trigger reconnect
+- **Errors with their cause** — a failed connect, TLS handshake or login names why (`Failed to connect to imap.example.com:993: Connection refused`, `IMAP login failed: Invalid credentials`), which is what `account_health` reports and what marks a network failure `retryable`
 
 ## Security
 
@@ -372,8 +397,10 @@ call leaves the previous draft intact rather than nothing at all.
 ### Search across accounts
 
 ```
-→ search_emails(account: "Work", from: "ceo@", is_read: false)
-  Found 3 unread emails from the CEO in Work account
+→ search_emails(from: "ceo@", is_read: false)
+  {"matched": 3, "accounts": [{"account": "Personal", "matched": 0},
+                              {"account": "Work", "matched": 3}], ...}
+  3 unread emails from the CEO, all in Work
 ```
 
 ### Triage newsletters
@@ -415,8 +442,6 @@ call leaves the previous draft intact rather than nothing at all.
                                               # The first entry receives downloads and is
                                               # kept at 0700; empty list `[]` is rejected;
                                               # write absolute paths (`~` is not expanded)
-# tool_set = "full"                           # "voice" trims the tool surface for a small
-                                              # model behind a voice assistant
 
 [[accounts]]
 name = "Personal"                   # Account name (used in tool calls)
@@ -720,7 +745,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 340 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 346 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
@@ -752,7 +777,7 @@ accept_invalid_certs = true   # GreenMail's self-signed certificate
 
 ### Integration tests
 
-End-to-end tests against the GreenMail container live in `tests/integration_greenmail.rs`. They're gated behind `#[ignore]` so `cargo test` stays fast and CI-friendly without the container:
+End-to-end tests against the GreenMail container live in `tests/integration_greenmail.rs`. The container has two users, `test` and `zweit`, the second for reads over several accounts. They're gated behind `#[ignore]` so `cargo test` stays fast and CI-friendly without the container:
 
 ```bash
 ./test-server.sh                                            # start container
@@ -762,18 +787,18 @@ podman rm -f imap-test                                      # stop container whe
 
 The suite covers the wire-protocol path that unit tests can't reach: TLS + IMAP login, `LIST`, FETCH + MIME decode, UID SEARCH, and STORE with server-acknowledged UIDs (the "mark_flags intersects against input" stability fix). Two sessions against one mailbox prove that a listing sees mail arriving while its folder stays selected.
 
-One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 tools** as real MCP JSON-RPC calls against the built binary — the request/response shapes an MCP client actually sees, including `has_more`, `failed`, `retryable`, the `isError` flag, `internal_date`, `dry_run` previews and the attachment `index` round trip. Without an argument it picks `result/bin/imap-mcp-rs` first, which is only current after a `nix build`; pass the path of the binary you mean to test. The run mutates the mailbox, so always give it a fresh container:
+One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 tools** as real MCP JSON-RPC calls against the built binary — the request/response shapes an MCP client actually sees, including `has_more`, `failed`, `retryable`, the `isError` flag, `internal_date`, `dry_run` previews and the attachment `index` round trip. A second phase reads both users as two accounts (counts per account, merged rows, `folder_missing_in`, the account a call on one email needs), a third serves them read-only. Without an argument it picks `result/bin/imap-mcp-rs` first, which is only current after a `nix build`; pass the path of the binary you mean to test. The run mutates the mailbox, so always give it a fresh container:
 
 ```bash
 ./test-server.sh                     # fresh container (run right before — the sub-day search asserts a 1-hour window)
 cargo build --release                # or nix build, then pass result/bin/imap-mcp-rs
-python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 45 checks across all 19 tools
+python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 61 checks across all 19 tools
 podman rm -f imap-test
 ```
 
 ### Measuring with a small model
 
-`mcp-tool-test/gemma/` holds the kit that shaped `tool_set = "voice"`: a Dovecot container with an invented mailbox (`welt.py`, reset before every conversation), a catalog of spoken requests with checks on the resulting mailbox, and the runners for Gemma 4 E4B behind the Otomo voice assistant and for Claude as the cross-check. It never talks to a real mailbox. `dump.py` records what the server hands a model in that world, the instructions, `tools/list` and example calls with their results, and `kick.py` checks that reads and writes succeed right after the server ended the session (`doveadm kick`). Its README (German) says how to run it, `EMPFEHLUNG.md` holds the results: with `voice`, Gemma handled 84 of 99 requests where the 2.0.0 texts managed 34 of 62, and 25 of 28 held-out requests instead of 11, while Claude with `full` lost nothing.
+`mcp-tool-test/gemma/` holds the kit that shaped the tool texts: a Dovecot container with an invented mailbox in two accounts (`welt.py`, reset before every conversation), catalogs of spoken requests with checks on the resulting mailbox, and the runners for Gemma 4 E4B behind the Otomo voice assistant and for Claude as the cross-check. `welt.py config` writes three configurations: one account with every permission, a second account read-only beside it, and both read-only. The kit never talks to a real mailbox. `dump.py` records what the server hands a model in that world, the instructions, `tools/list` and example calls with their results, and `kick.py` checks that reads and writes succeed right after the server ended the session (`doveadm kick`). Its README (German) says how to run it, `EMPFEHLUNG.md` holds the results: with the measured texts Gemma handled 86 of 99 requests where the 2.0.0 texts managed 34 of 62, 26 of 28 held-out requests instead of 11, and 24 of 28 requests with two read-only accounts, while Claude handled every request on the same surface.
 
 ## Architecture
 
@@ -795,10 +820,12 @@ src/
 │   │                       ConnectionState, PostFetchFilter, summarize_fetches, thread-UID helpers
 │   └── util.rs             Pure helpers: search criteria, astring escape, prefix detection, error cleanup
 └── tools/
-    ├── mod.rs              MCP server, tool registration, account resolution, list_accounts,
-    │                       account_health, error_json, folder name resolution
-    ├── voice.rs            tool_set = "voice": instructions, descriptions, hidden parameters,
-    │                       slim schemas
+    ├── mod.rs              MCP server, tool registration and descriptions, account resolution,
+    │                       list_accounts, account_health, error_json, folder name resolution
+    ├── surface.rs          the surface for the configured accounts: tools they may use,
+    │                       instructions, account and signature texts, slim schemas
+    ├── across.rs           reads over several accounts: concurrent reads, counts per account,
+    │                       failed and folder_missing_in
     ├── read.rs             untrusted-content marker, list_folders, list_emails (+group_by_thread),
     │                       get_email, get_thread, search_emails, download_attachment,
     │                       list_drafts, filesystem_safe_filename,
@@ -811,7 +838,8 @@ src/
         └── render.rs       Locale presets (EN/DE), Outlook-Web-style HTML bodies, date formatting
 tests/
 ├── integration_greenmail.rs  End-to-end tests against GreenMail container (22 tests, `#[ignore]`-gated)
-└── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls (45 checks)
+└── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls, then
+                              two accounts and two read-only accounts (61 checks)
 mcp-tool-test/gemma/          Measurement kit for small models: mail world, request catalog, runners
                               (see "Measuring with a small model")
 ```

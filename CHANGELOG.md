@@ -3,12 +3,50 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
-## Unreleased
+## 3.0.0
 
-Dependency update, a review pass over code and docs, and a tool surface for
-a small model behind a voice assistant (`tool_set = "voice"`), measured with
-Gemma 4 E4B together with the server changes it led to. Most fixes below
-concern behaviour that predates the update.
+One tool surface for every client, written for the smallest model it was
+measured with, Gemma 4 E4B behind a voice assistant, and fitted to what the
+configured accounts allow. With several accounts the reading tools read all
+of them at once. Besides that a dependency update and a review pass over
+code and docs; most fixes below concern behaviour that predates the update.
+Major version because the tools offered now follow the permissions and a
+read without `account` answers for every account.
+
+### Breaking
+
+- **Only the tools the accounts may use are offered.** A tool that no
+  configured account may use is left out of `tools/list`: with every
+  account `read_only` the eight reading tools and `download_attachment`
+  remain, and a call to a tool left out fails as unknown instead of with
+  the permission error. The instructions follow the same permissions. They
+  promise no drafts where none can be saved, and they say what cannot be
+  done in the words a user asks with: "Reading only: to reply, write,
+  forward, move, mark or delete, tell the user that you can only read
+  their mail here." Told instead that nothing "can be drafted", Gemma
+  answered "Antworte Mama ..." with "Ich antworte ihr ..." and wrote a
+  reply out as if it had gone; with the user's words it declined 16 of 16
+  such requests, against 12 of 16. Adding "forward", which users ask for
+  as well, took a wider set of such requests from 25 to 27 of 28.
+- **With several accounts, `list_folders`, `list_emails`, `search_emails`
+  and `list_drafts` read all of them when `account` is left out.** That was
+  an error. The answer gives the totals and the counts per account first
+  (`accounts`), then the accounts that failed (`failed`, each with `error`
+  and `retryable`) and those without the folder asked for
+  (`folder_missing_in`), then the rows of all accounts merged newest first.
+  "How many unread emails do I have?" is one call, and a model need not
+  know there are several accounts. `offset` pages through one account and
+  needs `account` then. A call that names an account answers as before.
+- **Rows name their account** (`account`, first in the row) whenever
+  several accounts are configured: it is what a call on that email passes
+  back. The schemas of the tools that work on one email then mark `account`
+  as required, as the server already did. With one account `account` is
+  not offered at all, and a call that sends it still works.
+- **Descriptions, parameter texts and instructions are the measured texts**
+  (see Added), the instructions at most 1000 characters. A client that
+  matched on the old wording needs to look again. `unread_only` of
+  `search_emails`, an alias of `is_read`, is no longer offered and still
+  accepted.
 
 ### Security
 
@@ -52,6 +90,13 @@ concern behaviour that predates the update.
   and a write, which is never repeated, checks the session with NOOP first.
   `mcp-tool-test/gemma/kick.py` checks this against Dovecot (`doveadm
   kick`): 1 of 9 checks passed before, 9 of 9 now.
+- **A failed connect named no cause and was not `retryable`.** The errors
+  of the connect, the TLS handshake, the greeting and the login carried
+  only their own words ("Failed to connect to imap.example.com:993", "IMAP
+  login failed"), so `account_health` could not say why, and a refused or
+  timed-out connection came back `retryable: false`, which tells a caller
+  to change the call rather than try again. They now name the cause
+  ("...: Connection refused", "IMAP login failed: Invalid credentials").
 - **Gmail OAuth2 did not work.** Google's token endpoint answers HTTP/1.1
   with `Transfer-Encoding: chunked`, and the minimal HTTPS client parsed the
   raw body, chunk sizes included, as JSON. Every token refresh and every
@@ -196,36 +241,49 @@ concern behaviour that predates the update.
   client asked before each `list_emails`. The flag tools are marked
   idempotent, and `list_accounts` and `account_health`, which answer from
   the configuration, as closed-world.
-- **`tool_set = "voice"`** serves a surface for a small model behind a
-  voice assistant, measured with Gemma 4 E4B behind the Otomo voice
-  assistant (kit in `mcp-tool-test/gemma`). Its descriptions begin with
-  what a tool does for the user, because such an assistant decides from the
-  first 140 characters whether a request needs the tool, and its
-  instructions stay within the 1000 characters it keeps. Parameters a spoken
-  request hardly needs are left out (`dry_run`, paging, `compact`,
-  attachments and a few more, `account` with a single account), and so is
-  schema detail that changes nothing for the caller, which shrinks
-  `tools/list` from 48 to 16 KB. `dry_run` goes because such an assistant
-  asks before destructive calls itself, and with earlier descriptions the
-  preview made the model ask a second time. Where every account has a
-  signature, the draft texts say that the server adds it, since the model
-  signed the message itself. A search for words that finds nothing lists the
-  ten newest INBOX emails, with the sender's name, to pick from. Hidden
-  parameters still work when a call sends them, and the default `full` is
-  unchanged.
+- **One tool surface for every client, measured with a small model.** The
+  texts were measured with Gemma 4 E4B behind the Otomo voice assistant
+  (kit in `mcp-tool-test/gemma`), and what works there works for larger
+  models as well. Such an assistant shows the model only a tool's name,
+  description and input schema, decides from the first 140 characters of a
+  description whether a request needs the tool, and keeps 1000 characters
+  of the instructions. The descriptions therefore begin with what a tool
+  does for the user, every parameter has one short line in the user's
+  terms (`dry_run`: "true: only shows what would happen, changes
+  nothing."), and the instructions stay within the cut. Schema detail that
+  changes nothing for the caller is left out, and with the shorter texts
+  `tools/list` shrinks from 48 to 20 KB (one account, every permission; 9 KB
+  with read-only accounts). Where every account that can
+  draft has a signature, the draft texts say that the server adds it, since
+  the model signed the message itself. A search for words that finds
+  nothing lists the ten newest INBOX emails, with the sender's name, to
+  pick from. During development a `tool_set` option chose between this
+  surface and the old one; it never shipped in a release, and a leftover
+  `tool_set` key is ignored.
 
-  Measured against the built binary, Gemma 4 E4B in Otomo handled 84 of 99
+  Measured against the built binary, Gemma 4 E4B in Otomo handled 86 of 99
   spoken requests (33 requests, three runs each), where the texts of 2.0.0
-  managed 34 of 62 (31 requests, two runs), and 25 of 28 held-out requests
-  that were never used for tuning, against 11 of 28. The prompt per model
-  call fell from 15.6k to 8.8k tokens (median). Claude Sonnet 5.5 with
-  `full` and every other change of this release handled 28 of 28 requests
-  (27 before) and 12 of 12 held-out ones. The texts carry the gain: the
-  server-side help below (folder names, the folder list in errors, local
-  dates, the recipient error, hiding `dry_run`) made no measurable
-  difference for Gemma once these texts say what to do, and it stays
-  because it is right for every client. Details, including what was tried
-  and dropped, are in `mcp-tool-test/gemma/EMPFEHLUNG.md`.
+  managed 34 of 62 (31 requests, two runs), and 26 of 28 held-out requests
+  that were never used for tuning, against 11 of 28. A first version of
+  these texts that left out the parameters a spoken request rarely needs
+  reached 84 of 99 and 25 of 28, so offering every parameter costs nothing
+  measurable. With two read-only accounts, as Otomo runs them, Gemma
+  handled 24 of 28 requests of a set written for that case (two runs each,
+  which vary by a hit or two). It declined all six requests to reply,
+  delete or mark as read, while a follow-up such as "Schreib ihr zurück"
+  still drew a claimed reply about one time in four. The prompt per model
+  call fell from 15.6k to 10.1k tokens (median), 6.8k with read-only
+  accounts. Claude Sonnet 5.5 on the same surface, measured before the
+  read-only sentence took its final wording, handled 28 of 28 requests (27
+  with the texts of 2.0.0), 12 of 12 held-out ones and 11 of 11 with
+  read-only accounts. The texts carry the gain: the server-side help below
+  (folder names, the folder list in errors, local dates, the recipient
+  error) made no measurable difference for Gemma once these texts say what
+  to do, and it stays because it is right for every client. Details,
+  including what was tried and dropped, are in
+  `mcp-tool-test/gemma/EMPFEHLUNG.md`.
+- **Reads over several accounts** (see Breaking), at once, each account
+  over its own connection.
 - **Measurement kit** in `mcp-tool-test/gemma`: a Dovecot container with an
   invented mailbox, reset before every conversation, a catalog of spoken
   requests checked against the resulting mailbox, runners for Gemma behind
@@ -241,7 +299,7 @@ concern behaviour that predates the update.
   the folder as the server knows it, and a name outside ASCII that fits no
   folder is refused with the folder list before it reaches the server. The
   `dry_run` previews keep the name as given, since they make no IMAP call.
-  With the voice texts, which say which name to pass, Gemma did as well
+  With the measured texts, which say which name to pass, Gemma did as well
   without it (8 of 12 requests either way).
 
 ### Changed
@@ -269,7 +327,7 @@ concern behaviour that predates the update.
   a UTC `Date` header has no such fallback.
 - A folder that does not exist is refused with the names of the folders
   there are, for reading and as a move target, so the next call can take the
-  right one. The move refuses before anything is copied. With the voice
+  right one. The move refuses before anything is copied. With the measured
   texts it made no measurable difference for Gemma (9 of 12 either way); it
   and the folder names stand in for each other, and with either of them a
   move "to the Papierkorb" worked 4 of 4 times.
@@ -278,7 +336,7 @@ concern behaviour that predates the update.
   the answer.
 - A recipient given as a bare name ("Ben") is refused with the way to its
   address (search the sender) instead of the address format alone. Once
-  the voice texts say to look the address up, Gemma no longer needed it.
+  the measured texts say to look the address up, Gemma no longer needed it.
 - `delete_email` on an account without a trash folder under a known name
   refuses and says why. It used to move to a guessed folder named "Trash".
 - `text` and `subject` in `search_emails` take several words, all of
@@ -298,6 +356,20 @@ concern behaviour that predates the update.
 - Non-ASCII attachment names in drafts are written as RFC 2231 parameters
   (`filename*=UTF-8''...`), the form RFC 2183 prescribes, instead of RFC 2047
   encoded words.
+- **Keys come in the order the server writes them** (`serde_json` with
+  `preserve_order`), no longer alphabetically: counts and `has_more` before
+  the rows, `content_warning` before the message it is about, a row
+  starting with `account`, `folder`, `uid`, `date`, `from`, `subject` and
+  ending with the threading headers, the saved draft's `uid` right after
+  `account`, and the parameters of a schema in the order a model should
+  fill them. JSON parsers see no difference; a small model reads the raw
+  text and often answers from its start.
+- A message without a usable `Date` header gets its arrival time
+  (INTERNALDATE) as `date` instead of `null`, in listings, searches,
+  `get_email` and `get_thread`. Without it such a message had no time to
+  tell the user and none to be sorted by among others.
+- The error for a missing folder points at `delete_email` only when the
+  account may delete.
 - A client speaking protocol `2026-07-28` no longer sends `initialize`, and
   rmcp 3.9 answers an `initialize` naming that version with `2025-11-25`,
   the newest version that has the handshake. The handshake-free `tools/list`
@@ -321,10 +393,11 @@ concern behaviour that predates the update.
   mailbox, and GreenMail fails a FETCH that races another session's
   EXPUNGE, so parallel runs failed at random.
 
-340 unit tests (up from 283), 22 GreenMail integration tests (up from 17)
-and 45 checks in the MCP end-to-end script (up from 35). `test-server.sh`
+346 unit tests (up from 283), 22 GreenMail integration tests (up from 17)
+and 61 checks in the MCP end-to-end script (up from 35). `test-server.sh`
 also creates `B&APw-cher` (Bücher), a folder whose name is encoded on the
-wire.
+wire, and a second user, `zweit`, for the script's rounds with two
+accounts and with two read-only accounts.
 
 ## 2.0.0
 

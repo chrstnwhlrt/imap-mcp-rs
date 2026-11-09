@@ -21,13 +21,9 @@
 # server in.
 # allowed_attachment_dirs = ["/custom/path", "/home/user/Documents"]
 
-# Tool surface. "full" (the default) offers every parameter, for assistants
-# such as Claude. "voice" is for a small model behind a voice assistant:
-# shorter descriptions and instructions written for such a model, fewer
-# parameters (no dry_run previews), and a search for words that finds
-# nothing lists the newest INBOX emails. Hidden parameters still work when a
-# call sends them.
-# tool_set = "full"
+# The tools a client is offered follow from the accounts below: a tool that
+# no account may use (read_only, allow_move, allow_delete,
+# allow_flag_change) is not offered at all.
 
 [[accounts]]
 name = "Personal"

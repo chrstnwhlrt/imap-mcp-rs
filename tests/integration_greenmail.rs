@@ -1167,6 +1167,23 @@ async fn folder_names_resolve_as_people_say_them() {
     assert!(err.contains("\"Größe\" does not exist"), "{err}");
     assert!(err.contains("Folders: INBOX"), "{err}");
 
+    // A read over several accounts asks without an error: the wire name,
+    // or none when the account lacks the folder, ASCII or not.
+    assert_eq!(
+        client
+            .find_folder("Papierkorb")
+            .await
+            .expect("lookup failed"),
+        Some("Trash".to_string())
+    );
+    for missing in ["NoSuchFolder", "Größe"] {
+        assert_eq!(
+            client.find_folder(missing).await.expect("lookup failed"),
+            None,
+            "{missing}"
+        );
+    }
+
     // The resolved name selects: the encoded folder reads like any other.
     let books = client.resolve_folder("Bücher").await.expect("resolved");
     let (rows, total, _) = client

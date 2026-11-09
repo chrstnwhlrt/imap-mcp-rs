@@ -71,9 +71,9 @@ use render::{
 #[schemars(inline)]
 #[schemars(description = "A file path, or {path, inline, cid} for an image shown inside the body.")]
 pub enum AttachmentSpec {
-    /// Bare absolute path — a regular attachment.
+    /// A file path, attached as a file.
     Path(String),
-    /// Path plus placement metadata.
+    /// A file path and where the file shows.
     Detailed(DetailedAttachment),
 }
 
@@ -82,14 +82,12 @@ pub enum AttachmentSpec {
 #[serde(deny_unknown_fields)]
 #[schemars(inline)]
 pub struct DetailedAttachment {
-    #[schemars(description = "Absolute file path, same rules as the bare-string form.")]
+    #[schemars(description = "The file's path, as saved_to gives it.")]
     pub path: String,
-    #[schemars(
-        description = "Embed in the body instead of appending as a file. Implied when `cid` is set."
-    )]
+    #[schemars(description = "true: show the image inside the text; cid implies it.")]
     pub inline: Option<bool>,
     #[schemars(
-        description = "Content id referenced from the body as `![alt](cid:<id>)`: letters, digits, '.', '_', '-'. Defaults to a value derived from the file name (extension dropped, other characters collapsed to '-')."
+        description = "The name body uses for the image, as in ![alt](cid:name): letters, digits, '.', '_' and '-'; taken from the file name when left out."
     )]
     pub cid: Option<String>,
 }
@@ -213,34 +211,33 @@ fn stamp_identity_headers<'a>(
 
 // ========== Request types ==========
 
+// Field order and texts as for the read tools (see `read.rs`): what a model
+// reads, in the order it should fill them. The `body` texts end in a full
+// stop that `surface.rs` turns into the signature clause where the server
+// signs the draft.
+
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DraftReplyRequest {
     #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+        description = "The email's account, as its row names it; the draft is saved there."
     )]
     pub account: Option<String>,
     #[schemars(description = "Folder containing the email to reply to (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UID to reply to (from list_emails or search_emails results)")]
     pub uid: u32,
-    #[schemars(
-        description = "Plain-text reply body. Rendered to HTML automatically; the original is quoted below an Outlook-style From/Sent/To/Subject header block in both MIME parts."
-    )]
+    #[schemars(description = "The message in the user's words.")]
     pub body: String,
-    #[schemars(
-        description = "Reply-all: include original To and CC recipients (your own address is excluded). Default: false."
-    )]
+    #[schemars(description = "true: also to everyone else the email went to.")]
     pub reply_all: Option<bool>,
-    #[schemars(
-        description = "Additional CC recipients, one per entry — a bare address or `Name <address>`, e.g. [\"alice@example.com\", \"Bob Example <bob@example.com>\"]. Appended to any recipients from reply_all."
-    )]
+    #[schemars(description = "More addresses to put in copy (CC), one per entry.")]
     pub cc: Option<Vec<String>>,
     #[schemars(
-        description = "Files to attach. Each entry is either an absolute path (e.g. from download_attachment's `saved_to`) or an object `{path, inline, cid}`. With `inline: true` the file is embedded in the body instead of appended: reference it from `body` as `![alt](cid:<id>)` and it appears exactly there. Paths must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
+        description = "Files to attach, one per entry: a saved_to path from download_attachment. For an image inside the text, pass {path, inline: true, cid: \"logo\"} and write ![Logo](cid:logo) in body where it belongs."
     )]
     pub attachments: Option<Vec<AttachmentSpec>>,
     #[schemars(
-        description = "UID of a draft this one replaces — this tool returns `uid` on every save, so a revision loop can pass the previous one straight back without calling list_drafts. The new draft is saved first, the old one deleted only afterwards — use this instead of delete_draft + draft_* so a failure can never leave you with neither version."
+        description = "To change a draft the user already has: its uid from list_drafts. The new version takes its place."
     )]
     pub replaces_uid: Option<u32>,
 }
@@ -248,7 +245,7 @@ pub struct DraftReplyRequest {
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DraftForwardRequest {
     #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
+        description = "The email's account, as its row names it; the draft is saved there."
     )]
     pub account: Option<String>,
     #[schemars(description = "Folder containing the email to forward (e.g. \"INBOX\")")]
@@ -256,32 +253,26 @@ pub struct DraftForwardRequest {
     #[schemars(description = "Email UID to forward (from list_emails or search_emails results)")]
     pub uid: u32,
     #[schemars(
-        description = "Recipients, one per entry — a bare address or `Name <address>`, e.g. [\"alice@example.com\", \"Bob Example <bob@example.com>\"]. At least one required — forwarding never auto-selects recipients."
+        description = "Email addresses, one per entry, such as \"ben@example.de\" or \"Ben <ben@example.de>\". Look an address up before asking the user: search_emails from: the name; for a person named by role, list_emails INBOX shows who wrote."
     )]
     pub to: Vec<String>,
-    #[schemars(
-        description = "Optional plain-text message placed ABOVE the forwarded content. If omitted, only the forwarded content is included."
-    )]
+    #[schemars(description = "A note above the forwarded email, in the user's words.")]
     pub body: Option<String>,
-    #[schemars(
-        description = "Optional CC recipients, one per entry — a bare address or `Name <address>`."
-    )]
+    #[schemars(description = "Addresses to put in copy (CC), one per entry.")]
     pub cc: Option<Vec<String>>,
     #[schemars(
-        description = "Files to attach. Each entry is either an absolute path (e.g. from download_attachment's `saved_to`) or an object `{path, inline, cid}`. With `inline: true` the file is embedded in the body instead of appended: reference it from `body` as `![alt](cid:<id>)` and it appears exactly there. Paths must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
+        description = "Files to attach, one per entry: a saved_to path from download_attachment. For an image inside the text, pass {path, inline: true, cid: \"logo\"} and write ![Logo](cid:logo) in body where it belongs."
     )]
     pub attachments: Option<Vec<AttachmentSpec>>,
     #[schemars(
-        description = "UID of a draft this one replaces — this tool returns `uid` on every save, so a revision loop can pass the previous one straight back without calling list_drafts. The new draft is saved first, the old one deleted only afterwards — use this instead of delete_draft + draft_* so a failure can never leave you with neither version."
+        description = "To change a draft the user already has: its uid from list_drafts. The new version takes its place."
     )]
     pub replaces_uid: Option<u32>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteDraftRequest {
-    #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
-    )]
+    #[schemars(description = "The drafts' account, as list_drafts names it.")]
     pub account: Option<String>,
     #[schemars(description = "Draft UIDs to delete (from list_drafts results). Pass one or many.")]
     pub uids: Vec<u32>,
@@ -289,30 +280,26 @@ pub struct DeleteDraftRequest {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DraftEmailRequest {
-    #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
-    )]
+    #[schemars(description = "The account to write from.")]
     pub account: Option<String>,
     #[schemars(
-        description = "Recipients, one per entry — a bare address or `Name <address>`, e.g. [\"alice@example.com\", \"Bob Example <bob@example.com>\"]. At least one required."
+        description = "Email addresses, one per entry, such as \"ben@example.de\" or \"Ben <ben@example.de>\". Look an address up before asking the user: search_emails from: the name; for a person named by role, list_emails INBOX shows who wrote."
     )]
     pub to: Vec<String>,
     #[schemars(description = "Email subject line (plain text)")]
     pub subject: String,
-    #[schemars(description = "Plain-text email body. Rendered to HTML automatically.")]
+    #[schemars(description = "The message in the user's words.")]
     pub body: String,
-    #[schemars(description = "CC recipients, one per entry — a bare address or `Name <address>`.")]
+    #[schemars(description = "Addresses to put in copy (CC), one per entry.")]
     pub cc: Option<Vec<String>>,
-    #[schemars(
-        description = "BCC recipients (hidden from other recipients), one per entry — a bare address or `Name <address>`."
-    )]
+    #[schemars(description = "Addresses in blind copy (BCC), hidden from the other recipients.")]
     pub bcc: Option<Vec<String>>,
     #[schemars(
-        description = "Files to attach. Each entry is either an absolute path (e.g. from download_attachment's `saved_to`) or an object `{path, inline, cid}`. With `inline: true` the file is embedded in the body instead of appended: reference it from `body` as `![alt](cid:<id>)` and it appears exactly there. Paths must be inside allowed_attachment_dirs (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`)."
+        description = "Files to attach, one per entry: a saved_to path from download_attachment. For an image inside the text, pass {path, inline: true, cid: \"logo\"} and write ![Logo](cid:logo) in body where it belongs."
     )]
     pub attachments: Option<Vec<AttachmentSpec>>,
     #[schemars(
-        description = "UID of a draft this one replaces — this tool returns `uid` on every save, so a revision loop can pass the previous one straight back without calling list_drafts. The new draft is saved first, the old one deleted only afterwards — use this instead of delete_draft + draft_* so a failure can never leave you with neither version."
+        description = "To change a draft the user already has: its uid from list_drafts. The new version takes its place."
     )]
     pub replaces_uid: Option<u32>,
 }
@@ -359,8 +346,16 @@ async fn finish_draft(
     replaces_uid: Option<u32>,
     mut response: serde_json::Value,
 ) -> ToolResult {
-    if let Some(uid) = uid {
-        response["uid"] = serde_json::json!(uid);
+    // Right after `account`, before the preview text: the handle a revision
+    // passes back as `replaces_uid`.
+    if let Some(uid) = uid
+        && let Some(fields) = response.as_object_mut()
+    {
+        let at = fields
+            .keys()
+            .position(|k| k == "account")
+            .map_or(fields.len(), |i| i + 1);
+        fields.shift_insert(at, "uid".into(), uid.into());
     }
     match replaces_uid {
         Some(old_uid) if uid == Some(old_uid) => {

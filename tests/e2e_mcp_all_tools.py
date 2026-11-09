@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """MCP end-to-end round: every one of the 19 tools once, as a real JSON-RPC
-call against the built binary talking to GreenMail.
+call against the built binary talking to GreenMail. A second phase reads two
+accounts at once (GreenMail's users test and zweit), a third serves two
+read-only accounts.
 
 The Rust integration tests (integration_greenmail.rs) cover the IMAP client
 layer; this script covers the MCP tool layer above it — request/response
@@ -59,29 +61,46 @@ os.makedirs(attach_dir)
 attachment = os.path.join(attach_dir, "hello.txt")
 with open(attachment, "w") as f:
     f.write("attachment payload for the e2e round\n")
-config_path = os.path.join(workdir, "config.toml")
-with open(config_path, "w") as f:
-    f.write(
-        f'allowed_attachment_dirs = ["{attach_dir}"]\n\n'
+
+
+def account_block(name, user, extra=""):
+    return (
         "[[accounts]]\n"
-        'name = "Greenmail"\n'
+        f'name = "{name}"\n'
         'host = "127.0.0.1"\n'
         "port = 3993\n"
-        'username = "test"\n'
-        'email = "test@localhost"\n'
+        f'username = "{user}"\n'
+        f'email = "{user}@localhost"\n'
         'auth_method = "password"\n'
         'password = "password"\n'
         "accept_invalid_certs = true\n"
+        f"{extra}\n"
     )
 
-proc = subprocess.Popen(
-    [find_binary(), "--config", config_path],
-    stdin=subprocess.PIPE,
-    stdout=subprocess.PIPE,
-    stderr=subprocess.DEVNULL,
-    text=True,
-)
+
+def start(name, accounts):
+    """A server on a config of its own; the previous one, if any, ends."""
+    global proc, _id
+    if proc is not None:
+        proc.stdin.close()
+        proc.wait(timeout=10)
+    path = os.path.join(workdir, f"{name}.toml")
+    with open(path, "w") as f:
+        f.write(f'allowed_attachment_dirs = ["{attach_dir}"]\n\n' + accounts)
+    proc = subprocess.Popen(
+        [BINARY, "--config", path],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    _id = 0
+
+
+BINARY = find_binary()
+proc = None
 _id = 0
+start("config", account_block("Greenmail", "test"))
 
 
 def rpc(method, params=None):
@@ -138,17 +157,22 @@ def ok(name, cond, detail=""):
         print(f"FAIL {name}: {detail}")
 
 
+def handshake():
+    """initialize, then the instructions and tools/list."""
+    init = rpc(
+        "initialize",
+        {
+            "protocolVersion": "2026-07-28",
+            "capabilities": {},
+            "clientInfo": {"name": "e2e", "version": "0"},
+        },
+    )
+    notify("notifications/initialized")
+    return init.get("instructions", ""), rpc("tools/list")["tools"]
+
+
 # --- Handshake ---
-rpc(
-    "initialize",
-    {
-        "protocolVersion": "2026-07-28",
-        "capabilities": {},
-        "clientInfo": {"name": "e2e", "version": "0"},
-    },
-)
-notify("notifications/initialized")
-tools = rpc("tools/list")["tools"]
+_, tools = handshake()
 names = sorted(t["name"] for t in tools)
 ok("tools/list: 19 tools", len(names) == 19, f"{len(names)}: {names}")
 # Annotations tell a client where to ask before a call: without them MCP
@@ -423,6 +447,149 @@ ok(
     and "oauth_token_valid" not in h0
     and "last_error" not in h0,
     str(h0),
+)
+
+# ===== Phase 2: two accounts, the second read-only =====
+# Without `account` the four reading tools read both accounts; a call on one
+# email needs the account its row names.
+start(
+    "zwei-konten",
+    account_block("Greenmail", "test") + account_block("Zweit", "zweit", "read_only = true"),
+)
+instructions, tools = handshake()
+schemas = {t["name"]: t["inputSchema"] for t in tools}
+ok(
+    "two accounts: every tool served, account required for one email only",
+    len(tools) == 19
+    and "account" in schemas["get_email"].get("required", [])
+    and "account" in schemas["list_emails"]["properties"]
+    and "account" not in schemas["list_emails"].get("required", []),
+    str(schemas["get_email"].get("required")),
+)
+ok(
+    "two accounts: the instructions ask for the account",
+    "pass its account, folder and uid" in instructions,
+    instructions[:200],
+)
+
+both = call("list_emails", {"folder": "INBOX", "limit": 50})
+per = {a["account"]: a for a in both.get("accounts", [])}
+rows = both.get("emails", [])
+dates = [r["date"] for r in rows]
+ok(
+    "list_emails without account: counts per account before the rows, rows merged newest first",
+    list(per) == ["Greenmail", "Zweit"]
+    and per["Zweit"]["total"] == 2
+    and both["total"] == sum(a["total"] for a in per.values())
+    and list(both)[:3] == ["total", "matched", "accounts"]
+    and {r["account"] for r in rows} == {"Greenmail", "Zweit"}
+    and dates == sorted(dates, reverse=True),
+    str(both)[:300],
+)
+budget = next((r for r in rows if r["subject"] == "Budget 2027"), None)
+# GreenMail's mails carry no Date header (smtplib adds none): their arrival
+# time stands in, so they can be told apart in time and merged.
+ok(
+    "a mail without a Date header shows its arrival time as date",
+    rows and all(local_time(r.get("date")) for r in rows),
+    str([r.get("date") for r in rows]),
+)
+
+found = call("search_emails", {"from": "alice@example.com"})
+ok(
+    "search_emails without account: both accounts searched, rows name theirs",
+    {r["account"] for r in found.get("emails", [])} == {"Greenmail", "Zweit"}
+    and [a["account"] for a in found.get("accounts", [])] == ["Greenmail", "Zweit"],
+    str(found)[:300],
+)
+
+folders = call("list_folders")
+ok(
+    "list_folders without account: folders of both, each naming its account",
+    {f["account"] for f in folders.get("folders", [])} == {"Greenmail", "Zweit"}
+    and folders.get("total") == len(folders.get("folders", [])),
+    str(folders)[:300],
+)
+
+books = call("list_emails", {"folder": "Bücher"})
+ok(
+    "list_emails on a folder one account lacks: folder_missing_in names it",
+    books.get("folder_missing_in") == ["Zweit"]
+    and [a["account"] for a in books.get("accounts", [])] == ["Greenmail"],
+    str(books)[:300],
+)
+
+drafts_both = call("list_drafts")
+ok(
+    "list_drafts without account: the account without a Drafts folder is named",
+    drafts_both.get("folder_missing_in") == ["Zweit"],
+    str(drafts_both)[:300],
+)
+
+nowhere = call("list_emails", {"folder": "Nirgends"})
+ok(
+    "list_emails on a folder no account has: an error with the folders of each",
+    "error" in nowhere and "Greenmail" in nowhere["error"] and "Zweit" in nowhere["error"],
+    str(nowhere)[:300],
+)
+paged = call("list_emails", {"folder": "INBOX", "offset": 1})
+ok(
+    "offset without account: refused, naming the accounts",
+    "error" in paged and "Greenmail, Zweit" in paged["error"],
+    str(paged),
+)
+no_account = call("get_email", {"folder": "INBOX", "uid": budget["uid"] if budget else 1})
+ok(
+    "get_email without account: refused, naming the accounts",
+    "error" in no_account and "Available: Greenmail, Zweit" in no_account["error"],
+    str(no_account),
+)
+got = call(
+    "get_email",
+    {"account": "zweit", "folder": "INBOX", "uid": budget["uid"] if budget else 1},
+)
+ok(
+    "get_email with the account of the row, in another case",
+    got.get("account") == "Zweit" and got.get("email", {}).get("subject") == "Budget 2027",
+    str(got)[:200],
+)
+refused = call("draft_email", {"account": "Zweit", "to": ["a@example.com"], "subject": "x", "body": "y"})
+ok("draft_email on the read-only account: refused", "error" in refused, str(refused))
+
+# ===== Phase 3: both accounts read-only =====
+# Only the reading tools are served, and the instructions promise no drafts.
+start(
+    "nur-lesen",
+    account_block("Greenmail", "test", "read_only = true")
+    + account_block("Zweit", "zweit", "read_only = true"),
+)
+instructions, tools = handshake()
+ok(
+    "read-only accounts: the nine reading tools only",
+    sorted(t["name"] for t in tools)
+    == [
+        "account_health",
+        "download_attachment",
+        "get_email",
+        "get_thread",
+        "list_accounts",
+        "list_drafts",
+        "list_emails",
+        "list_folders",
+        "search_emails",
+    ],
+    str(sorted(t["name"] for t in tools)),
+)
+ok(
+    "read-only accounts: the instructions say reading only",
+    "Reading only" in instructions and "saved as a draft" not in instructions,
+    instructions[:200],
+)
+unread = call("list_emails", {"folder": "INBOX", "unread_only": True})
+ok(
+    "read-only accounts: unread mail of both accounts in one call",
+    [a["account"] for a in unread.get("accounts", [])] == ["Greenmail", "Zweit"],
+    str(unread)[:200],
 )
 
 # --- isError: the MCP flag for a failed tool execution ---

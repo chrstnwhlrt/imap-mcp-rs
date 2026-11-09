@@ -12,29 +12,21 @@ use super::{ImapMcpServer, ToolResult, error_json};
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MoveEmailRequest {
-    #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
-    )]
+    #[schemars(description = "The emails' account, as their rows name it.")]
     pub account: Option<String>,
     #[schemars(description = "Source folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UIDs to move (from list_emails or search_emails results)")]
     pub uids: Vec<u32>,
-    #[schemars(
-        description = "Destination folder name. Must exist — use list_folders to find valid targets."
-    )]
+    #[schemars(description = "Destination folder name, from list_folders.")]
     pub target_folder: String,
-    #[schemars(
-        description = "If true, validate permissions + inputs but don't actually move; returns a preview payload the LLM can show the user for confirmation. Default: false."
-    )]
+    #[schemars(description = "true: only shows what would happen, changes nothing.")]
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkReadRequest {
-    #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
-    )]
+    #[schemars(description = "The emails' account, as their rows name it.")]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -42,17 +34,13 @@ pub struct MarkReadRequest {
         description = "Email UIDs to mark as read (from list_emails or search_emails results)"
     )]
     pub uids: Vec<u32>,
-    #[schemars(
-        description = "If true, validate permissions + inputs but don't touch IMAP; returns a preview payload. Default: false."
-    )]
+    #[schemars(description = "true: only shows what would happen, changes nothing.")]
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct MarkUnreadRequest {
-    #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
-    )]
+    #[schemars(description = "The emails' account, as their rows name it.")]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
@@ -60,61 +48,47 @@ pub struct MarkUnreadRequest {
         description = "Email UIDs to mark as unread (from list_emails or search_emails results)"
     )]
     pub uids: Vec<u32>,
-    #[schemars(
-        description = "If true, validate permissions + inputs but don't touch IMAP; returns a preview payload. Default: false."
-    )]
+    #[schemars(description = "true: only shows what would happen, changes nothing.")]
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct FlagEmailRequest {
-    #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
-    )]
+    #[schemars(description = "The emails' account, as their rows name it.")]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UIDs to flag (from list_emails or search_emails results)")]
     pub uids: Vec<u32>,
-    #[schemars(
-        description = "If true, validate permissions + inputs but don't touch IMAP; returns a preview payload. Default: false."
-    )]
+    #[schemars(description = "true: only shows what would happen, changes nothing.")]
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct UnflagEmailRequest {
-    #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
-    )]
+    #[schemars(description = "The emails' account, as their rows name it.")]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UIDs to unflag (from list_emails or search_emails results)")]
     pub uids: Vec<u32>,
-    #[schemars(
-        description = "If true, validate permissions + inputs but don't touch IMAP; returns a preview payload. Default: false."
-    )]
+    #[schemars(description = "true: only shows what would happen, changes nothing.")]
     pub dry_run: Option<bool>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct DeleteEmailRequest {
-    #[schemars(
-        description = "Account name (from list_accounts), matched case-insensitively. Optional only when a single account is configured; with multiple accounts it is required — omitting it errors and lists the names."
-    )]
+    #[schemars(description = "The emails' account, as their rows name it.")]
     pub account: Option<String>,
     #[schemars(description = "Folder name (e.g. \"INBOX\")")]
     pub folder: String,
     #[schemars(description = "Email UIDs to delete (from list_emails or search_emails results)")]
     pub uids: Vec<u32>,
     #[schemars(
-        description = "true = EXPUNGE immediately (unrecoverable), false (default) = move to Trash"
+        description = "true only when the user explicitly asks for permanent deletion (endgültig, unwiderruflich), or for emails already in the trash; \"löschen\" alone means the trash."
     )]
     pub permanent: Option<bool>,
-    #[schemars(
-        description = "If true, validate permissions + inputs but don't actually delete; returns a preview payload the LLM can show the user for confirmation. Default: false."
-    )]
+    #[schemars(description = "true: only shows what would happen, changes nothing.")]
     pub dry_run: Option<bool>,
 }
 

@@ -5,7 +5,7 @@ conversation, plus the server configuration that points imap-mcp-rs at it.
 
     welt.py reset [--minimal]  a fresh container (127.0.0.1:3994, IMAPS), both mailboxes filled
     welt.py state [--account NAME]  the current state as JSON on stdout
-    welt.py config             write run/config.toml, run/config-voice.toml and run/config-zwei-konten.toml
+    welt.py config             write run/config.toml, run/config-zwei-konten.toml and run/config-nur-lesen.toml
     welt.py stop               remove the container
 
 From Python, `welt.state()` returns the same as a dict: what a conversation
@@ -547,10 +547,6 @@ CONFIG_HEAD = """\
 allowed_attachment_dirs = ["{downloads}", "{documents}"]
 """
 
-# The tool surface for the small model behind the voice assistant: no
-# dry_run, and an empty word search lists the newest INBOX emails.
-VOICE = 'tool_set = "voice"\n'
-
 CONFIG_ACCOUNT = """
 [[accounts]]
 name = "{name}"
@@ -591,15 +587,20 @@ def cmd_config(_args):
     }.items():
         (documents / name).write_bytes(tiny_pdf(lines))
     head = CONFIG_HEAD.format(host=HOST, port=PORT, downloads=downloads, documents=documents)
-    privat = CONFIG_ACCOUNT.format(name="Privat", host=HOST, port=PORT, login=ACCOUNTS["Privat"]["login"],
-                                   email=ME[1], display=ME[0], read_only="false", password=PASSWORD)
-    arbeit = CONFIG_ACCOUNT.format(name="Arbeit", host=HOST, port=PORT, login=ACCOUNTS["Arbeit"]["login"],
-                                   email=ME_WORK[1], display=ME_WORK[0], read_only="true", password=PASSWORD)
-    write_private(RUN / "config.toml", head + privat)
-    write_private(RUN / "config-voice.toml", head + VOICE + privat)
-    write_private(RUN / "config-zwei-konten.toml", head + privat + arbeit)
-    print(f"{RUN / 'config.toml'} (Konto Privat)\n{RUN / 'config-voice.toml'} (Konto Privat, tool_set voice)\n"
-          f"{RUN / 'config-zwei-konten.toml'} (Privat + Arbeit, read_only)")
+    def account(name, email, read_only):
+        return CONFIG_ACCOUNT.format(name=name, host=HOST, port=PORT, login=ACCOUNTS[name]["login"],
+                                     email=email[1], display=email[0], read_only=read_only, password=PASSWORD)
+
+    write_private(RUN / "config.toml", head + account("Privat", ME, "false"))
+    write_private(RUN / "config-zwei-konten.toml",
+                  head + account("Privat", ME, "false") + account("Arbeit", ME_WORK, "true"))
+    # Both accounts readable only, as Christian runs Otomo: the server then
+    # serves the reading tools alone.
+    write_private(RUN / "config-nur-lesen.toml",
+                  head + account("Privat", ME, "true") + account("Arbeit", ME_WORK, "true"))
+    print(f"{RUN / 'config.toml'} (Konto Privat)\n"
+          f"{RUN / 'config-zwei-konten.toml'} (Privat, dazu Arbeit read_only)\n"
+          f"{RUN / 'config-nur-lesen.toml'} (Privat und Arbeit, beide read_only)")
 
 
 def main():

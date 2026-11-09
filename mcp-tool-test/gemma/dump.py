@@ -7,10 +7,15 @@ included. Resets the world before and after, since the examples write.
     dump.py [--binary PATH] [--config PATH]
 
 Writes run/dump.json (everything, machine-readable) and run/dump.md (the
-same for reading), named after the configuration: run/config-voice.toml
-gives run/dump-voice.json and run/dump-voice.md. Without --binary it takes
+same for reading), named after the configuration: run/config-nur-lesen.toml
+gives run/dump-nur-lesen.json and run/dump-nur-lesen.md. Without --binary it takes
 target/release/imap-mcp-rs of this repository, without --config
 run/config.toml (`welt.py config`).
+
+The examples follow what the configuration serves: a tool it leaves out is
+skipped, and with several accounts a call on one email names the account
+Privat, while the reading tools read both accounts, plus the cases only
+several accounts have.
 """
 import argparse
 import datetime
@@ -117,6 +122,24 @@ def examples(uid, documents):
     ]
 
 
+def examples_across(uid):
+    """The cases only several accounts have."""
+    return [
+        ("list_folders", {"unread_only": True}, "beide Konten: Ordner mit ungelesenen Mails"),
+        ("search_emails", {"text": "Rechnung", "compact": True}, "beide Konten: Volltext"),
+        ("list_emails", {"folder": welt.BILLS, "limit": 3}, "Ordner, den nur Privat hat: folder_missing_in"),
+        ("list_emails", {"folder": "INBOX", "account": "arbeit", "limit": 3}, "nur ein Konto, Name in anderer Schreibung"),
+        ("list_emails", {"folder": "INBOX", "offset": 5}, "Fehler: offset über beide Konten"),
+        ("get_email", {"folder": "INBOX", "uid": uid["mama-sonntag"], NO_ACCOUNT: True},
+         "Fehler: eine Mail ohne Konto"),
+        ("list_emails", {"folder": "Archiv"}, "Fehler: Ordner in keinem Konto"),
+    ]
+
+
+# Marks an example that leaves `account` out on purpose.
+NO_ACCOUNT = "__no_account__"
+
+
 def text_of(result):
     return "".join(block.get("text", "") for block in result.get("content", []) if block.get("type") == "text")
 
@@ -144,10 +167,21 @@ def main():
     server.notify("notifications/initialized")
     tools = server.call("tools/list")["tools"]
 
+    served = {t["name"]: t for t in tools}
+    several = "account" in served["list_emails"]["inputSchema"].get("properties", {})
+    chosen = examples(uid, welt.RUN / "dokumente") + (examples_across(uid) if several else [])
     calls = []
-    for tool, arguments, purpose in examples(uid, welt.RUN / "dokumente"):
+    for tool, arguments, purpose in chosen:
+        if tool not in served:
+            continue
         if arguments.get("uids") == ["<draft_reply>"]:
-            arguments = {"uids": [next(c["uid_saved"] for c in calls if c["tool"] == "draft_reply")]}
+            saved = [c.get("uid_saved") for c in calls if c["tool"] == "draft_reply" and c.get("uid_saved")]
+            if not saved:
+                continue
+            arguments = {"uids": saved[:1]}
+        arguments = dict(arguments)
+        if not arguments.pop(NO_ACCOUNT, False) and "account" in served[tool]["inputSchema"].get("required", []):
+            arguments = {"account": "Privat", **arguments}
         result = server.call("tools/call", {"name": tool, "arguments": arguments})
         text = text_of(result)
         entry = {"tool": tool, "purpose": purpose, "arguments": arguments,

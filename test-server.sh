@@ -5,7 +5,7 @@ echo "Starting GreenMail IMAP test server..."
 podman rm -f imap-test 2>/dev/null || true
 podman run -d --name imap-test \
   -p 3025:3025 -p 3143:3143 -p 3993:3993 \
-  -e GREENMAIL_OPTS="-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=test:password@localhost -Dgreenmail.verbose" \
+  -e GREENMAIL_OPTS="-Dgreenmail.setup.test.all -Dgreenmail.hostname=0.0.0.0 -Dgreenmail.users=test:password@localhost,zweit:password@localhost -Dgreenmail.verbose" \
   docker.io/greenmail/standalone:2.1.15
 
 sleep 3
@@ -77,12 +77,30 @@ msg4['Message-ID'] = make_msgid(domain='example.com')
 
 with smtplib.SMTP('127.0.0.1', 3025) as s:
     s.send_message(msg4)
+
+# A second account for the reads over several accounts (the e2e round's
+# second phase): one mail from the same sender as in the first, one of its
+# own, no Drafts folder.
+time.sleep(1.1)
+for sender, subject, body in [
+    ('alice@example.com', 'Budget 2027', 'The budget draft for 2027 is attached in the wiki.'),
+    ('dana@example.org', 'Workshop Friday', 'The workshop moves to Friday, 2pm.'),
+]:
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = 'zweit@localhost'
+    msg['Message-ID'] = make_msgid(domain='example.com')
+    with smtplib.SMTP('127.0.0.1', 3025) as s:
+        s.send_message(msg)
+    time.sleep(1.1)
 "
 
 echo ""
 echo "GreenMail ready:"
-echo "  IMAPS: 127.0.0.1:3993 (user: test, pass: password)"
+echo "  IMAPS: 127.0.0.1:3993 (user: test, pass: password; second account: zweit, pass: password)"
 echo "  SMTP:  127.0.0.1:3025"
-echo "  Folders: INBOX (4 emails), Drafts, Sent, Trash, B&APw-cher (Bücher)"
+echo "  Folders of test: INBOX (4 emails), Drafts, Sent, Trash, B&APw-cher (Bücher)"
+echo "  Folders of zweit: INBOX (2 emails)"
 echo ""
 echo "Stop with: podman rm -f imap-test"

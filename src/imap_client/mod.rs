@@ -158,6 +158,22 @@ const MAX_FOLDER_COUNT: usize = 10_000;
 // SINCE/BEFORE are day-granular, so the exact bound is applied client-side
 // against the arrival timestamp (not the sender-controlled Date header).
 const SUMMARY_FETCH_ITEMS: &str = "(BODY.PEEK[] FLAGS UID INTERNALDATE)";
+/// One message in full: INTERNALDATE stands in for a missing Date header
+/// (see [`dated`]).
+const MESSAGE_FETCH_ITEMS: &str = "(BODY.PEEK[] FLAGS INTERNALDATE)";
+
+/// A parsed message whose `date` falls back to its arrival time
+/// (INTERNALDATE) when it has no usable Date header. Without one a message
+/// had `date: null`: nothing to tell the user, and nothing to sort it by
+/// among others, which rows merged from several accounts need.
+fn dated(mut email: EmailFull, fetch: &Fetch) -> EmailFull {
+    if email.date.is_none() {
+        email.date = fetch
+            .internal_date()
+            .and_then(|d| email::unix_to_utc_iso(d.timestamp()));
+    }
+    email
+}
 
 /// Client-side full-text criteria for servers whose SEARCH cannot take them
 /// (Outlook 365 silently returns zero matches for `CHARSET UTF-8`). Applied
@@ -305,7 +321,7 @@ fn summarize_fetches(
             continue;
         }
         let flags = parse_flags(fetch);
-        let full = email::parse_email_no_html(uid, folder, body, flags);
+        let full = dated(email::parse_email_no_html(uid, folder, body, flags), fetch);
         // Full-text criteria run here, on the complete message, while it
         // still exists — `summarize` drops the body for the snippet right
         // after.
@@ -621,7 +637,7 @@ impl ImapClient {
         let _greeting = client
             .read_response()
             .await
-            .context("Failed to read server greeting")?;
+            .map_err(|e| anyhow::anyhow!("Failed to read server greeting: {e:#}"))?;
 
         let session = match self.config.auth_method {
             AuthMethod::Password => {
@@ -630,11 +646,14 @@ impl ImapClient {
                     .password
                     .as_deref()
                     .context("Password required but not configured")?;
+                // The server's reason in the message: "IMAP login failed"
+                // alone left "why does my mail not work?" without an answer.
                 client
                     .login(&self.config.username, password)
                     .await
-                    .map_err(|(e, _)| e)
-                    .context("IMAP login failed")?
+                    .map_err(|(e, _)| {
+                        anyhow::anyhow!("IMAP login failed: {}", clean_imap_error(&e.to_string()))
+                    })?
             }
             AuthMethod::OAuth2 => {
                 // Reuse a cached token when it's still within its TTL. Only
@@ -664,9 +683,10 @@ impl ImapClient {
                         // next connect attempt refreshes rather than replaying
                         // a revoked token.
                         self.cached_oauth_token = None;
-                        return Err(
-                            anyhow::Error::from(e).context("IMAP OAuth2 authentication failed")
-                        );
+                        return Err(anyhow::anyhow!(
+                            "IMAP OAuth2 authentication failed: {}",
+                            clean_imap_error(&e.to_string())
+                        ));
                     }
                 }
             }
@@ -811,7 +831,7 @@ impl ImapClient {
                 if says_nonexistent(&err.to_string())
                     && let Some(names) = self.folder_list_without(folder).await
                 {
-                    return Err(unknown_folder_error(folder, &names));
+                    return Err(unknown_folder_error(folder, &names, self.may_delete()));
                 }
                 return Err(err);
             }
@@ -850,22 +870,39 @@ impl ImapClient {
     /// name with other characters is refused here: no wire name has them,
     /// IMAP encodes those as modified UTF-7.
     pub async fn resolve_folder(&mut self, requested: &str) -> Result<String> {
-        if requested.eq_ignore_ascii_case("INBOX") {
-            return Ok("INBOX".to_string());
-        }
-        let names = self.get_folder_names().await?;
-        if let Some(name) = resolve_folder_name(requested, &names) {
-            return Ok(name);
-        }
-        self.cached_folder_names = None;
-        let names = self.get_folder_names().await?;
-        if let Some(name) = resolve_folder_name(requested, &names) {
+        if let Some(name) = self.find_folder(requested).await? {
             return Ok(name);
         }
         if !requested.is_ascii() {
-            return Err(unknown_folder_error(requested, &names));
+            let names = self.get_folder_names().await?;
+            return Err(unknown_folder_error(requested, &names, self.may_delete()));
         }
         Ok(requested.to_string())
+    }
+
+    /// The wire name of the folder a caller means, as [`resolve_folder`]
+    /// finds it, or `None` when this account has no such folder (outside
+    /// `allowed_folders` counts as none). For a read over several accounts,
+    /// where a folder one account lacks is an answer, not an error.
+    ///
+    /// [`resolve_folder`]: Self::resolve_folder
+    pub async fn find_folder(&mut self, requested: &str) -> Result<Option<String>> {
+        if requested.eq_ignore_ascii_case("INBOX") {
+            return Ok(self.is_folder_allowed("INBOX").then(|| "INBOX".to_string()));
+        }
+        let names = self.get_folder_names().await?;
+        if let Some(name) = resolve_folder_name(requested, &names) {
+            return Ok(Some(name));
+        }
+        self.cached_folder_names = None;
+        let names = self.get_folder_names().await?;
+        Ok(resolve_folder_name(requested, &names))
+    }
+
+    /// Whether this account may delete emails: the folder error points at
+    /// `delete_email` only then.
+    const fn may_delete(&self) -> bool {
+        !self.config.read_only && self.config.allow_delete
     }
 
     /// The folder list when it does not contain `folder`; `None` when it does
@@ -1123,7 +1160,7 @@ impl ImapClient {
         self.ensure_selected(folder).await?;
         let session = self.session()?;
         let stream = session
-            .uid_fetch(uid.to_string(), "(BODY.PEEK[] FLAGS)")
+            .uid_fetch(uid.to_string(), MESSAGE_FETCH_ITEMS)
             .await?;
         let fetches: Vec<Fetch> = stream.try_collect().await?;
 
@@ -1133,7 +1170,10 @@ impl ImapClient {
 
         let body = bounded_body(fetch, uid).context("Email has no body (or exceeds size cap)")?;
         let flags = parse_flags(fetch);
-        Ok(Some(email::parse_email(uid, folder, body, flags)))
+        Ok(Some(dated(
+            email::parse_email(uid, folder, body, flags),
+            fetch,
+        )))
     }
 
     /// Search one folder. Returns the summaries (newest first, capped at
@@ -1358,13 +1398,13 @@ impl ImapClient {
             let uid_set = uid_set_string(&uid_vec[start..]);
             self.ensure_selected(folder).await?;
             let session = self.session()?;
-            let stream = session.uid_fetch(&uid_set, "(BODY.PEEK[] FLAGS)").await?;
+            let stream = session.uid_fetch(&uid_set, MESSAGE_FETCH_ITEMS).await?;
             let fetches: Vec<Fetch> = stream.try_collect().await?;
             for fetch in &fetches {
                 let Some(uid) = fetch.uid else { continue };
                 if let Some(body) = bounded_body(fetch, uid) {
                     let flags = parse_flags(fetch);
-                    emails.push(email::parse_email(uid, folder, body, flags));
+                    emails.push(dated(email::parse_email(uid, folder, body, flags), fetch));
                 }
             }
         }
@@ -1411,7 +1451,7 @@ impl ImapClient {
                     // Use silent-fail semantics here too: a FETCH failure for
                     // sent-folder messages shouldn't lose the primary-folder
                     // thread emails we already collected.
-                    let fetch_result = session.uid_fetch(&uid_set, "(BODY.PEEK[] FLAGS)").await;
+                    let fetch_result = session.uid_fetch(&uid_set, MESSAGE_FETCH_ITEMS).await;
                     let fetches: Vec<Fetch> = match fetch_result {
                         Ok(stream) => match stream.try_collect().await {
                             Ok(v) => v,
@@ -1429,7 +1469,7 @@ impl ImapClient {
                         let Some(uid) = fetch.uid else { continue };
                         if let Some(body) = bounded_body(fetch, uid) {
                             let flags = parse_flags(fetch);
-                            emails.push(email::parse_email(uid, &sent, body, flags));
+                            emails.push(dated(email::parse_email(uid, &sent, body, flags), fetch));
                         }
                     }
                 }
@@ -1516,7 +1556,7 @@ impl ImapClient {
         // Checked before anything moves; the server's own refusal of the
         // COPY would only say "doesn't exist", without the names to pick from.
         if let Some(names) = self.folder_list_without(target).await {
-            return Err(unknown_folder_error(target, &names));
+            return Err(unknown_folder_error(target, &names, self.may_delete()));
         }
         // Confirmation source for the response — see `existing_uids` for why
         // this is a SEARCH up front rather than the STORE acknowledgements.
@@ -1851,9 +1891,12 @@ impl ImapClient {
 
     async fn establish_tls(&self) -> Result<TlsStream<TcpStream>> {
         let addr = format!("{}:{}", self.config.host, self.config.port);
+        // The cause in the message ("Connection refused", "timed out"): it is
+        // what tells a caller the failure is transient (`retryable`), and
+        // what `account_health` reports.
         let tcp_stream = TcpStream::connect(&addr)
             .await
-            .with_context(|| format!("Failed to connect to {addr}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to connect to {addr}: {e}"))?;
 
         // TCP keepalive: first probe after 30 s idle, then every 10 s, and
         // three unanswered probes drop the connection — a dead peer is
@@ -1898,7 +1941,7 @@ impl ImapClient {
         let tls_stream = connector
             .connect(domain, tcp_stream)
             .await
-            .context("TLS handshake failed")?;
+            .map_err(|e| anyhow::anyhow!("TLS handshake failed: {e}"))?;
 
         Ok(tls_stream)
     }
@@ -2077,10 +2120,28 @@ fn says_nonexistent(message: &str) -> bool {
 }
 
 /// The error for a folder the account does not have, naming the ones it has
-/// so the next call can take one instead of guessing again: INBOX first,
-/// then alphabetically, the readable name in parentheses where the wire
-/// name is encoded, at most 20 of them.
-fn unknown_folder_error(folder: &str, names: &[String]) -> anyhow::Error {
+/// so the next call can take one instead of guessing again (see
+/// [`folder_names_shown`]). `trash_hint`: the account may delete, so the
+/// error can point at `delete_email` for a model looking for the trash.
+fn unknown_folder_error(folder: &str, names: &[String], trash_hint: bool) -> anyhow::Error {
+    // The last sentence names the next call: "use delete_email" alone made a
+    // model tell the user which folder to use instead of making the call.
+    let trash = if trash_hint {
+        " To move emails to the trash, call delete_email with the same folder and uids; it puts \
+         them there."
+    } else {
+        ""
+    };
+    anyhow::anyhow!(
+        "Folder \"{folder}\" does not exist. Folders: {}.{trash}",
+        folder_names_shown(names)
+    )
+}
+
+/// The folder names an error offers: INBOX first, then alphabetically, the
+/// readable name in parentheses where the wire name is encoded, at most 20
+/// of them.
+pub fn folder_names_shown(names: &[String]) -> String {
     const SHOWN: usize = 20;
     let mut ordered: Vec<&String> = names.iter().collect();
     ordered.sort_by_key(|name| (!name.eq_ignore_ascii_case("INBOX"), name.to_lowercase()));
@@ -2098,13 +2159,7 @@ fn unknown_folder_error(folder: &str, names: &[String]) -> anyhow::Error {
     } else {
         String::new()
     };
-    // The last sentence names the next call: "use delete_email" alone made a
-    // model tell the user which folder to use instead of making the call.
-    anyhow::anyhow!(
-        "Folder \"{folder}\" does not exist. Folders: {}{rest}. To move emails to the trash, call \
-         delete_email with the same folder and uids; it puts them there.",
-        shown.join(", ")
-    )
+    format!("{}{rest}", shown.join(", "))
 }
 
 /// The readable form of a folder name, when it is safe to show.
@@ -2419,15 +2474,18 @@ mod tests {
             .iter()
             .map(|s| (*s).to_string())
             .collect();
-        let err = unknown_folder_error("Trash", &names).to_string();
+        let err = unknown_folder_error("Trash", &names, true).to_string();
         assert_eq!(
             err,
             "Folder \"Trash\" does not exist. Folders: INBOX, Entw&APw-rfe (Entwürfe), \
              Gesendete Elemente, Rechnungen. To move emails to the trash, call delete_email with \
              the same folder and uids; it puts them there."
         );
+        // An account that may not delete is not sent to delete_email.
+        let err = unknown_folder_error("Trash", &names, false).to_string();
+        assert!(err.ends_with("Gesendete Elemente, Rechnungen."), "{err}");
         let many: Vec<String> = (0..25).map(|i| format!("Ordner {i:02}")).collect();
-        let err = unknown_folder_error("X", &many).to_string();
+        let err = unknown_folder_error("X", &many, true).to_string();
         assert!(
             err.contains("Ordner 19 … and 5 more, see list_folders."),
             "{err}"
