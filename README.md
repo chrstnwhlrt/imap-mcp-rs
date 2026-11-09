@@ -287,6 +287,7 @@ The server maintains one persistent IMAP connection per account with several res
 - **Folder name caching** — IMAP LIST is called once per session per account, and again when a name is not in the cached list (a folder created in another client meanwhile)
 - **TCP keepalive** — first probe after 30 seconds of silence, then every 10 seconds; three unanswered probes drop the connection, so a dead one is noticed within about 60 seconds (Linux and macOS)
 - **Auto-reconnect** — if a connection drops, the next tool call automatically reconnects. Failed accounts at startup reconnect on first use
+- **Server-closed sessions** count as dead connections. A session the server has ended (an idle timeout, an admin's kick) makes the next command fail instead of "succeed" with an empty answer, which is how async-imap reads a closed connection. Reads then reconnect and repeat; before a write a NOOP checks the session and reconnects when needed
 - **Transparent retry** — idempotent read-only operations (SEARCH, FETCH, LIST, STATUS) automatically retry once on connection errors, so transient `broken pipe` failures don't bubble up to the caller. Write operations (APPEND, COPY) never retry to avoid duplicate messages
 - **Connection error detection** — heuristic detection of network errors vs. IMAP protocol errors. Only network errors trigger reconnect
 
@@ -719,7 +720,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 339 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 340 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
@@ -772,7 +773,7 @@ podman rm -f imap-test
 
 ### Measuring with a small model
 
-`mcp-tool-test/gemma/` holds the kit that shaped `tool_set = "voice"`: a Dovecot container with an invented mailbox (`welt.py`, reset before every conversation), a catalog of spoken requests with checks on the resulting mailbox, and the runners for Gemma 4 E4B behind the Otomo voice assistant and for Claude as the cross-check. It never talks to a real mailbox. `dump.py` records what the server hands a model in that world, the instructions, `tools/list` and example calls with their results. Its README (German) says how to run it, `EMPFEHLUNG.md` holds the results: with `voice`, Gemma handled 84 of 99 requests where the 2.0.0 texts managed 34 of 62, and 25 of 28 held-out requests instead of 11, while Claude with `full` lost nothing.
+`mcp-tool-test/gemma/` holds the kit that shaped `tool_set = "voice"`: a Dovecot container with an invented mailbox (`welt.py`, reset before every conversation), a catalog of spoken requests with checks on the resulting mailbox, and the runners for Gemma 4 E4B behind the Otomo voice assistant and for Claude as the cross-check. It never talks to a real mailbox. `dump.py` records what the server hands a model in that world, the instructions, `tools/list` and example calls with their results, and `kick.py` checks that reads and writes succeed right after the server ended the session (`doveadm kick`). Its README (German) says how to run it, `EMPFEHLUNG.md` holds the results: with `voice`, Gemma handled 84 of 99 requests where the 2.0.0 texts managed 34 of 62, and 25 of 28 held-out requests instead of 11, while Claude with `full` lost nothing.
 
 ## Architecture
 

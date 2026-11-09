@@ -41,6 +41,17 @@ concern behaviour that predates the update.
 
 ### Fixed
 
+- **A session the server had ended returned empty results instead of an
+  error.** Gmail and Outlook close IMAP sessions after a spell without
+  traffic, and the server noticed only with the next command. async-imap
+  took the closed connection for the end of that command's answer, so the
+  command "succeeded" with nothing: `list_folders` showed no folders, a
+  search found nothing, a flag change reported nothing changed, and the
+  empty folder list stayed cached, so Drafts and Trash were gone until a
+  restart. A closed connection is now an error. Reads reconnect and repeat,
+  and a write, which is never repeated, checks the session with NOOP first.
+  `mcp-tool-test/gemma/kick.py` checks this against Dovecot (`doveadm
+  kick`): 1 of 9 checks passed before, 9 of 9 now.
 - **Gmail OAuth2 did not work.** Google's token endpoint answers HTTP/1.1
   with `Transfer-Encoding: chunked`, and the minimal HTTPS client parsed the
   raw body, chunk sizes included, as JSON. Every token refresh and every
@@ -310,7 +321,7 @@ concern behaviour that predates the update.
   mailbox, and GreenMail fails a FETCH that races another session's
   EXPUNGE, so parallel runs failed at random.
 
-339 unit tests (up from 283), 22 GreenMail integration tests (up from 17)
+340 unit tests (up from 283), 22 GreenMail integration tests (up from 17)
 and 45 checks in the MCP end-to-end script (up from 35). `test-server.sh`
 also creates `B&APw-cher` (Bücher), a folder whose name is encoded on the
 wire.

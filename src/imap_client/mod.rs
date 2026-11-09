@@ -55,7 +55,79 @@ macro_rules! retry_read {
     }};
 }
 
-type ImapSession = Session<TlsStream<TcpStream>>;
+type ImapSession = Session<ClosedIsError<TlsStream<TcpStream>>>;
+
+/// The TLS stream with a clean end of stream turned into an error.
+///
+/// A server that ends a session itself (Gmail and Outlook after a spell
+/// without traffic, Dovecot on `doveadm kick`) sends `BYE` and closes the
+/// connection. async-imap reads a command's responses up to its tagged
+/// completion and takes a clean end of stream for that completion: the
+/// command "succeeded" with what it had read until then, usually nothing.
+/// A LIST then reported no folders, and the empty list was cached, so the
+/// account had no Drafts or Trash until a restart; a STORE reported nothing
+/// changed and a SELECT an empty folder. As an error the end of stream takes
+/// the path of every other dead connection: reads reconnect and repeat, the
+/// caller of a write gets `retryable: true`.
+#[derive(Debug)]
+struct ClosedIsError<S>(S);
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ClosedIsError<S> {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        // Zero bytes into a buffer with room is how a reader reports the end
+        // of the stream; into a full buffer they mean nothing.
+        let room = buf.remaining() > 0;
+        let before = buf.filled().len();
+        let poll = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
+        if room && matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before {
+            return std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "connection closed by the server",
+            )));
+        }
+        poll
+    }
+}
+
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ClosedIsError<S> {
+    fn poll_write(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+    }
+
+    fn poll_write_vectored(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        bufs: &[std::io::IoSlice<'_>],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.0.is_write_vectored()
+    }
+
+    fn poll_flush(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+    }
+}
 
 /// Hard cap on a single email body (raw RFC 822 bytes, already decoded by
 /// IMAP's BODY[] fetch). Defends against a compromised or malicious server
@@ -541,7 +613,7 @@ impl ImapClient {
             "connect() called while session is Some — caller forgot mark_dead/disconnect"
         );
         let tls_stream = self.establish_tls().await?;
-        let mut client = async_imap::Client::new(tls_stream);
+        let mut client = async_imap::Client::new(ClosedIsError(tls_stream));
 
         // Read the server greeting before any commands.
         // async-imap's Client::new() doesn't consume the greeting, which causes
@@ -678,6 +750,22 @@ impl ImapClient {
             "IMAP session lost, attempting reconnect..."
         );
         self.connect_bounded().await
+    }
+
+    /// Before a write, which is never retried: replace a session the server
+    /// has closed since the last command, so the write does not fail on it.
+    /// Servers end quiet sessions after a while (Gmail and Outlook do), and
+    /// only the next command finds out; a read then reconnects and repeats,
+    /// a write came back as "Broken pipe". NOOP changes nothing, so it may
+    /// go through `retry_read!`.
+    async fn ensure_live(&mut self) -> Result<()> {
+        retry_read!(self.noop_once())
+    }
+
+    async fn noop_once(&mut self) -> Result<()> {
+        self.ensure_connected().await?;
+        self.session()?.noop().await?;
+        Ok(())
     }
 
     /// Select a folder, skipping the IMAP command if it is already selected.
@@ -1387,6 +1475,7 @@ impl ImapClient {
         if uids.is_empty() {
             return Ok(vec![]);
         }
+        self.ensure_live().await?;
         self.ensure_selected(folder).await?;
         let session = self.session()?;
 
@@ -1422,6 +1511,7 @@ impl ImapClient {
                 "Source and target folder are the same (\"{folder}\") — there is nothing to move"
             );
         }
+        self.ensure_live().await?;
         self.ensure_selected(folder).await?;
         // Checked before anything moves; the server's own refusal of the
         // COPY would only say "doesn't exist", without the names to pick from.
@@ -1616,6 +1706,7 @@ impl ImapClient {
             return Ok(vec![]);
         }
         if permanent {
+            self.ensure_live().await?;
             self.ensure_selected(folder).await?;
             self.expunge_uids_in_selected(uids).await
         } else {
@@ -1671,6 +1762,7 @@ impl ImapClient {
             anyhow::bail!("Drafts folder \"{drafts}\" is not in allowed_folders for this account");
         }
 
+        self.ensure_live().await?;
         self.ensure_selected(&drafts).await?;
         // Reports the UIDs that existed — an already-gone draft must not be
         // reported as deleted; `note_replacement` turns exactly that case
@@ -1699,7 +1791,7 @@ impl ImapClient {
             anyhow::bail!("Drafts folder \"{drafts}\" is not in allowed_folders for this account");
         }
 
-        self.ensure_connected().await?;
+        self.ensure_live().await?;
         let session = self.session()?;
         // `\Seen` alongside `\Draft`: clients save their own drafts as read;
         // an unseen draft shows up bold/unread in the Drafts folder and marks
@@ -2263,6 +2355,23 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A server that ends the session closes the connection cleanly. Read as
+    /// the end of a command's responses, that made the command "succeed"
+    /// with nothing; it has to surface as the connection error it is.
+    #[tokio::test]
+    async fn a_closed_connection_reads_as_an_error_not_as_the_end() {
+        use tokio::io::AsyncReadExt as _;
+        let mut stream = ClosedIsError(&b"* BYE Disconnected\r\n"[..]);
+        let mut buf = [0u8; 64];
+        assert_eq!(stream.read(&mut buf).await.unwrap(), 20);
+        let err = stream.read(&mut buf).await.unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert!(is_connection_error(&err.to_string()), "{err}");
+        assert!(is_retryable_error(&err.to_string()), "{err}");
+        // A read with no room in the buffer is not an end of stream.
+        assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+    }
 
     /// A folder whose raw name is pure ASCII sails past the control/bidi
     /// filter, while its decoded form carries a right-to-left override — the
