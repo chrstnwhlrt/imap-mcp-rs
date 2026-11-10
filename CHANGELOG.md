@@ -3,6 +3,30 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.1.1
+
+All dependencies and the toolchain at their newest releases. Nothing a
+client sees changes: `initialize` and `tools/list` are byte for byte those
+of 3.1.0, compared for nine configs (the three of the Gemma kit and six
+variants with fewer permissions, no signature or a signature on only one of
+two accounts) and three protocol versions.
+
+### Changed
+
+- jiff 0.2.42 and uuid 1.29.2, and further down the tree syn 3.0.10, itoa
+  1.0.19 and crc32fast 1.5.5. No major version is outstanding anywhere in
+  the tree.
+- The flake's rust-overlay input moved to its state of 10 November 2026,
+  nixpkgs and crane were already current. The toolchain is Rust 1.99.1, the
+  newest stable release. `rust-version` stays at 1.98, the floor set by
+  mail-parser 1.0, and the tests pass with that version.
+- cargo audit reports no vulnerability, only that pin-utils is unmaintained
+  (RUSTSEC-2026-0441). It comes in through async-imap 0.12.0, the newest
+  release, so only a new async-imap can remove it.
+
+350 unit tests, 23 GreenMail integration tests and 73 checks in the MCP
+end-to-end script.
+
 ## 3.1.0
 
 Answers that leave a small model less to infer, found in the tool calls

@@ -43,7 +43,7 @@ futures-util = "0.3.34"
 # `all` exposes `TcpKeepalive::with_retries` (the probe count); no extra
 # dependencies.
 socket2 = { version = "0.6.5", features = ["all"] }
-uuid = { version = "1.29.1", features = ["v4"] }
+uuid = { version = "1.29.2", features = ["v4"] }
 # PKCE (RFC 7636): SHA-256 + CSPRNG from the same provider rustls already
 # uses, and URL-safe base64. Both are already in the tree transitively.
 aws-lc-rs = { version = "1.19.0", default-features = false, features = ["aws-lc-sys"] }
@@ -53,4 +53,4 @@ base64 = "0.23.1"
 # jiff renders the Date header with the local UTC offset like desktop
 # clients do, instead of mail-builder's UTC fallback.
 ammonia = "4.2.4"
-jiff = "0.2.41"
+jiff = "0.2.42"
