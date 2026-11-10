@@ -1,6 +1,6 @@
 # Ergebnis der Messung für imap-mcp-rs
 
-Stand 09.11.2026, Messkit in diesem Ordner (README.md). Gemessen wurde Gemma 4 E4B in Otomo (Ollama, gemma4-e4b-mtp, 32k Kontext) gegen die Welt aus `welt.py`, dazu Claude Sonnet 5.5 als Gegenprobe. Vorher meint die Texte von 2.0.0 vor `tool_set` (heute `full`). Nachher meint für Gemma `tool_set = "voice"` und für Claude `full`, beides mit allen Serveränderungen aus diesem Loop und gemessen gegen das gebaute Binary ohne Nachbildung. Den Stand danach, eine Oberfläche ohne `tool_set`, beschreibt der Abschnitt "Eine Oberfläche für Gemma und Claude".
+Stand 10.11.2026, Messkit in diesem Ordner (README.md). Gemessen wurde Gemma 4 E4B in Otomo (Ollama, gemma4-e4b-mtp, 32k Kontext) gegen die Welt aus `welt.py`, dazu Claude Sonnet 5.5 als Gegenprobe. Vorher meint die Texte von 2.0.0 vor `tool_set` (heute `full`). Nachher meint für Gemma `tool_set = "voice"` und für Claude `full`, beides mit allen Serveränderungen aus diesem Loop und gemessen gegen das gebaute Binary ohne Nachbildung. Den Stand danach, eine Oberfläche ohne `tool_set`, beschreibt der Abschnitt "Eine Oberfläche für Gemma und Claude", was 3.0.1 und 3.1.0 an den Antworten geändert haben der Abschnitt "Die Antworten (3.0.1 und 3.1.0)".
 
 ## Ergebnis
 
@@ -39,6 +39,31 @@ Bei Konten, die nur lesen dürfen, entschied ein Satz der Instructions. Gezielt 
 
 Mit zwei Läufen schwanken die Zahlen um einen bis zwei Treffer, gegen `-3` kamen `NUR_LESEN` und der frische Satz je einen Treffer unter `-2` heraus. Die gezielten Läufe mit vier Wiederholungen sprechen für `-3`. Etwa eines von vier Malen geht eine Folgefrage daneben. Nach "Was schreibt Mama?" behauptet Gemma auf "Schreib ihr zurück, dass wir kommen." dann, sie habe geantwortet. Otomo prüft solche Antworten mit seinem Torwächter, der wertete "Ich habe eine E-Mail an die Personalabteilung formuliert ... Möchtest du, dass ich diese E-Mail jetzt versende?" aber nicht als Behauptung. Das ist ein Punkt für Otomo. In Otomo gab Gemma "Antworte Mama ..." zudem einmal an einen Agenten weiter, statt gleich abzusagen. "Muss ich am Samstag mit irgendwelchen Ausfällen rechnen?" nennt keine Mail, Gemma fragt dort zu Recht nach dem Ort.
 
+## Die Antworten (3.0.1 und 3.1.0)
+
+In der Nacht zum 10.11.2026 lief der Katalog mit 3.0.1 noch einmal. Die Mitschnitte in `work/` zeigten dabei, wo der Server Gemma etwas erschließen ließ, das er auch hätte sagen können. 3.0.1 behebt außerdem einen Fehler, der älter ist als die Messung: `list_emails` mit `unread_only` lieferte bei einem Konto die älteste ungelesene Mail zuerst, in den Mitschnitten 14 Mal. Seit 3.0.1 übernimmt eine Überarbeitung mit `replaces_uid` auch `to`, `cc` und `subject` des alten Entwurfs, vorher brauchte Gemma dafür einmal drei Anläufe. Ein Kontoname als Ordner ("Arbeit") bekommt einen Hinweis auf das Konto.
+
+3.1.0 wurde als `run/bin/imap-mcp-rs-eine-oberflaeche-4` gemessen und ändert keinen Text, nur Antworten:
+
+- Die neuesten Mails nach einer leeren Suche (`newest`) tragen den Anfang ihres Textes.
+- Jede Entwurfsantwort sagt direkt nach `status`, dass nichts verschickt wurde ("saved": "as a draft in Drafts; nothing was sent, the user sends it").
+- `list_emails` mit `unread_only` nennt seine Zahl auch `unread`, vor `total`.
+- Findet eine Suche nichts und ist ein Suchwort ein Kontoname, beginnt der Hinweis mit dem Weg zu diesem Konto.
+
+| Messung | 3.0.1 | 3.1.0 | Claude auf 3.1.0 |
+|---|---|---|---|
+| Katalog (33 Bitten, 3 Läufe) | 86/99 | 94/99 | 28/28 |
+| zurückgehaltene Bitten (14, 2 Läufe) | 26/28 | 25/28 | 12/12 |
+| `NUR_LESEN` (14 Bitten, 2 Läufe) | 24/28 | 26/28 | 11/11 |
+| frischer Satz (7 Bitten, 2 Läufe) | 14/14 | 13/14 | 6/6 |
+| frischer Satz nur lesend (6 Bitten, 2 Läufe) | 10/12 | 8/12 | 5/5 |
+
+Den größten Sprung machte "Was braucht die Steuerberaterin noch von mir?" mit 0/3 auf 3/3. Gemma findet Selin Kaya in `newest` und liest die Antwort jetzt gleich aus dem Textanfang ("... brauche ich bis zum 30.11. noch: - die Lohnsteuerbescheinigung 2025 ..."). Ebenso stiegen "Hat Jonas auf meine Antwort reagiert?" und "Hab ich was von Amazon bekommen? / Lösch die Mail." von 1/3 auf 3/3, "Schick die Antwort jetzt ab." von 2/3 auf 3/3 und die beiden Absagen beim Antworten nur lesend von 1/2 auf 2/2. "Leite die Rechnung von den Stadtwerken an die Steuerberaterin weiter." kam von 0/3 auf 1/3, zweimal schrieb Gemma den Entwurf und sagte trotzdem "weitergeleitet".
+
+Bei zwei oder drei Läufen fielen "Markier die Rechnung von den Stadtwerken als wichtig" (3/3 auf 1/3), "Was wollte Ben von mir?" (3/3 auf 2/3), "Leg die Telekom-Rechnung zurück in den Posteingang." (2/2 auf 1/2), "Leite das an Jonas weiter" (2/2 auf 1/2), "Verschieb die Mail vom Radhaus in den Papierkorb" (2/2 auf 1/2, eine leere Antwort aus Otomo) und nur lesend "Leite die Urlaubsgenehmigung an Mama weiter." (1/2 auf 0/2). Keiner dieser Fehlgriffe hängt erkennbar an den vier Änderungen. Mit je sechs Läufen wiederholt kamen Weiterleiten und Papierkorb nur lesend mit 3.1.0 auf 11/12 gegen 10/12 mit 3.0.1. Die Stadtwerke-Markierung kam auf 6/6 gegen 4/6, wobei 3.0.1 zweimal beide Rechnungen markierte.
+
+Zur Bestätigung lief 3.1.0 aus dem nix profile je einmal. Gemma kam im Katalog auf 32/33, einmal führte sie "Markier die Mail von Amazon wieder als ungelesen" nicht aus. Bei `NUR_LESEN` kam sie auf 13/14, die eine Lücke ist wieder "Muss ich am Samstag mit irgendwelchen Ausfällen rechnen?" mit der Gegenfrage nach dem Ort. Claude kam auf 28/28 und 11/11. Otomo läuft seit dem 10.11.2026 um 03:13 Uhr mit 3.1.0.
+
 ## Was gewirkt hat
 
 1. **Die Zeile des Torwächters.** Otomo fragt vor jeder Antwort Gemma selbst, ob die Bitte ein Werkzeug braucht, und zeigt ihr dafür von jedem Werkzeug nur den Namen und die ersten 140 Zeichen der Beschreibung. Die alten Beschreibungen begannen mit Technik ("Search emails by combinable criteria ..."). Bei "Was schreibt Mama?", "Wann kommt mein Paket?" oder "Antworte Mama: ..." sagte der Torwächter deshalb nein und Gemma antwortete, ohne nachzusehen. Die Beschreibungen in `voice` beginnen mit dem, was der Nutzer davon hat, und nennen in den ersten 140 Zeichen Inhalte wie Rechnungen, Pakete und Termine. Ohne die neuen Beschreibungen fiel "Wann kommt mein Paket?" wieder auf 0/2.
@@ -53,12 +78,11 @@ Die Regel für Wörter mit Bindestrich (Teile ab drei Buchstaben, "Telekom-Rechn
 ## Verworfen
 
 - **Die Mail im Fokus**, also die Mail des letzten Zugs als Ziel, wenn `uids` fehlt. Bei "Wann kommt mein Paket?" und danach "Markier die Mail als wichtig." fragte Gemma "Welche Mail?", ohne ein Werkzeug zu rufen, mit und ohne Fokus 0/4.
-- **`matched` vor `total` bei mehreren Konten.** Auf "Wie viele ungelesene Mails habe ich gerade?" nannte Gemma einmal "15 ungelesene", die Zahl aller Mails beider Posteingänge (`total`). Mit `matched` vor `total`, per Proxy nachgebildet, kam gezielt 7/8 wie ohne (`texts/matched-first.json`). Die Reihenfolge bleibt.
+- **`matched` vor `total` bei mehreren Konten.** Auf "Wie viele ungelesene Mails habe ich gerade?" nannte Gemma einmal "15 ungelesene", die Zahl aller Mails beider Posteingänge (`total`). Mit `matched` vor `total`, per Proxy nachgebildet, kam gezielt 7/8 wie ohne (`texts/matched-first.json`). Die Reihenfolge bleibt. In 3.1.0 steht stattdessen `unread` vor `total`, als Teil der vier Änderungen gemessen.
+- **"Rows come newest first: when the user means one email, it is the first row."** am Ende der Beschreibung von `search_emails`, per Proxy über 3.1.0 nachgebildet (`texts/newest-first.json`). Die Stadtwerke-Markierung kam mit und ohne den Satz auf 6/6 bei je sechs Läufen. Der Katalog kam mit ihm auf 63/66 bei zwei Läufen (ohne 94/99 bei drei), die zurückgehaltenen Bitten wie ohne auf 25/28. Der Satz bringt nichts, was 3.1.0 nicht schon hat.
 - **Eine Umbenennung von list_drafts.** Gemma ruft das Werkzeug als "list_draft" oder "list_draft_emails" auf. Das gehört in Otomo, das bei einem unbekannten Namen die ähnlichsten vorschlägt und dabei "draft" und "drafts" für verschiedene Wörter hält.
 
 ## Grenzen, die kein Servertext löst
 
 - "Ergänz im Entwurf an Frau Kaya ..." 0/3: der verstümmelte Name von `list_drafts`, danach gibt Gemma ohne Antwort auf. Das ist ein Punkt für Otomo.
-- Eine Person nach ihrer Rolle ("Was braucht die Steuerberaterin noch von mir?"): Über `newest` findet Gemma Selin Kaya, liest die Mail dann aber nicht und fragt nach (0/3).
-- Zwei Treffer, von denen der neueste gemeint ist ("Markier die Rechnung von den Stadtwerken als wichtig", 1/3): Die Suche über alle Ordner findet auch die Rechnung vom September in Rechnungen und Gemma nimmt sie.
 - Eine Folgefrage ohne Anker im Gesagten ("Markier die Mail als wichtig" nach einer Antwort, die die Mail nicht nennt): Otomos Verlauf behält nur Gesprochenes, Gemma fragt nach.
