@@ -53,7 +53,7 @@ base64 = "0.23.1"
 # jiff renders the Date header with the local UTC offset like desktop
 # clients do, instead of mail-builder's UTC fallback.
 ammonia = "4.2.4"
-jiff = "0.2.42"
+jiff = "0.2.43"
 
 # `geteuid` for the owner check of the attachment directory: std has no safe
 # way to ask for the process's user. Already in the tree through tokio and
