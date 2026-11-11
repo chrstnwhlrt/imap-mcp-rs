@@ -55,24 +55,90 @@ macro_rules! retry_read {
     }};
 }
 
-type ImapSession = Session<ClosedIsError<TlsStream<TcpStream>>>;
+type ImapSession = Session<GuardedStream<TlsStream<TcpStream>>>;
 
-/// The TLS stream with a clean end of stream turned into an error.
+/// How long the session waits without a single byte from the server, or
+/// without the server taking a single byte, before the connection counts as
+/// dead (see [`GuardedStream`]). Generous for a live server: an answer that
+/// keeps coming restarts it with every byte, and Dovecot reports progress
+/// during a long SEARCH.
+const STALL_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// The TLS stream as the session reads and writes it, with two kinds of
+/// silence turned into errors.
 ///
-/// A server that ends a session itself (Gmail and Outlook after a spell
-/// without traffic, Dovecot on `doveadm kick`) sends `BYE` and closes the
-/// connection. async-imap reads a command's responses up to its tagged
-/// completion and takes a clean end of stream for that completion: the
-/// command "succeeded" with what it had read until then, usually nothing.
-/// A LIST then reported no folders, and the empty list was cached, so the
-/// account had no Drafts or Trash until a restart; a STORE reported nothing
-/// changed and a SELECT an empty folder. As an error the end of stream takes
-/// the path of every other dead connection: reads reconnect and repeat, the
-/// caller of a write gets `retryable: true`.
+/// A clean end of stream. A server that ends a session itself (Gmail and
+/// Outlook after a spell without traffic, Dovecot on `doveadm kick`) sends
+/// `BYE` and closes the connection. async-imap reads a command's responses
+/// up to its tagged completion and takes a clean end of stream for that
+/// completion: the command "succeeded" with what it had read until then,
+/// usually nothing. A LIST then reported no folders, and the empty list was
+/// cached, so the account had no Drafts or Trash until a restart; a STORE
+/// reported nothing changed and a SELECT an empty folder.
+///
+/// A wait without progress. A server that takes a command and then says
+/// nothing, or a path that died without FIN or RST (a DSL reconnect at
+/// night), kept the read waiting for TCP's retransmission timeout, a quarter
+/// of an hour, with the account's lock held: every later call on the account
+/// ran into its client's timeout until the server restarted. After `stall`
+/// without a byte either way, the wait ends with the error a dead connection
+/// gives anyway (see [`stalled`]).
+///
+/// Both take the path of every other dead connection: reads reconnect and
+/// repeat, the caller of a write gets `retryable: true`, and the next call
+/// finds the account free.
 #[derive(Debug)]
-struct ClosedIsError<S>(S);
+struct GuardedStream<S> {
+    inner: S,
+    stall: Duration,
+    read_wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    write_wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+}
 
-impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ClosedIsError<S> {
+impl<S> GuardedStream<S> {
+    const fn new(inner: S, stall: Duration) -> Self {
+        Self {
+            inner,
+            stall,
+            read_wait: None,
+            write_wait: None,
+        }
+    }
+}
+
+/// The error of a stalled connection: the operating system's own for a
+/// connection that timed out, the one TCP keepalive raises for a dead peer.
+/// A caller (and a model) sees nothing it could not see before, and it
+/// counts as a dead connection, retryable.
+fn stalled() -> std::io::Error {
+    #[cfg(unix)]
+    {
+        std::io::Error::from_raw_os_error(libc::ETIMEDOUT)
+    }
+    #[cfg(not(unix))]
+    {
+        std::io::Error::from(std::io::ErrorKind::TimedOut)
+    }
+}
+
+/// What a pending read or write becomes: still pending, or the error of a
+/// stalled connection once `stall` has passed since it began to wait. The
+/// timer is armed on the first `Pending` and dropped on every `Ready`, so
+/// each byte starts the wait anew.
+fn pending_or_stalled<T>(
+    wait: &mut Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    stall: Duration,
+    cx: &mut std::task::Context<'_>,
+) -> std::task::Poll<std::io::Result<T>> {
+    let timer = wait.get_or_insert_with(|| Box::pin(tokio::time::sleep(stall)));
+    if timer.as_mut().poll(cx).is_ready() {
+        *wait = None;
+        return std::task::Poll::Ready(Err(stalled()));
+    }
+    std::task::Poll::Pending
+}
+
+impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for GuardedStream<S> {
     fn poll_read(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
@@ -82,24 +148,37 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for ClosedIsError<S> 
         // of the stream; into a full buffer they mean nothing.
         let room = buf.remaining() > 0;
         let before = buf.filled().len();
-        let poll = std::pin::Pin::new(&mut self.0).poll_read(cx, buf);
-        if room && matches!(poll, std::task::Poll::Ready(Ok(()))) && buf.filled().len() == before {
-            return std::task::Poll::Ready(Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "connection closed by the server",
-            )));
+        let this = &mut *self;
+        match std::pin::Pin::new(&mut this.inner).poll_read(cx, buf) {
+            std::task::Poll::Pending => pending_or_stalled(&mut this.read_wait, this.stall, cx),
+            std::task::Poll::Ready(result) => {
+                this.read_wait = None;
+                if room && result.is_ok() && buf.filled().len() == before {
+                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "connection closed by the server",
+                    )));
+                }
+                std::task::Poll::Ready(result)
+            }
         }
-        poll
     }
 }
 
-impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ClosedIsError<S> {
+impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for GuardedStream<S> {
     fn poll_write(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.0).poll_write(cx, buf)
+        let this = &mut *self;
+        match std::pin::Pin::new(&mut this.inner).poll_write(cx, buf) {
+            std::task::Poll::Pending => pending_or_stalled(&mut this.write_wait, this.stall, cx),
+            ready @ std::task::Poll::Ready(_) => {
+                this.write_wait = None;
+                ready
+            }
+        }
     }
 
     fn poll_write_vectored(
@@ -107,25 +186,41 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for ClosedIsError<S
         cx: &mut std::task::Context<'_>,
         bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<std::io::Result<usize>> {
-        std::pin::Pin::new(&mut self.0).poll_write_vectored(cx, bufs)
+        let this = &mut *self;
+        match std::pin::Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+            std::task::Poll::Pending => pending_or_stalled(&mut this.write_wait, this.stall, cx),
+            ready @ std::task::Poll::Ready(_) => {
+                this.write_wait = None;
+                ready
+            }
+        }
     }
 
     fn is_write_vectored(&self) -> bool {
-        self.0.is_write_vectored()
+        self.inner.is_write_vectored()
     }
 
     fn poll_flush(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_flush(cx)
+        let this = &mut *self;
+        match std::pin::Pin::new(&mut this.inner).poll_flush(cx) {
+            std::task::Poll::Pending => pending_or_stalled(&mut this.write_wait, this.stall, cx),
+            ready @ std::task::Poll::Ready(_) => {
+                this.write_wait = None;
+                ready
+            }
+        }
     }
 
+    // Not watched: LOGOUT has its own five seconds, and a session dropped
+    // while shutting down is closed by the operating system anyway.
     fn poll_shutdown(
         mut self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::pin::Pin::new(&mut self.0).poll_shutdown(cx)
+        std::pin::Pin::new(&mut self.inner).poll_shutdown(cx)
     }
 }
 
@@ -394,6 +489,8 @@ pub struct ImapClient {
     /// operators can answer "why is this account offline?" without tailing
     /// stderr.
     last_error: Option<String>,
+    /// How long a command may wait without progress, see [`GuardedStream`].
+    stall: Duration,
 }
 
 /// Read-only snapshot of an `ImapClient`'s health for the `account_health`
@@ -444,7 +541,16 @@ impl ImapClient {
             cached_oauth_token: None,
             active_refresh_token,
             last_error: None,
+            stall: STALL_TIMEOUT,
         }
+    }
+
+    /// The same client with another stall time, so a test of a silent server
+    /// need not wait a minute.
+    #[cfg(test)]
+    const fn stall_after(mut self, stall: Duration) -> Self {
+        self.stall = stall;
+        self
     }
 
     /// Adopt the refresh token persisted by an earlier run, a parallel
@@ -629,7 +735,7 @@ impl ImapClient {
             "connect() called while session is Some — caller forgot mark_dead/disconnect"
         );
         let tls_stream = self.establish_tls().await?;
-        let mut client = async_imap::Client::new(ClosedIsError(tls_stream));
+        let mut client = async_imap::Client::new(GuardedStream::new(tls_stream, self.stall));
 
         // Read the server greeting before any commands.
         // async-imap's Client::new() doesn't consume the greeting, which causes
@@ -2469,7 +2575,7 @@ mod tests {
     #[tokio::test]
     async fn a_closed_connection_reads_as_an_error_not_as_the_end() {
         use tokio::io::AsyncReadExt as _;
-        let mut stream = ClosedIsError(&b"* BYE Disconnected\r\n"[..]);
+        let mut stream = GuardedStream::new(&b"* BYE Disconnected\r\n"[..], STALL_TIMEOUT);
         let mut buf = [0u8; 64];
         assert_eq!(stream.read(&mut buf).await.unwrap(), 20);
         let err = stream.read(&mut buf).await.unwrap_err();
@@ -2478,6 +2584,177 @@ mod tests {
         assert!(is_retryable_error(&err.to_string()), "{err}");
         // A read with no room in the buffer is not an end of stream.
         assert_eq!(stream.read(&mut []).await.unwrap(), 0);
+    }
+
+    /// Silence ends a read, and a write the peer does not take, with the
+    /// error of a dead connection, which reads retry on. Without the guard
+    /// both waited for TCP's retransmission timeout, a quarter of an hour.
+    #[tokio::test]
+    async fn silence_ends_a_read_and_a_write_as_a_dead_connection() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (near, _far) = tokio::io::duplex(8);
+        let mut stream = GuardedStream::new(near, Duration::from_millis(100));
+        let mut buf = [0u8; 4];
+        let err = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
+            .await
+            .expect("the read must end, not hang")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+        assert!(is_connection_error(&err.to_string()), "{err}");
+        assert!(is_retryable_error(&err.to_string()), "{err}");
+        // The peer takes nothing: the write fills the pipe and stalls too.
+        let err = tokio::time::timeout(Duration::from_secs(5), stream.write_all(&[0u8; 64]))
+            .await
+            .expect("the write must end, not hang")
+            .unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::TimedOut);
+    }
+
+    /// Every byte starts the wait anew: an answer that keeps coming, however
+    /// slowly, is no stall.
+    #[tokio::test]
+    async fn an_answer_that_keeps_coming_is_no_stall() {
+        use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+        let (near, mut far) = tokio::io::duplex(64);
+        let mut stream = GuardedStream::new(near, Duration::from_millis(200));
+        tokio::spawn(async move {
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(80)).await;
+                let _ = far.write_all(b"x").await;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        });
+        let mut got = Vec::new();
+        let mut buf = [0u8; 8];
+        while got.len() < 5 {
+            let n = stream
+                .read(&mut buf)
+                .await
+                .expect("no stall while bytes come");
+            got.extend_from_slice(&buf[..n]);
+        }
+        assert_eq!(got, b"xxxxx");
+    }
+
+    /// A throwaway self-signed certificate (P-256, CN=localhost) and its key,
+    /// for the fake server below and valid for nothing else.
+    const FAKE_CERT: &str = "MIIBfzCCASWgAwIBAgIUVmRbvFRXWEIwwOfIRd9NC+eRM7AwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExMTAwNDkyMVoYDzIxMjYxMDE4MDA0OTIxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR0bdX1KvMmduT6WBBs9EUfmWhWFB7x3+cdYOb4AIOFiWGeu38F2+qHXQ0JnWKQJ4APKj/PQinauWnr3qy4q0qTo1MwUTAdBgNVHQ4EFgQUqdcJPd34gLZBGRrRKfZxaSCJlhIwHwYDVR0jBBgwFoAUqdcJPd34gLZBGRrRKfZxaSCJlhIwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiAZvZpAy7LBEpHmnX23B06gj5bthW9SYjpbCoU4QsCsQAIhAMPqisnLF8/8yh8zzOo9iZaRd/Zv5BXUPLtwDN9scEWU";
+    const FAKE_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg9q5WF+ut6HmCU0k4cmUrA6YESHF4jgKbPYiHya5b392hRANCAAR0bdX1KvMmduT6WBBs9EUfmWhWFB7x3+cdYOb4AIOFiWGeu38F2+qHXQ0JnWKQJ4APKj/PQinauWnr3qy4q0qT";
+
+    /// An IMAP server on loopback that greets and takes any LOGIN, then
+    /// reads a SELECT and says nothing, as a hung server or a dead path does,
+    /// until the `answer_from`-th SELECT, which it answers with an empty
+    /// folder. Returns its address and how many SELECTs it has read.
+    async fn silent_server(
+        answer_from: usize,
+    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+        use base64::Engine as _;
+        use base64::engine::general_purpose::STANDARD;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let cert = rustls::pki_types::CertificateDer::from(STANDARD.decode(FAKE_CERT).unwrap());
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(STANDARD.decode(FAKE_KEY).unwrap()),
+        );
+        let config = rustls::ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![cert], key)
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let selects = Arc::new(AtomicUsize::new(0));
+        let counted = Arc::clone(&selects);
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let acceptor = acceptor.clone();
+                let counted = Arc::clone(&counted);
+                tokio::spawn(async move {
+                    let Ok(tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let (read, mut write) = tokio::io::split(tls);
+                    let mut lines = tokio::io::BufReader::new(read).lines();
+                    if write.write_all(b"* OK fake IMAP ready\r\n").await.is_err() {
+                        return;
+                    }
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let mut words = line.split_whitespace();
+                        let tag = words.next().unwrap_or("*");
+                        let reply = match words.next().map(str::to_ascii_uppercase).as_deref() {
+                            Some("LOGIN") => format!("{tag} OK LOGIN completed\r\n"),
+                            Some("SELECT") => {
+                                if counted.fetch_add(1, Ordering::SeqCst) + 1 < answer_from {
+                                    continue;
+                                }
+                                format!(
+                                    "* 0 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n\
+                                     {tag} OK [READ-WRITE] SELECT completed\r\n"
+                                )
+                            }
+                            Some("LOGOUT") => format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n"),
+                            _ => format!("{tag} OK done\r\n"),
+                        };
+                        if write.write_all(reply.as_bytes()).await.is_err() {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        (addr, selects)
+    }
+
+    /// The case Otomo ran into: the server takes the command and says
+    /// nothing. The read gives up after the stall time, reconnects once and
+    /// meets the same silence, and the call fails as retryable instead of
+    /// holding the account until the server restarts. The next call
+    /// reconnects and gets its answer.
+    #[tokio::test]
+    async fn a_server_that_goes_silent_frees_the_account() {
+        let (addr, selects) = silent_server(3).await;
+        let account: AccountConfig = toml::from_str(&format!(
+            "name = \"Fake\"\nhost = \"127.0.0.1\"\nport = {}\nusername = \"u@h\"\n\
+             password = \"p\"\naccept_invalid_certs = true\n",
+            addr.port()
+        ))
+        .unwrap();
+        let mut client = ImapClient::new(account).stall_after(Duration::from_millis(300));
+        client.connect_bounded().await.expect("greeting and login");
+
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.list_emails("INBOX", 1, 0, false),
+        )
+        .await
+        .expect("the silence must end the call, not hang it")
+        .expect_err("both SELECTs went unanswered");
+        assert!(is_retryable_error(&err.to_string()), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert_eq!(
+            selects.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "the read reconnected and tried once more"
+        );
+        assert!(
+            !client.connection_state().connected,
+            "the silent session is gone"
+        );
+
+        let (rows, total, _) = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.list_emails("INBOX", 1, 0, false),
+        )
+        .await
+        .expect("no hang")
+        .expect("the third SELECT is answered");
+        assert!(rows.is_empty() && total == 0);
     }
 
     /// A folder whose raw name is pure ASCII sails past the control/bidi

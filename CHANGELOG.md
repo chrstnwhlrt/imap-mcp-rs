@@ -3,6 +3,26 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.1
+
+### Fixed
+
+- **A server that stopped answering held the account until a restart.**
+  A command that got no reply, from a hung server or over a path that
+  died without FIN or RST (a DSL reconnect at night), waited for TCP's
+  retransmission timeout, a quarter of an hour, with the account's lock
+  held, so every later call ran into its client's timeout as well. A
+  command now gives up after 60 seconds without a single byte from the
+  server, or without the server taking one, with the error a dead
+  connection gives anyway: reads reconnect and try once more, writes
+  report `retryable: true`, and the next call finds the account free.
+  Answers that keep coming are not cut off, however long they take.
+  Tested against a server that takes the command and then stays silent.
+  The tool surface and the texts of the responses are unchanged.
+
+371 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
+end-to-end script.
+
 ## 3.2.0
 
 Fixes from a review of the whole code. The tool surface is unchanged:
