@@ -2086,9 +2086,11 @@ impl ImapClient {
 
     /// Find the first folder matching any of `candidates` in the session's
     /// folder list (case-insensitive). Returns Ok(None) on clean "not
-    /// found"; errors propagate from the underlying LIST call so the
-    /// caller can choose to swallow via `.ok().flatten()` or handle
-    /// connection issues.
+    /// found"; errors propagate from the underlying LIST call. A caller
+    /// that can do without the folder passes the error through
+    /// [`Self::check_error`] before dropping it (see
+    /// [`Self::drafts_folder_or_default`]): dropped alone, a dead or stalled
+    /// session stays in use with the LIST answer still due.
     async fn find_folder_by_role(&mut self, candidates: &[&str]) -> Result<Option<String>> {
         let folders = self.get_folder_names().await?;
         Ok(folders
