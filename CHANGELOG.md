@@ -25,6 +25,12 @@ Fixes from a review of the whole code. The tool surface is unchanged:
 
 ### Fixed
 
+- **A forward left the original's attachments behind.** `draft_forward`
+  quoted the text alone, so forwarding an invoice sent it without the
+  invoice, unlike every mail client. The draft now carries every
+  attachment `get_email` lists, decoded as it arrived and ahead of the
+  files the call adds; inline images come along as ordinary attachments.
+  The original is fetched once for both.
 - **`body_parts_diverge` missed mirrored text in mail from Outlook.** The
   HTML part was read with its `<style>` block, whose CSS words outnumbered
   the message's own, so the plain part never covered the HTML and a
@@ -49,7 +55,7 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   the client-side `from` match was never tried by name, and
   `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
 
-357 unit tests, 23 GreenMail integration tests and 73 checks in the MCP
+358 unit tests, 23 GreenMail integration tests and 74 checks in the MCP
 end-to-end script.
 
 ## 3.1.1

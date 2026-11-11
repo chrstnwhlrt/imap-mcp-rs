@@ -404,6 +404,11 @@ ok(
     str(f2)[:200],
 )
 f1 = f2
+# A forward carries the original's attachments, as a mail client does.
+f_att = call("draft_forward", {"folder": drafts_folder, "uid": d1["uid"], "to": ["carol@example.com"]})
+fwd_mail = call("get_email", {"folder": drafts_folder, "uid": f_att.get("uid", 0)})
+fwd_atts = [a.get("filename") for a in (fwd_mail.get("email") or {}).get("attachments") or []]
+ok("draft_forward: the original's attachment comes along", fwd_atts == ["hello.txt"], str(fwd_atts))
 
 # --- 12 list_drafts ---
 ld = call("list_drafts")
@@ -414,14 +419,11 @@ ok(
 )
 
 # --- 13 delete_draft (real + stale) ---
-del1 = call(
-    "delete_draft", {"uids": [d1["uid"], r1["uid"], f1["uid"], named["uid"], cc_kept["uid"]]}
-)
+written = [d1["uid"], r1["uid"], f1["uid"], f_att["uid"], named["uid"], cc_kept["uid"]]
+del1 = call("delete_draft", {"uids": written})
 ok(
     "delete_draft: all succeeded, failed empty",
-    sorted(del1.get("succeeded", []))
-    == sorted([d1["uid"], r1["uid"], f1["uid"], named["uid"], cc_kept["uid"]])
-    and del1.get("failed") == [],
+    sorted(del1.get("succeeded", [])) == sorted(written) and del1.get("failed") == [],
     str(del1),
 )
 del2 = call("delete_draft", {"uids": [d1["uid"]]})

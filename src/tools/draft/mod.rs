@@ -333,6 +333,44 @@ async fn fetch_original(
     }
 }
 
+/// [`fetch_original`] together with the raw message, for a forward: the
+/// attachments it carries along exist only there.
+async fn fetch_original_with_raw(
+    client_arc: &Arc<Mutex<ImapClient>>,
+    folder: &str,
+    uid: u32,
+) -> Result<(EmailFull, Vec<u8>), String> {
+    let mut client = client_arc.lock().await;
+    let folder = super::folder_for(&mut client, folder).await?;
+    match client.get_email_with_raw(&folder, uid).await {
+        Ok(Some(found)) => Ok(found),
+        Ok(None) => Err(error_json(&format!(
+            "Email with UID {uid} not found in {}",
+            crate::email::sanitize_external_str(&folder)
+        ))),
+        Err(e) => Err(error_json(&client.check_error(e).to_string())),
+    }
+}
+
+/// The attachments of a message being forwarded, as a mail client carries
+/// them along: every part `get_email` lists (see
+/// [`crate::email::attachment_parts`]), decoded, under the name and type it
+/// shows there. Inline images come along as ordinary attachments.
+fn original_attachments(raw: &[u8]) -> AttachmentData {
+    let Some(message) = mail_parser::MessageParser::default().parse(raw) else {
+        return Vec::new();
+    };
+    crate::email::attachment_parts(&message)
+        .map(|part| {
+            (
+                crate::email::format_content_type(part.content_type()),
+                crate::email::sanitize_external_str(part.attachment_name().unwrap_or("attachment")),
+                part.decoded().into_owned(),
+            )
+        })
+        .collect()
+}
+
 /// The `saved` of every draft response.
 const SAVED_AS_DRAFT: &str = "as a draft in Drafts; nothing was sent, the user sends it";
 
@@ -686,7 +724,12 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     };
     let acct = DraftAccount::from_config(account_config);
 
-    let original = fetch_original(&client_arc, &req.folder, req.uid).await?;
+    let (original, raw) = fetch_original_with_raw(&client_arc, &req.folder, req.uid).await?;
+    // A forward carries the original's attachments, as every mail client
+    // does: forwarding an invoice without the invoice helped nobody, and the
+    // draft quoted the text alone. Ahead of the files the call adds.
+    let carried = original_attachments(&raw);
+    drop(raw);
 
     let subject_raw = if has_forward_prefix(&original.subject) {
         original.subject.clone()
@@ -697,7 +740,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     let subject = sanitize_header_value(&subject_raw);
 
     // Read before rendering — see the note in draft_reply.
-    let (prepared, inline_notice) = match prepare_attachments(
+    let (mut prepared, inline_notice) = match prepare_attachments(
         req.attachments.as_deref(),
         &server.config.allowed_attachment_dirs,
         req.body.as_deref().unwrap_or(""),
@@ -708,6 +751,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
         Ok(v) => v,
         Err(e) => return Err(error_json(&e)),
     };
+    prepared.regular.splice(0..0, carried);
 
     let (plain_body, html_body) = {
         let refs = inline_refs(&prepared.inline);
@@ -1080,7 +1124,7 @@ fn truncate(s: &str, max_len: usize) -> String {
 // ========== Attachment helpers ==========
 
 /// Regular (appended) attachments as `(content_type, filename, bytes)`.
-type AttachmentData = Vec<(&'static str, String, Vec<u8>)>;
+type AttachmentData = Vec<(String, String, Vec<u8>)>;
 
 /// An attachment that is embedded in the body rather than appended to it.
 pub(super) struct InlineImage {
@@ -1324,7 +1368,7 @@ async fn read_attachments(
         }
 
         if !is_inline {
-            regular.push((content_type, filename, bytes));
+            regular.push((content_type.to_string(), filename, bytes));
             continue;
         }
 
@@ -1767,6 +1811,30 @@ mod tests {
             attachments: vec![],
             body_parts_diverge: false,
         }
+    }
+
+    /// A forward carries what `get_email` lists as attachments, decoded,
+    /// under the names shown there: forwarding an invoice mail forwards the
+    /// invoice.
+    #[test]
+    fn a_forward_carries_the_original_attachments() {
+        let raw = "From: a@example.com\r\nSubject: Rechnung\r\nMIME-Version: 1.0\r\n\
+                   Content-Type: multipart/mixed; boundary=\"B\"\r\n\r\n\
+                   --B\r\nContent-Type: text/plain; charset=utf-8\r\n\r\nAnbei die Rechnung.\r\n\
+                   --B\r\nContent-Type: application/pdf; name=\"Rechnung.pdf\"\r\n\
+                   Content-Disposition: attachment; filename=\"Rechnung.pdf\"\r\n\
+                   Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n\
+                   --B--\r\n";
+        let carried = original_attachments(raw.as_bytes());
+        assert_eq!(carried.len(), 1, "{carried:?}");
+        assert_eq!(carried[0].0, "application/pdf");
+        assert_eq!(carried[0].1, "Rechnung.pdf");
+        assert_eq!(carried[0].2, b"%PDF-1.4", "decoded, not base64");
+        assert_eq!(
+            original_attachments(b"From: a@b\r\nSubject: s\r\n\r\nText\r\n"),
+            Vec::new(),
+            "a plain message carries nothing"
+        );
     }
 
     #[test]
@@ -2472,7 +2540,11 @@ mod tests {
     #[test]
     fn inline_and_regular_attachments_nest_correctly() {
         let prepared = PreparedAttachments {
-            regular: vec![("application/pdf", "report.pdf".to_string(), vec![9, 9])],
+            regular: vec![(
+                "application/pdf".to_string(),
+                "report.pdf".to_string(),
+                vec![9, 9],
+            )],
             inline: vec![img("shot")],
         };
         let builder = apply_bodies_and_attachments(
@@ -2503,7 +2575,11 @@ mod tests {
         // Regression guard: the common path must not change shape just because
         // the inline feature exists.
         let prepared = PreparedAttachments {
-            regular: vec![("application/pdf", "report.pdf".to_string(), vec![9])],
+            regular: vec![(
+                "application/pdf".to_string(),
+                "report.pdf".to_string(),
+                vec![9],
+            )],
             inline: vec![],
         };
         let builder = apply_bodies_and_attachments(

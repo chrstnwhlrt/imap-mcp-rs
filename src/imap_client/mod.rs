@@ -1149,11 +1149,11 @@ impl ImapClient {
             .await?;
         let fetches: Vec<Fetch> = stream.try_collect().await?;
 
-        let Some(fetch) = requested_fetch(&fetches, uid) else {
+        let Some(fetch) = requested_fetch(fetches, uid) else {
             return Ok(None);
         };
 
-        Ok(bounded_body(fetch, uid).map(<[u8]>::to_vec))
+        Ok(bounded_body(&fetch, uid).map(<[u8]>::to_vec))
     }
 
     pub async fn get_email(&mut self, folder: &str, uid: u32) -> Result<Option<EmailFull>> {
@@ -1161,23 +1161,53 @@ impl ImapClient {
     }
 
     async fn get_email_once(&mut self, folder: &str, uid: u32) -> Result<Option<EmailFull>> {
+        let Some(fetch) = self.fetch_message_once(folder, uid).await? else {
+            return Ok(None);
+        };
+        let body = bounded_body(&fetch, uid).context("Email has no body (or exceeds size cap)")?;
+        Ok(Some(dated(
+            email::parse_email(uid, folder, body, parse_flags(&fetch)),
+            &fetch,
+        )))
+    }
+
+    /// [`Self::get_email`] together with the message as the server stores
+    /// it, from one fetch: a forward carries the original's attachments,
+    /// which only the raw message holds.
+    pub async fn get_email_with_raw(
+        &mut self,
+        folder: &str,
+        uid: u32,
+    ) -> Result<Option<(EmailFull, Vec<u8>)>> {
+        retry_read!(self.get_email_with_raw_once(folder, uid))
+    }
+
+    async fn get_email_with_raw_once(
+        &mut self,
+        folder: &str,
+        uid: u32,
+    ) -> Result<Option<(EmailFull, Vec<u8>)>> {
+        let Some(fetch) = self.fetch_message_once(folder, uid).await? else {
+            return Ok(None);
+        };
+        let body = bounded_body(&fetch, uid).context("Email has no body (or exceeds size cap)")?;
+        let email = dated(
+            email::parse_email(uid, folder, body, parse_flags(&fetch)),
+            &fetch,
+        );
+        Ok(Some((email, body.to_vec())))
+    }
+
+    /// The FETCH response for message `uid` of `folder` with its body, flags
+    /// and arrival time; `None` when the folder has no such message.
+    async fn fetch_message_once(&mut self, folder: &str, uid: u32) -> Result<Option<Fetch>> {
         self.ensure_selected(folder).await?;
         let session = self.session()?;
         let stream = session
             .uid_fetch(uid.to_string(), MESSAGE_FETCH_ITEMS)
             .await?;
         let fetches: Vec<Fetch> = stream.try_collect().await?;
-
-        let Some(fetch) = requested_fetch(&fetches, uid) else {
-            return Ok(None);
-        };
-
-        let body = bounded_body(fetch, uid).context("Email has no body (or exceeds size cap)")?;
-        let flags = parse_flags(fetch);
-        Ok(Some(dated(
-            email::parse_email(uid, folder, body, flags),
-            fetch,
-        )))
+        Ok(requested_fetch(fetches, uid))
     }
 
     /// Search one folder. Returns the summaries (newest first, capped at
@@ -2299,8 +2329,8 @@ impl async_imap::Authenticator for XOAuth2Authenticator {
 /// first one made `get_email` fail with "no body" whenever such an update
 /// came in ahead of the answer. RFC 3501 has a UID FETCH response carry the
 /// UID, so the right one is unambiguous.
-fn requested_fetch(fetches: &[Fetch], uid: u32) -> Option<&Fetch> {
-    fetches.iter().find(|f| f.uid == Some(uid))
+fn requested_fetch(fetches: Vec<Fetch>, uid: u32) -> Option<Fetch> {
+    fetches.into_iter().find(|f| f.uid == Some(uid))
 }
 
 /// Map IMAP flags to strings, dropping `\Recent`: it is session-scoped
