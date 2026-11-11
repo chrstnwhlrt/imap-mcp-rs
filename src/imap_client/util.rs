@@ -188,6 +188,9 @@ pub fn is_retryable_error(msg: &str) -> bool {
 /// - **Parse errors** — usually leftover bytes in the stream (e.g. after a
 ///   cancelled operation) desync our reader from the server's output. The
 ///   session is nominally alive but every subsequent command will fail.
+///   async-imap reports an answer its parser rejects as `... during parsing
+///   of ...` and keeps that answer in its buffer, so every later command
+///   reads it again.
 /// - **`no mailbox selected`** — rare, but happens if the server internally
 ///   deselects without dropping TCP. A reconnect + fresh SELECT recovers.
 pub(super) fn is_connection_error(msg: &str) -> bool {
@@ -211,6 +214,7 @@ pub(super) fn is_connection_error(msg: &str) -> bool {
         // Stream corruption / desync — reconnect to clear the buffer
         || lower.contains("unable to parse")
         || lower.contains("invalid response")
+        || lower.contains(PARSE_FAILURE)
         // Session-state desync — reconnect forces a fresh SELECT
         || lower.contains("no mailbox selected")
 }
@@ -343,6 +347,27 @@ pub(super) fn strip_email_prefixes(subject: &str) -> &str {
     }
 }
 
+/// How async-imap words an answer its parser rejects:
+/// `io: Error(Error { input: [..], code: .. }) during parsing of "..."`.
+const PARSE_FAILURE: &str = " during parsing of ";
+
+/// What is left of such an error for a reader. async-imap puts the whole
+/// unread buffer into the message, as a list of byte values and again as
+/// text: with a message body in it megabytes, all of it from the server, and
+/// none of it says more than that the answer could not be read.
+const UNREADABLE_ANSWER: &str = "io: the server's answer could not be parsed";
+
+/// `msg` without the buffer dump of a parse failure (see
+/// [`UNREADABLE_ANSWER`]); other messages unchanged. For logs and
+/// `last_error`, which keep the rest of a message as it is.
+pub fn without_parse_dump(msg: &str) -> std::borrow::Cow<'_, str> {
+    if msg.contains(PARSE_FAILURE) {
+        std::borrow::Cow::Borrowed(UNREADABLE_ANSWER)
+    } else {
+        std::borrow::Cow::Borrowed(msg)
+    }
+}
+
 /// Reformat a raw async-imap error string into a concise user-facing message.
 ///
 /// async-imap's `Display` for `Error::No` / `Error::Bad` emits its own
@@ -358,6 +383,9 @@ pub(super) fn strip_email_prefixes(subject: &str) -> &str {
 /// error message (including our own static strings) at the `error_json`
 /// boundary.
 pub fn clean_imap_error(raw: &str) -> String {
+    if raw.contains(PARSE_FAILURE) {
+        return UNREADABLE_ANSWER.to_string();
+    }
     // Neither marker is a substring of the other ("information" does not
     // contain "info: "), so the order of the two does not matter.
     let info = ["info: Some(\"", "information: Some(\""]
@@ -535,6 +563,21 @@ mod tests {
         assert!(is_connection_error("unable to parse response"));
         assert!(is_connection_error("invalid response from server"));
         assert!(is_connection_error("no mailbox selected"));
+    }
+
+    /// async-imap's wording for an answer its parser rejects: a desync, and
+    /// without the buffer it dumps.
+    #[test]
+    fn a_parse_failure_is_a_desync_and_reads_as_one_sentence() {
+        let dump = format!(
+            "io: Error(Error {{ input: [37, 37], code: TakeWhile1 }}) during parsing of \"{}\"",
+            "x".repeat(100_000)
+        );
+        assert!(is_connection_error(&dump));
+        assert!(is_retryable_error(&dump));
+        assert_eq!(clean_imap_error(&dump), UNREADABLE_ANSWER);
+        assert_eq!(without_parse_dump(&dump), UNREADABLE_ANSWER);
+        assert_eq!(without_parse_dump("broken pipe"), "broken pipe");
     }
 
     #[test]

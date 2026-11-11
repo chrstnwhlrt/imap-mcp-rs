@@ -3,6 +3,19 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.4
+
+### Fixed
+
+- **An answer the parser cannot read no longer blocks the account until a
+  restart.** async-imap keeps such an answer in its buffer, so every later
+  command read it again and failed, and the error did not count as a broken
+  session, so nothing reconnected. Now the session is dropped and the read
+  repeated on a fresh one. The error itself is one sentence ("the server's
+  answer could not be parsed"): async-imap put the whole unread buffer into
+  its message twice, and with a message body in it, the model and
+  `account_health` got megabytes of server bytes as the error.
+
 ## 3.2.3
 
 ### Fixed

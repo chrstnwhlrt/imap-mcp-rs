@@ -32,7 +32,7 @@ pub use util::{
     host_supports_unicode_search, imap_astring, is_retryable_error, iso_to_imap_date, same_folder,
     sanitize_log_str, starts_with_ignore_ascii_case,
 };
-use util::{clean_message_id, is_connection_error, strip_email_prefixes};
+use util::{clean_message_id, is_connection_error, strip_email_prefixes, without_parse_dump};
 
 /// Retry a read-only IMAP operation once on connection errors. After a connection
 /// error, the client is marked dead; the second call triggers `ensure_connected`
@@ -44,8 +44,9 @@ macro_rules! retry_read {
             Ok(r) => Ok(r),
             Err(e) if is_connection_error(&e.to_string()) => {
                 tracing::info!(
-                    "Connection error on {}, retrying after reconnect: {e}",
-                    stringify!($op)
+                    "Connection error on {}, retrying after reconnect: {}",
+                    stringify!($op),
+                    without_parse_dump(&e.to_string())
                 );
                 $self.mark_dead();
                 $self.$op($($arg),*).await
@@ -723,7 +724,9 @@ impl ImapClient {
             // context ("run `imap-mcp-rs reauth …`") while the reason sits
             // underneath (`AADSTS700082`). Safe since token-endpoint errors
             // now carry only the sanitized RFC 6749 fields, never raw bodies.
-            Err(e) => self.last_error = Some(sanitize_log_str(&format!("{e:#}"))),
+            Err(e) => {
+                self.last_error = Some(sanitize_log_str(&without_parse_dump(&format!("{e:#}"))));
+            }
         }
         result
     }
@@ -1056,11 +1059,12 @@ impl ImapClient {
     /// to the next one.
     pub fn check_error(&mut self, e: anyhow::Error) -> anyhow::Error {
         if is_connection_error(&format!("{e:#}")) {
-            tracing::warn!("IMAP connection error, will reconnect on next call: {e}");
+            let shown = without_parse_dump(&e.to_string()).into_owned();
+            tracing::warn!("IMAP connection error, will reconnect on next call: {shown}");
             // Sanitize before stashing — the error string may embed server
             // output which could contain bidi/control chars the
             // `account_health` surface eventually echoes to the LLM.
-            self.last_error = Some(sanitize_log_str(&e.to_string()));
+            self.last_error = Some(sanitize_log_str(&shown));
             self.mark_dead();
         }
         e
@@ -2862,6 +2866,68 @@ mod tests {
         .expect("no hang")
         .expect("the third SELECT is answered");
         assert!(rows.is_empty() && total == 0);
+    }
+
+    /// An answer the parser cannot read stays in async-imap's buffer, where
+    /// every later command meets it again: kept, the session failed every
+    /// call until a restart. It goes like any other desynced session, and the
+    /// read is repeated on a fresh one.
+    #[tokio::test]
+    async fn an_unreadable_answer_drops_the_session() {
+        let addr = fake_server(Arc::new(|tag, word, before| match word {
+            "SELECT" if before == 0 => Some(format!(
+                "%%% no IMAP here %%%\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+            )),
+            "SELECT" => Some(selected(tag)),
+            _ => Some(format!("{tag} OK done\r\n")),
+        }))
+        .await;
+        let mut client = fake_client(addr).await;
+        for call in ["first", "second"] {
+            let (rows, total, _) = tokio::time::timeout(
+                Duration::from_secs(10),
+                client.list_emails("INBOX", 1, 0, false),
+            )
+            .await
+            .expect("no hang")
+            .unwrap_or_else(|e| panic!("the {call} call must read on a fresh session: {e}"));
+            assert!(rows.is_empty() && total == 0);
+        }
+    }
+
+    /// When the answer stays unreadable, the call fails as retryable with one
+    /// sentence. async-imap's message carries the whole unread buffer, twice:
+    /// with a message body in it, the model and `account_health` got
+    /// megabytes of server bytes as the error.
+    #[tokio::test]
+    async fn an_unreadable_answer_reads_as_one_sentence() {
+        let addr = fake_server(Arc::new(|tag, word, _| match word {
+            "SELECT" => Some(format!(
+                "%%% {} %%%\r\n{tag} OK [READ-WRITE] SELECT completed\r\n",
+                "x".repeat(50_000)
+            )),
+            _ => Some(format!("{tag} OK done\r\n")),
+        }))
+        .await;
+        let mut client = fake_client(addr).await;
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.list_emails("INBOX", 1, 0, false),
+        )
+        .await
+        .expect("no hang")
+        .expect_err("no SELECT is readable");
+        // What every tool does with a failed call before it answers.
+        let err = client.check_error(err);
+        let (error, retryable) = crate::tools::error_fields(&err.to_string());
+        assert_eq!(error, "io: the server's answer could not be parsed");
+        assert!(retryable);
+        let health = client.connection_state();
+        assert!(!health.connected);
+        assert_eq!(
+            health.last_error.as_deref(),
+            Some("io: the server's answer could not be parsed")
+        );
     }
 
     /// A failure swallowed for a better error message (here the folder list
