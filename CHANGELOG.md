@@ -30,6 +30,12 @@ the MCP tool surface and the config format are the public API.
   folders. MOVE moves all or nothing. Whether the server has it is asked
   once per session; without it the three steps stay as they were.
 
+- **The server answers `initialize` at once.** It connected every account
+  before it began to serve, so the client's start waited for the slowest
+  account, the whole 15 s for a server that did not answer. Now the
+  accounts connect in the background; a call on an account waits for its
+  connect, as it waited for the start before.
+
 - **The installed binary is a fifth smaller**, 13.8 MB instead of 17.3 MB:
   the Nix package now strips the symbol table as well as the debug info.
   Symbols only name the frames of a backtrace, which a panic prints under

@@ -101,32 +101,31 @@ async fn main() -> anyhow::Result<()> {
         tracing::warn!(error = %e, "attachment cleanup skipped");
     }
 
-    // Connect all accounts in parallel — otherwise a slow server on one account
-    // would delay startup of all others. Each has its own timeout (see
-    // `ImapClient::connect_bounded`). Soft errors: failed accounts reconnect
-    // on first use.
-    // `iter().cloned()` (not into_iter) because we still need config.accounts
-    // afterwards to build ImapMcpServer.
-    #[allow(clippy::redundant_iter_cloned)]
-    let connect_futures = config.accounts.iter().cloned().map(|account| async move {
-        let name = account.name.clone();
-        let mut client = ImapClient::new(account);
-        client.adopt_stored_token();
-        let result = client.connect_bounded().await;
-        (name, client, result)
-    });
-
+    // Connect all accounts in parallel and in the background: serving starts
+    // at once. Each connect holds its account's lock from here on, so a call
+    // on the account waits for it, and each has its own timeout (see
+    // `ImapClient::connect_bounded`). Waiting for all of them first held
+    // `initialize` back by the slowest account, by the whole 15 s for a
+    // server that did not answer. Soft errors: failed accounts reconnect on
+    // first use.
     let mut clients = HashMap::new();
-    for (name, client, result) in futures_util::future::join_all(connect_futures).await {
-        match result {
-            Ok(()) => tracing::info!(account = %name, "Connected"),
-            Err(e) => tracing::warn!(
-                account = %name,
-                error = %e,
-                "Failed to connect (will retry on first use)"
-            ),
-        }
-        clients.insert(name.to_lowercase(), Arc::new(Mutex::new(client)));
+    for account in &config.accounts {
+        let name = account.name.clone();
+        let mut client = ImapClient::new(account.clone());
+        client.adopt_stored_token();
+        let client = Arc::new(Mutex::new(client));
+        let mut connecting = Arc::clone(&client).lock_owned().await;
+        tokio::spawn(async move {
+            match connecting.connect_bounded().await {
+                Ok(()) => tracing::info!(account = %name, "Connected"),
+                Err(e) => tracing::warn!(
+                    account = %name,
+                    error = %e,
+                    "Failed to connect (will retry on first use)"
+                ),
+            }
+        });
+        clients.insert(account.name.to_lowercase(), client);
     }
 
     let server = ImapMcpServer::new(config, clients);
