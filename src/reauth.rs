@@ -51,6 +51,9 @@ const MAX_REQUEST_BYTES: usize = 16 * 1024;
 /// post-authorization IMAP verification login.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
 const VERIFY_TIMEOUT: Duration = Duration::from_secs(20);
+// The token refresh inside the verification login gives up first, with its
+// own error.
+const _: () = assert!(crate::oauth2::OAUTH2_TIMEOUT.as_secs() < VERIFY_TIMEOUT.as_secs());
 /// Shown both on a usage error and on `reauth --help`.
 const USAGE: &str =
     "usage: imap-mcp-rs reauth <account> [--config <path>] [--port <n>] [--no-browser]";

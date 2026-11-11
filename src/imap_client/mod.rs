@@ -234,6 +234,9 @@ const MAX_EMAIL_BYTES: usize = 100 * 1024 * 1024;
 /// on every reconnect — see [`ImapClient::connect_bounded`].
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
+// The token refresh inside a connect gives up first, with its own error.
+const _: () = assert!(crate::oauth2::OAUTH2_TIMEOUT.as_secs() < CONNECT_TIMEOUT.as_secs());
+
 /// Hard cap on the number of folders we'll process in a single `LIST` response.
 /// A malicious server could return millions of folders to drive the subsequent
 /// per-folder STATUS loop into a `DoS`.

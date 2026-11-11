@@ -23,11 +23,18 @@ the MCP tool surface and the config format are the public API.
   was swallowed or wrapped.** The lookup of a saved draft's UID, the Drafts
   folder lookup before a write, the folder list behind "does not exist"
   and the one a read over several accounts shows for an account without
-  the folder swallowed their failures, and a write step's error wrapped its cause in
-  what it means for the caller, so a dead or stalled connection there was
-  not recognized. The next command would have read the late answers (a
-  SEARCH, a LIST) as its own. These now drop the session like every other
-  connection error.
+  the folder swallowed their failures, and a write step's error wrapped
+  its cause in what it means for the caller, so a dead or stalled
+  connection there was not recognized. The next command would have read
+  the late answers (a SEARCH, a LIST) as its own. These now drop the
+  session like every other connection error.
+- **A token endpoint that did not answer was reported as an IMAP
+  timeout.** The OAuth2 token refresh had 30 seconds, but it runs inside
+  the connect, which gives up after 15 (the check at the end of `reauth`
+  after 20). A token request that hung, behind a proxy dropping it for
+  instance, therefore showed up in `account_health` as "IMAP connect timed
+  out" against an IMAP server that was fine. The refresh now gives up after
+  10 seconds with its own error, "OAuth2 token refresh timed out".
 
 373 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
 end-to-end script.

@@ -18,7 +18,12 @@ use serde::Deserialize;
 
 use crate::config::OAuth2Config;
 
-const OAUTH2_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long a token refresh may take. It runs inside a connect, which gives
+/// up after 15 s (20 s in `reauth`'s check), so it has to give up first: at
+/// 30 s a token endpoint that did not answer (a proxy dropping the request)
+/// ran into the connect's timeout, and the account reported "IMAP connect
+/// timed out" against an IMAP server that was fine.
+pub(crate) const OAUTH2_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Debug, Deserialize)]
 struct TokenResponse {
