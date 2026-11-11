@@ -341,22 +341,31 @@ async fn fetch_original_with_raw(
 /// in an Outlook signature, a pasted screenshot) stays inline under that id,
 /// next to the quote that shows it; carried as a file it became an extra
 /// attachment beside a broken image in the quote. Every other part is a
-/// regular attachment, which a forward carries and a reply leaves out.
-fn original_attachments(raw: &[u8], html: Option<&str>) -> (AttachmentData, Vec<InlineImage>) {
+/// regular attachment, which a forward carries (`files`) and a reply leaves
+/// out: for a reply those are not even decoded, a 50 MB attachment would
+/// have been decoded only to be dropped.
+fn original_attachments(
+    raw: &[u8],
+    html: Option<&str>,
+    files: bool,
+) -> (AttachmentData, Vec<InlineImage>) {
     let mut regular = Vec::new();
     let mut inline = Vec::new();
     let Some(message) = mail_parser::MessageParser::default().parse(raw) else {
         return (regular, inline);
     };
     for part in crate::email::attachment_parts(&message) {
-        let content_type = crate::email::format_content_type(part.content_type());
-        let filename =
-            crate::email::sanitize_external_str(part.attachment_name().unwrap_or("attachment"));
-        let bytes = part.decoded().into_owned();
         let shown = part
             .content_id()
             .map(|id| sanitize_header_value(id.trim().trim_matches(['<', '>'])))
             .filter(|id| !id.is_empty() && html.is_some_and(|h| h.contains(&format!("cid:{id}"))));
+        if shown.is_none() && !files {
+            continue;
+        }
+        let content_type = crate::email::format_content_type(part.content_type());
+        let filename =
+            crate::email::sanitize_external_str(part.attachment_name().unwrap_or("attachment"));
+        let bytes = part.decoded().into_owned();
         match shown {
             Some(id) => inline.push(InlineImage {
                 cid: id.clone(),
@@ -605,7 +614,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Tool
     // A reply carries no attachments, but the images its quote shows (a
     // signature's logo) stay, as in every mail client: without them the
     // quote showed broken pictures.
-    let (_, quoted_images) = original_attachments(&raw, original.body_html.as_deref());
+    let (_, quoted_images) = original_attachments(&raw, original.body_html.as_deref(), false);
     drop(raw);
 
     let reply_all = req.reply_all.unwrap_or(false);
@@ -743,7 +752,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     // A forward carries the original's attachments, as every mail client
     // does: forwarding an invoice without the invoice helped nobody, and the
     // draft quoted the text alone. Ahead of the files the call adds.
-    let (carried, carried_inline) = original_attachments(&raw, original.body_html.as_deref());
+    let (carried, carried_inline) = original_attachments(&raw, original.body_html.as_deref(), true);
     drop(raw);
 
     let subject_raw = if has_forward_prefix(&original.subject) {
@@ -1867,14 +1876,14 @@ mod tests {
                    Content-Disposition: attachment; filename=\"Rechnung.pdf\"\r\n\
                    Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n\
                    --B--\r\n";
-        let (carried, inline) = original_attachments(raw.as_bytes(), None);
+        let (carried, inline) = original_attachments(raw.as_bytes(), None, true);
         assert_eq!(carried.len(), 1, "{carried:?}");
         assert_eq!(carried[0].0, "application/pdf");
         assert_eq!(carried[0].1, "Rechnung.pdf");
         assert_eq!(carried[0].2, b"%PDF-1.4", "decoded, not base64");
         assert!(inline.is_empty(), "{} inline parts", inline.len());
         let (carried, inline) =
-            original_attachments(b"From: a@b\r\nSubject: s\r\n\r\nText\r\n", None);
+            original_attachments(b"From: a@b\r\nSubject: s\r\n\r\nText\r\n", None, true);
         assert_eq!(carried, Vec::new(), "a plain message carries nothing");
         assert!(inline.is_empty(), "{} inline parts", inline.len());
     }
@@ -1920,15 +1929,19 @@ mod tests {
              Content-Disposition: attachment; filename=\"Angebot.pdf\"\r\n\
              Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n--M--\r\n"
         );
-        let (carried, inline) = original_attachments(raw.as_bytes(), Some(html));
+        let (carried, inline) = original_attachments(raw.as_bytes(), Some(html), true);
         assert_eq!(carried.len(), 1, "{carried:?}");
         assert_eq!(carried[0].1, "Angebot.pdf");
         assert_eq!(inline.len(), 1, "{} inline parts", inline.len());
         assert_eq!(inline[0].content_id, "image001.png@01DA0000.11112222");
         assert_eq!(inline[0].filename, "image001.png");
         assert_eq!(inline[0].content_type, "image/png");
+        // A reply keeps the image and decodes no file.
+        let (carried, inline) = original_attachments(raw.as_bytes(), Some(html), false);
+        assert_eq!(carried, Vec::new());
+        assert_eq!(inline.len(), 1, "{} inline parts", inline.len());
         // Without HTML that shows it, the image is just another attachment.
-        let (carried, inline) = original_attachments(raw.as_bytes(), None);
+        let (carried, inline) = original_attachments(raw.as_bytes(), None, true);
         assert_eq!(carried.len(), 2, "{carried:?}");
         assert!(inline.is_empty(), "{} inline parts", inline.len());
     }
