@@ -6,7 +6,8 @@ the MCP tool surface and the config format are the public API.
 ## 3.2.0
 
 Fixes from a review of the whole code. The tool surface is unchanged:
-`initialize` and `tools/list` are byte for byte those of 3.1.1.
+`tools/list` and the instructions are byte for byte those of 3.1.1, and
+`initialize` differs only in the version it reports.
 
 ### Changed
 
