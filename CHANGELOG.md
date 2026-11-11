@@ -61,6 +61,13 @@ the MCP tool surface and the config format are the public API.
   its message twice, and with a message body in it, the model and
   `account_health` got megabytes of server bytes as the error.
 
+The tool surface is unchanged: `tools/list` and the instructions are byte
+for byte those of 3.1.1, and `initialize` differs only in the version it
+reports.
+
+388 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
+end-to-end script.
+
 ## 3.2.3
 
 ### Fixed
