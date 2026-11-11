@@ -1190,8 +1190,8 @@ impl ImapClient {
     }
 
     /// [`Self::get_email`] together with the message as the server stores
-    /// it, from one fetch: a forward carries the original's attachments,
-    /// which only the raw message holds.
+    /// it, from one fetch: a forward carries the original's attachments and
+    /// a reply the images its quote shows, which only the raw message holds.
     pub async fn get_email_with_raw(
         &mut self,
         folder: &str,
