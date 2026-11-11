@@ -442,8 +442,7 @@ FRESH_NUR_LESEN = [
 # Measured 2026-11-11 with Gemma 4 E4B, 10 runs each, 3.2.2 against the candidate: km3 9/10 against 9/10, the old
 # text once had Gemma offer a move the account may not make, the new one never (kept in 3.2.3). km1 with "Mail-":
 # 0/10 against 0/10; the candidate's "hint": "Older conversations: call again with offset 6." reached Gemma 4
-# times and was never followed. Claude (Sonnet 5.5, both questions in one claude -p session over stream-json, 5 runs
-# each): old 0/5, every run paging with offset 5 and naming Jonas's older email as the start of conversation 3;
+# times and was never followed. Claude (Sonnet 5.5, claude_follow.py, 5 runs each): old 0/5, every run paging with offset 5 and naming Jonas's older email as the start of conversation 3;
 # candidate 3/5, the hint followed in 3 of 5 runs. Below the bar of 4 of 5: dropped, K-M1 stays as it is.
 KM = [
     dict(group="km1", context=["Was sind meine letzten fünf Unterhaltungen?"], q="Und die älteren?",
