@@ -1171,6 +1171,20 @@ mod tests {
         assert!(out.contains("https://example.com"), "href dropped: {out}");
     }
 
+    /// The quote finds its images by Content-ID: the sanitizer must hand the
+    /// `cid:` reference on exactly as written, or the images a reply or
+    /// forward carries for it would not show.
+    #[test]
+    fn prepare_quoted_content_keeps_cid_references_as_written() {
+        let html = r#"<p>Gruss</p><img src="cid:image001.png@01DA0000.11112222" alt="Logo">"#;
+        let quoted = prepare_quoted_content(Some(html), "Gruss");
+        let out = quoted_as_html(&quoted);
+        assert!(
+            out.contains(r#"src="cid:image001.png@01DA0000.11112222""#),
+            "{out}"
+        );
+    }
+
     #[test]
     fn prepare_quoted_content_falls_back_to_escaped_text() {
         let quoted = prepare_quoted_content(None, "a<b\nnext");
