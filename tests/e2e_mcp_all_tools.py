@@ -63,6 +63,10 @@ os.makedirs(attach_dir)
 attachment = os.path.join(attach_dir, "hello.txt")
 with open(attachment, "w") as f:
     f.write("attachment payload for the e2e round\n")
+# An image to embed in a draft's body (the PNG signature is enough).
+picture = os.path.join(attach_dir, "shot.png")
+with open(picture, "wb") as f:
+    f.write(bytes.fromhex("89504e470d0a1a0a0000000d49484452"))
 
 
 def account_block(name, user, extra=""):
@@ -427,6 +431,21 @@ fwd_mail = call("get_email", {"folder": drafts_folder, "uid": f_att.get("uid", 0
 fwd_atts = [a.get("filename") for a in (fwd_mail.get("email") or {}).get("attachments") or []]
 ok("draft_forward: the original's attachment comes along", fwd_atts == ["hello.txt"], str(fwd_atts))
 
+# A reply carries no attachments, but the image its quote shows stays.
+pic = call(
+    "draft_email",
+    {
+        "to": ["bob@example.com"],
+        "subject": "E2E image",
+        "body": "see ![shot](cid:shot)",
+        "attachments": [{"path": picture, "cid": "shot"}],
+    },
+)
+reply_pic = call("draft_reply", {"folder": drafts_folder, "uid": pic.get("uid", 0), "body": "nice"})
+reply_mail = call("get_email", {"folder": drafts_folder, "uid": reply_pic.get("uid", 0)})
+reply_names = [a.get("filename") for a in (reply_mail.get("email") or {}).get("attachments") or []]
+ok("draft_reply: the image its quote shows comes along", reply_names == ["shot.png"], str(reply_names))
+
 # --- 12 list_drafts ---
 ld = call("list_drafts")
 ok(
@@ -436,7 +455,10 @@ ok(
 )
 
 # --- 13 delete_draft (real + stale) ---
-written = [d1["uid"], r1["uid"], f1["uid"], f_att["uid"], named["uid"], cc_kept["uid"]]
+written = [
+    d1["uid"], r1["uid"], f1["uid"], f_att["uid"], pic["uid"], reply_pic["uid"], named["uid"],
+    cc_kept["uid"],
+]
 del1 = call("delete_draft", {"uids": written})
 ok(
     "delete_draft: all succeeded, failed empty",

@@ -116,8 +116,8 @@ All organizing tools support **batch operations** — pass an array of UIDs to o
 
 | Tool | Description |
 |------|-------------|
-| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, Outlook-style quoting), addressed to the original's `Reply-To` when it names one and to its sender otherwise. Supports `reply_all` (excludes your own address automatically), `cc`, `attachments` (incl. inline images via `{path, inline, cid}` + `![alt](cid:<id>)` in the body), and `replaces_uid` (revise an existing draft). |
-| `draft_forward` | Forward an email with the original text and its attachments included, as a mail client does (inline images come along as ordinary attachments). **Requires `to`** — forwarding never auto-selects recipients the way `draft_reply` does. Optionally add message body, `cc`, `attachments`, and `replaces_uid`. |
+| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, Outlook-style quoting), addressed to the original's `Reply-To` when it names one and to its sender otherwise. The images the quote shows stay in it, attachments do not come along. Supports `reply_all` (excludes your own address automatically), `cc`, `attachments` (incl. inline images via `{path, inline, cid}` + `![alt](cid:<id>)` in the body), and `replaces_uid` (revise an existing draft). |
+| `draft_forward` | Forward an email with the original text and its attachments included, as a mail client does; an image the original's HTML shows (a signature's logo) stays inline in the quote. **Requires `to`** — forwarding never auto-selects recipients the way `draft_reply` does. Optionally add message body, `cc`, `attachments`, and `replaces_uid`. |
 | `draft_email` | Compose a new email from scratch with `to`, `subject`, `body`, `cc`, `bcc`, `attachments`, and `replaces_uid`. |
 | `list_drafts` | List pending drafts in the account's Drafts folder (newest first). Supports `limit` / `offset` pagination and returns `total` (all drafts) alongside `returned`. `compact: true` trims each row as in `list_emails`. Useful for tracking drafts awaiting manual send. |
 | `delete_draft` | Delete one or more drafts via UID EXPUNGE (scoped — other drafts are untouched). Takes `uids: [u32...]`; capped at 25 per call, since there is no Trash to recover from. Returns `{account, succeeded: [uids], failed: [uids]}`. Bypasses `allow_delete` because the Drafts folder is the user's own workspace; only `read_only = true` blocks it. `succeeded`/`failed` report exactly what existed — an already-deleted draft lands in `failed`, not silently in neither. **To revise a draft, don't use this** — pass `replaces_uid` to `draft_*` instead. |
@@ -747,7 +747,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 364 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 365 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
@@ -794,7 +794,7 @@ One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 to
 ```bash
 ./test-server.sh                     # fresh container (run right before — the sub-day search asserts a 1-hour window)
 cargo build --release                # or nix build, then pass result/bin/imap-mcp-rs
-python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 75 checks across all 19 tools
+python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 76 checks across all 19 tools
 podman rm -f imap-test
 ```
 
@@ -841,7 +841,7 @@ src/
 tests/
 ├── integration_greenmail.rs  End-to-end tests against GreenMail container (23 tests, `#[ignore]`-gated)
 └── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls, then
-                              two accounts and two read-only accounts (75 checks)
+                              two accounts and two read-only accounts (76 checks)
 mcp-tool-test/gemma/          Measurement kit for small models: mail world, request catalog, runners
                               (see "Measuring with a small model")
 ```

@@ -310,31 +310,13 @@ pub struct DraftEmailRequest {
 
 // ========== Tool implementations ==========
 
-/// Fetch the message a reply or forward is based on. The error side is the
-/// finished tool response.
+/// Fetch the message a reply or forward is based on, parsed and as the
+/// server stores it (the images a quote shows and the attachments a forward
+/// carries exist only there). The error side is the finished tool response.
 ///
 /// Locks only for the fetch — CPU work (HTML escape, quote building, MIME
 /// serialization) happens outside the mutex so parallel tool calls on the
 /// same account aren't blocked on this draft.
-async fn fetch_original(
-    client_arc: &Arc<Mutex<ImapClient>>,
-    folder: &str,
-    uid: u32,
-) -> Result<EmailFull, String> {
-    let mut client = client_arc.lock().await;
-    let folder = super::folder_for(&mut client, folder).await?;
-    match client.get_email(&folder, uid).await {
-        Ok(Some(email)) => Ok(email),
-        Ok(None) => Err(error_json(&format!(
-            "Email with UID {uid} not found in {}",
-            crate::email::sanitize_external_str(&folder)
-        ))),
-        Err(e) => Err(error_json(&client.check_error(e).to_string())),
-    }
-}
-
-/// [`fetch_original`] together with the raw message, for a forward: the
-/// attachments it carries along exist only there.
 async fn fetch_original_with_raw(
     client_arc: &Arc<Mutex<ImapClient>>,
     folder: &str,
@@ -352,23 +334,41 @@ async fn fetch_original_with_raw(
     }
 }
 
-/// The attachments of a message being forwarded, as a mail client carries
-/// them along: every part `get_email` lists (see
+/// The attachments of a message being forwarded or replied to, as a mail
+/// client carries them along: every part `get_email` lists (see
 /// [`crate::email::attachment_parts`]), decoded, under the name and type it
-/// shows there. Inline images come along as ordinary attachments.
-fn original_attachments(raw: &[u8]) -> AttachmentData {
+/// shows there. A part the original's HTML shows by its Content-ID (the logo
+/// in an Outlook signature, a pasted screenshot) stays inline under that id,
+/// next to the quote that shows it; carried as a file it became an extra
+/// attachment beside a broken image in the quote. Every other part is a
+/// regular attachment, which a forward carries and a reply leaves out.
+fn original_attachments(raw: &[u8], html: Option<&str>) -> (AttachmentData, Vec<InlineImage>) {
+    let mut regular = Vec::new();
+    let mut inline = Vec::new();
     let Some(message) = mail_parser::MessageParser::default().parse(raw) else {
-        return Vec::new();
+        return (regular, inline);
     };
-    crate::email::attachment_parts(&message)
-        .map(|part| {
-            (
-                crate::email::format_content_type(part.content_type()),
-                crate::email::sanitize_external_str(part.attachment_name().unwrap_or("attachment")),
-                part.decoded().into_owned(),
-            )
-        })
-        .collect()
+    for part in crate::email::attachment_parts(&message) {
+        let content_type = crate::email::format_content_type(part.content_type());
+        let filename =
+            crate::email::sanitize_external_str(part.attachment_name().unwrap_or("attachment"));
+        let bytes = part.decoded().into_owned();
+        let shown = part
+            .content_id()
+            .map(|id| sanitize_header_value(id.trim().trim_matches(['<', '>'])))
+            .filter(|id| !id.is_empty() && html.is_some_and(|h| h.contains(&format!("cid:{id}"))));
+        match shown {
+            Some(id) => inline.push(InlineImage {
+                cid: id.clone(),
+                content_id: id,
+                filename,
+                content_type,
+                bytes,
+            }),
+            None => regular.push((content_type, filename, bytes)),
+        }
+    }
+    (regular, inline)
 }
 
 /// The `saved` of every draft response.
@@ -592,7 +592,12 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Tool
     };
     let acct = DraftAccount::from_config(account_config);
 
-    let original = fetch_original(&client_arc, &req.folder, req.uid).await?;
+    let (original, raw) = fetch_original_with_raw(&client_arc, &req.folder, req.uid).await?;
+    // A reply carries no attachments, but the images its quote shows (a
+    // signature's logo) stay, as in every mail client: without them the
+    // quote showed broken pictures.
+    let (_, quoted_images) = original_attachments(&raw, original.body_html.as_deref());
+    drop(raw);
 
     let reply_all = req.reply_all.unwrap_or(false);
     let (to_list, cc_list) =
@@ -611,7 +616,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Tool
     // Attachments are read BEFORE the bodies: inline images have to be known
     // while rendering, because their markers are resolved inside the body
     // text rather than patched in afterwards.
-    let (prepared, inline_notice) = match prepare_attachments(
+    let (mut prepared, inline_notice) = match prepare_attachments(
         req.attachments.as_deref(),
         &server.config.allowed_attachment_dirs,
         &req.body,
@@ -622,6 +627,7 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Tool
         Ok(v) => v,
         Err(e) => return Err(error_json(&e)),
     };
+    prepared.inline.extend(quoted_images);
 
     // Scoped so the borrows of `prepared` end before it is moved into the
     // MIME assembly below.
@@ -728,7 +734,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     // A forward carries the original's attachments, as every mail client
     // does: forwarding an invoice without the invoice helped nobody, and the
     // draft quoted the text alone. Ahead of the files the call adds.
-    let carried = original_attachments(&raw);
+    let (carried, carried_inline) = original_attachments(&raw, original.body_html.as_deref());
     drop(raw);
 
     let subject_raw = if has_forward_prefix(&original.subject) {
@@ -752,6 +758,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
         Err(e) => return Err(error_json(&e)),
     };
     prepared.regular.splice(0..0, carried);
+    prepared.inline.extend(carried_inline);
 
     let (plain_body, html_body) = {
         let refs = inline_refs(&prepared.inline);
@@ -1161,7 +1168,7 @@ pub(super) struct InlineImage {
     /// unique — see `read_attachments` for why it differs from `cid`.
     pub content_id: String,
     pub filename: String,
-    pub content_type: &'static str,
+    pub content_type: String,
     pub bytes: Vec<u8>,
 }
 
@@ -1403,7 +1410,7 @@ async fn read_attachments(
             cid,
             content_id,
             filename,
-            content_type,
+            content_type: content_type.to_string(),
             bytes,
         });
     }
@@ -1851,16 +1858,49 @@ mod tests {
                    Content-Disposition: attachment; filename=\"Rechnung.pdf\"\r\n\
                    Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n\
                    --B--\r\n";
-        let carried = original_attachments(raw.as_bytes());
+        let (carried, inline) = original_attachments(raw.as_bytes(), None);
         assert_eq!(carried.len(), 1, "{carried:?}");
         assert_eq!(carried[0].0, "application/pdf");
         assert_eq!(carried[0].1, "Rechnung.pdf");
         assert_eq!(carried[0].2, b"%PDF-1.4", "decoded, not base64");
-        assert_eq!(
-            original_attachments(b"From: a@b\r\nSubject: s\r\n\r\nText\r\n"),
-            Vec::new(),
-            "a plain message carries nothing"
+        assert!(inline.is_empty(), "{} inline parts", inline.len());
+        let (carried, inline) =
+            original_attachments(b"From: a@b\r\nSubject: s\r\n\r\nText\r\n", None);
+        assert_eq!(carried, Vec::new(), "a plain message carries nothing");
+        assert!(inline.is_empty(), "{} inline parts", inline.len());
+    }
+
+    /// The logo in an Outlook signature sits inline under a Content-ID that
+    /// the HTML shows: forwarded, it stays inline under that id, so the quote
+    /// shows it, instead of turning into an extra attachment beside a broken
+    /// image. A file the HTML does not show stays an attachment.
+    #[test]
+    fn a_forward_keeps_what_the_quote_shows_inline() {
+        let html = "<p>Gruss</p><img src=\"cid:image001.png@01DA0000.11112222\">";
+        let raw = format!(
+            "From: a@example.com\r\nSubject: Logo\r\nMIME-Version: 1.0\r\n\
+             Content-Type: multipart/mixed; boundary=\"M\"\r\n\r\n\
+             --M\r\nContent-Type: multipart/related; boundary=\"R\"\r\n\r\n\
+             --R\r\nContent-Type: text/html; charset=utf-8\r\n\r\n{html}\r\n\
+             --R\r\nContent-Type: image/png; name=\"image001.png\"\r\n\
+             Content-ID: <image001.png@01DA0000.11112222>\r\n\
+             Content-Disposition: inline; filename=\"image001.png\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\niVBORw0KGgo=\r\n--R--\r\n\
+             --M\r\nContent-Type: application/pdf; name=\"Angebot.pdf\"\r\n\
+             Content-Disposition: attachment; filename=\"Angebot.pdf\"\r\n\
+             Content-Transfer-Encoding: base64\r\n\r\nJVBERi0xLjQ=\r\n--M--\r\n"
         );
+        let (carried, inline) = original_attachments(raw.as_bytes(), Some(html));
+        assert_eq!(carried.len(), 1, "{carried:?}");
+        assert_eq!(carried[0].1, "Angebot.pdf");
+        assert_eq!(inline.len(), 1, "{} inline parts", inline.len());
+        assert_eq!(inline[0].content_id, "image001.png@01DA0000.11112222");
+        assert_eq!(inline[0].filename, "image001.png");
+        assert_eq!(inline[0].content_type, "image/png");
+        // Without HTML that shows it, the image is just another attachment.
+        let (carried, inline) = original_attachments(raw.as_bytes(), None);
+        assert_eq!(carried.len(), 2, "{carried:?}");
+        assert!(inline.is_empty(), "{} inline parts", inline.len());
     }
 
     #[test]
@@ -2329,7 +2369,7 @@ mod tests {
             cid: cid.to_string(),
             content_id: format!("{cid}.fixed0@unit.invalid"),
             filename: format!("{cid}.png"),
-            content_type: "image/png",
+            content_type: "image/png".to_string(),
             bytes: vec![1, 2, 3],
         }
     }
@@ -2862,7 +2902,7 @@ mod tests {
                 cid: "rollen".to_string(),
                 content_id: "rollen.fixed0@unit.invalid".to_string(),
                 filename: "Rollenübersicht.png".to_string(),
-                content_type: "image/png",
+                content_type: "image/png".to_string(),
                 bytes: png,
             }],
         };
