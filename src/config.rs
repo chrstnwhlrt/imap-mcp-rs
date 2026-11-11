@@ -191,8 +191,9 @@ pub struct AccountConfig {
     /// message in the folder — including ones flagged by a concurrent
     /// client (phone, webmail) that hasn't expunged yet. On modern servers
     /// (Gmail, Outlook 365, Dovecot, Cyrus) UIDPLUS is universal and this
-    /// never matters; on older/custom servers a permanent delete or move
-    /// will refuse unless this is explicitly enabled.
+    /// never matters; on older/custom servers a permanent delete, and a move
+    /// where the server has no MOVE either, will refuse unless this is
+    /// explicitly enabled.
     #[serde(default)]
     pub allow_unsafe_expunge: bool,
     pub allowed_folders: Option<Vec<String>>,

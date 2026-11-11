@@ -28,7 +28,8 @@ the MCP tool surface and the config format are the public API.
   Before, every move was COPY, STORE `\Deleted` and EXPUNGE: two round
   trips more, and a failure between them left the messages in both
   folders. MOVE moves all or nothing. Whether the server has it is asked
-  once per session; without it the three steps stay as they were.
+  once per session; without it the three steps stay as they were, and so
+  does a server that lists MOVE but refuses the command.
 
 - **The server answers `initialize` at once.** It connected every account
   before it began to serve, so the client's start waited for the slowest

@@ -405,10 +405,6 @@ impl PostFetchFilter {
     }
 }
 
-/// Turn a list of summary-shaped fetch responses into `EmailSummary`
-/// rows. Centralizes the UID-skip + bounded body + parse + post-filter +
-/// summarize pipeline shared by `list_emails`, `list_unread_emails`, and
-/// `search_emails`.
 /// A listing row, or the UID of a message whose start did not settle its
 /// row and has to be read whole.
 enum Row {
@@ -448,10 +444,13 @@ fn structure_counts(structure: &BodyStructure<'_>) -> (usize, bool) {
     }
 }
 
-/// The rows of `fetches`, in their order. `partial` says they were read with
-/// [`ROW_FETCH_ITEMS`]: a message cut off there gets its row from the start
-/// only where [`email::parse_prefix_no_html`] finds it certain, its files
-/// counted from the BODYSTRUCTURE, and is otherwise left to be read whole.
+/// The rows of `fetches`, in their order: the UID-skip + bounded body +
+/// parse + post-filter + summarize pipeline shared by `list_emails`,
+/// `list_unread_emails` and `search_emails`. `partial` says they were read
+/// with [`ROW_FETCH_ITEMS`]: a message cut off there gets its row from the
+/// start only where [`email::parse_prefix_no_html`] finds it certain, its
+/// files counted from the BODYSTRUCTURE, and is otherwise left to be read
+/// whole.
 fn summarize_fetches(
     fetches: &[Fetch],
     folder: &str,
@@ -1557,8 +1556,9 @@ impl ImapClient {
         Ok(requested_fetch(fetches, uid))
     }
 
-    /// Search one folder. Returns the summaries (newest first, capped at
-    /// `limit`) together with the number of messages that actually matched.
+    /// Search one folder. Returns the summaries of the newest `limit`
+    /// matches by UID, in the order the server sends them (the caller sorts
+    /// by date), together with the number of messages that actually matched.
     ///
     /// The count is taken before the cap: a caller that only sees `limit`
     /// results cannot otherwise tell "exactly this many" from "the first of
@@ -1937,7 +1937,7 @@ impl ImapClient {
         self.ensure_live().await?;
         self.ensure_selected(folder).await?;
         // Checked before anything moves; the server's own refusal of the
-        // COPY would only say "doesn't exist", without the names to pick from.
+        // move would only say "doesn't exist", without the names to pick from.
         if let Some(names) = self.folder_list_without(target).await {
             return Err(unknown_folder_error(target, &names, self.may_delete()));
         }
@@ -1951,11 +1951,26 @@ impl ImapClient {
         if self.server_can_move().await? {
             // One command that moves all or nothing: no state with the
             // messages in both folders, and two round trips fewer.
-            self.session()?.uid_mv(&uid_set, target).await?;
-            // The move expunged the messages from the folder, which
-            // renumbered it.
-            self.selected_folder = None;
-            return Ok(existing);
+            match self.session()?.uid_mv(&uid_set, target).await {
+                Ok(()) => {
+                    // The move expunged the messages from the folder, which
+                    // renumbered it.
+                    self.selected_folder = None;
+                    return Ok(existing);
+                }
+                // BAD: the server did not take the command, so nothing moved.
+                // A server that lists MOVE without taking UID MOVE would
+                // otherwise move nothing at all; it gets the three steps.
+                Err(async_imap::error::Error::Bad(reason)) => {
+                    tracing::warn!(
+                        account = %self.config.name,
+                        reason = %sanitize_log_str(&reason),
+                        "UID MOVE refused although MOVE is listed; moving with COPY on this session"
+                    );
+                    self.can_move = Some(false);
+                }
+                Err(e) => return Err(e.into()),
+            }
         }
         // COPY first. If it fails the source is unchanged — the caller may
         // safely retry. If it SUCCEEDS, any subsequent failure leaves the
@@ -2920,7 +2935,9 @@ mod tests {
     const FAKE_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg9q5WF+ut6HmCU0k4cmUrA6YESHF4jgKbPYiHya5b392hRANCAAR0bdX1KvMmduT6WBBs9EUfmWhWFB7x3+cdYOb4AIOFiWGeu38F2+qHXQ0JnWKQJ4APKj/PQinauWnr3qy4q0qT";
 
     /// What the fake server answers to a command, given its tag, its word
-    /// (upper case) and how often that word came before on any connection:
+    /// (upper case; `UID FETCH` for a UID command, `FETCH START` for a FETCH
+    /// of the start of messages) and how often that word came before on any
+    /// connection:
     /// the reply, or `None` to read the command and say nothing, as a hung
     /// server or a dead path does.
     type FakeAnswer = Arc<dyn Fn(&str, &str, usize) -> Option<String> + Send + Sync>;
@@ -2967,7 +2984,16 @@ mod tests {
                     while let Ok(Some(line)) = lines.next_line().await {
                         let mut words = line.split_whitespace();
                         let tag = words.next().unwrap_or("*").to_string();
-                        let word = words.next().unwrap_or("").to_ascii_uppercase();
+                        let mut word = words.next().unwrap_or("").to_ascii_uppercase();
+                        // `UID FETCH`, `UID MOVE`: the command is the second word.
+                        if word == "UID" {
+                            word =
+                                format!("UID {}", words.next().unwrap_or("").to_ascii_uppercase());
+                        }
+                        // A FETCH of the start of messages (`ROW_FETCH_ITEMS`).
+                        if line.contains("BODY.PEEK[]<0.") {
+                            word.push_str(" START");
+                        }
                         let reply = match word.as_str() {
                             "LOGIN" => Some(format!("{tag} OK LOGIN completed\r\n")),
                             "LOGOUT" => Some(format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n")),
@@ -3190,8 +3216,8 @@ mod tests {
             "SELECT" => Some(format!(
                 "* 2 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
             )),
-            "FETCH" => Some(format!("{page}{tag} OK FETCH completed\r\n")),
-            "UID" => {
+            "FETCH START" => Some(format!("{page}{tag} OK FETCH completed\r\n")),
+            "UID FETCH" => {
                 seen.lock().unwrap().push(tag.to_string());
                 Some(format!("{whole}{tag} OK FETCH completed\r\n"))
             }
@@ -3227,6 +3253,58 @@ mod tests {
         assert_eq!(got[0]["snippet"], "Anbei die Rechnung.");
         assert_eq!(got[1]["snippet"], "Hier das Foto Und noch eins");
         assert!(got.iter().all(|row| row["has_attachments"] == true));
+    }
+
+    /// A server that writes the start of a message the way imap-proto cannot
+    /// parse (`GreenMail`: `BODY[]<0>{n}`, without the space before the
+    /// literal) costs one reconnect: the listing is read again with whole
+    /// messages, and so is every later one on the account.
+    #[tokio::test]
+    async fn an_unreadable_start_switches_the_account_to_whole_messages() {
+        let raw =
+            "From: a@b\r\nSubject: Hallo\r\nDate: Tue, 10 Nov 2026 09:00:00 +0100\r\n\r\nText\r\n";
+        let commands = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&commands);
+        let addr = fake_server(Arc::new(move |tag, word, _| {
+            seen.lock().unwrap().push(word.to_string());
+            match word {
+                "SELECT" => Some(format!(
+                    "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+                )),
+                "FETCH START" => Some(format!(
+                    "* 1 FETCH (UID 5 FLAGS () RFC822.SIZE {} BODY[]<0>{{{}}}\r\n{raw})\r\n{tag} OK done\r\n",
+                    raw.len(),
+                    raw.len()
+                )),
+                "FETCH" => Some(format!(
+                    "* 1 FETCH (UID 5 FLAGS () BODY[] {{{}}}\r\n{raw})\r\n{tag} OK done\r\n",
+                    raw.len()
+                )),
+                _ => Some(format!("{tag} OK done\r\n")),
+            }
+        }))
+        .await;
+        let mut client = fake_client(addr).await;
+        for _ in 0..2 {
+            let (rows, total, _) = client
+                .list_emails("INBOX", 5, 0, false)
+                .await
+                .expect("read with whole messages");
+            assert_eq!(total, 1);
+            assert_eq!(rows[0].subject, "Hallo");
+        }
+        let fetches: Vec<String> = commands
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|c| c.contains("FETCH"))
+            .cloned()
+            .collect();
+        assert_eq!(
+            fetches,
+            ["FETCH START", "FETCH", "FETCH"],
+            "one try, then whole messages"
+        );
     }
 
     /// An answer the parser cannot read stays in async-imap's buffer, where
@@ -3356,6 +3434,54 @@ mod tests {
             "{err}"
         );
         assert!(!err.contains("move_email"), "{err}");
+    }
+
+    /// A server that lists MOVE and still refuses UID MOVE with BAD has moved
+    /// nothing: the move goes the old way, COPY, STORE and EXPUNGE, and
+    /// reports the messages moved. Without the fallback such a server could
+    /// not move or delete at all.
+    #[tokio::test]
+    async fn a_refused_move_falls_back_to_copy() {
+        let commands = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&commands);
+        let addr = fake_server(Arc::new(move |tag, word, _| {
+            seen.lock().unwrap().push(word.to_string());
+            match word {
+                "SELECT" => Some(format!(
+                    "* 1 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+                )),
+                "LIST" => Some(format!(
+                    "* LIST () \"/\" \"INBOX\"\r\n* LIST () \"/\" \"Archiv\"\r\n{tag} OK LIST completed\r\n"
+                )),
+                "CAPABILITY" => Some(format!(
+                    "* CAPABILITY IMAP4rev1 UIDPLUS MOVE\r\n{tag} OK CAPABILITY completed\r\n"
+                )),
+                "UID SEARCH" => Some(format!("* SEARCH 7\r\n{tag} OK SEARCH completed\r\n")),
+                "UID MOVE" => Some(format!("{tag} BAD Unknown command\r\n")),
+                "UID STORE" => Some(format!(
+                    "* 1 FETCH (UID 7 FLAGS (\\Deleted))\r\n{tag} OK STORE completed\r\n"
+                )),
+                _ => Some(format!("{tag} OK done\r\n")),
+            }
+        }))
+        .await;
+        let mut client = fake_client(addr).await;
+        let moved = client
+            .move_emails("INBOX", &[7], "Archiv")
+            .await
+            .expect("the move goes through COPY");
+        assert_eq!(moved, vec![7]);
+        let commands = commands.lock().unwrap().clone();
+        let after_move: Vec<&str> = commands
+            .iter()
+            .skip_while(|c| *c != "UID MOVE")
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            after_move,
+            ["UID MOVE", "UID COPY", "UID STORE", "UID EXPUNGE"],
+            "{commands:?}"
+        );
     }
 
     /// A write step wraps the cause in what it means for the caller. A dead
