@@ -351,6 +351,11 @@ pub(super) fn strip_email_prefixes(subject: &str) -> &str {
 /// `io: Error(Error { input: [..], code: .. }) during parsing of "..."`.
 const PARSE_FAILURE: &str = " during parsing of ";
 
+/// Whether `msg` is async-imap's report of an answer its parser rejected.
+pub(super) fn is_parse_failure(msg: &str) -> bool {
+    msg.contains(PARSE_FAILURE)
+}
+
 /// What is left of such an error for a reader. async-imap puts the whole
 /// unread buffer into the message, as a list of byte values and again as
 /// text: with a message body in it megabytes, all of it from the server, and

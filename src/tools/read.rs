@@ -769,7 +769,7 @@ pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> ToolRe
             } else {
                 let summaries: Vec<_> = emails
                     .into_iter()
-                    .map(|e| crate::email::summarize(e, 200))
+                    .map(|e| crate::email::summarize(e, crate::email::SNIPPET_LEN))
                     .collect();
                 serde_json::to_value(&summaries).unwrap_or(serde_json::Value::Array(vec![]))
             };

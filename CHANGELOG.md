@@ -5,6 +5,24 @@ the MCP tool surface and the config format are the public API.
 
 ## 3.2.4
 
+### Changed
+
+- **Listings read the start of a message, not all of it.** A row of
+  `list_emails`, `search_emails` or `list_drafts` needs the header, the start
+  of the text and whether there are files, but each row read its whole
+  message: a page of 20 mails with a photo or a PDF in each was 86 MB, and a
+  search over every folder read such a page in each folder. Now the rows come
+  from the first 128 KiB of each message and its BODYSTRUCTURE. A message
+  whose start does not settle its row is read whole: text after a photo, a
+  text part cut off before its snippet is safely over. Every row is byte for
+  byte the row of the whole message, checked at every cut position of 16
+  kinds of mail and against Dovecot with the answers of 3.2.3. Over a line
+  of 50 Mbit/s with 20 ms delay a page of 50 rows took 3 s instead of 10 s,
+  a search for an invoice word over every folder 1.5 s instead of 8 s. A
+  server whose answer cannot be parsed gets whole messages from then on;
+  GreenMail is one, it writes `BODY[]<0>{416}` without the space RFC 3501
+  puts before the literal.
+
 ### Fixed
 
 - **An answer the parser cannot read no longer blocks the account until a

@@ -14,7 +14,7 @@
 use std::borrow::Cow;
 use std::sync::LazyLock;
 
-use mail_parser::{ContentType, Message, MessagePart, PartKind, PartRole};
+use mail_parser::{ContentType, Message, MessagePart, PartFlags, PartKind, PartRole};
 use serde::Serialize;
 
 /// Format a MIME `Content-Type` as `type/subtype`, falling back to
@@ -306,6 +306,85 @@ pub fn parse_email_no_html(uid: u32, folder: &str, raw: &[u8], flags: Vec<String
     parse_email_inner(uid, folder, raw, flags, false)
 }
 
+/// The length of the text start a listing row shows (see [`summarize`]).
+pub const SNIPPET_LEN: usize = 200;
+
+/// How much text has to follow a row's snippet when the bytes cut off the
+/// text part it comes from. The end of a part cut in the middle may decode
+/// otherwise than in the whole message (a split base64 group or character,
+/// an HTML tag left open); text well before it is the text of the whole
+/// message.
+const SETTLED_MARGIN: usize = 1024;
+
+/// The fields of a message for a listing row from its first bytes alone:
+/// `None` when they might differ from what the whole message gives.
+///
+/// A row needs the header, the start of the text and whether there are
+/// attachments. The header is certain once it has ended within `prefix`.
+/// The text is certain when every text part of the message is in `prefix`:
+/// `text_parts` is how many the message has, counted in the server's
+/// BODYSTRUCTURE (text parts of attached messages not included). Each one
+/// found here has to have ended at its delimiter, except the last, which
+/// may run on beyond the bytes when the snippet ends long before them. What
+/// follows the text parts is then all files, which add nothing to the text;
+/// whether there are any the caller takes from the BODYSTRUCTURE as well,
+/// since a file cut off here may be the only one.
+pub fn parse_prefix_no_html(
+    uid: u32,
+    folder: &str,
+    prefix: &[u8],
+    flags: Vec<String>,
+    text_parts: usize,
+) -> Option<EmailFull> {
+    let message = mail_parser::MessageParser::default().parse(prefix)?;
+    let root = message.root();
+    if root.root_part().flags().contains(PartFlags::NO_BLANK_LINE) {
+        return None;
+    }
+    let mut seen = 0;
+    let mut text_cut = false;
+    for part in root.parts() {
+        if !matches!(part.kind(), PartKind::Text | PartKind::Html) {
+            continue;
+        }
+        // Read as text without being declared text: a multipart whose
+        // first delimiter is not in the bytes yet, say. Its parts are still
+        // to come.
+        if !part
+            .content_type()
+            .is_none_or(|ct| ct.ctype().eq_ignore_ascii_case("text"))
+        {
+            return None;
+        }
+        // Running to the end of the bytes, the part may go on beyond them.
+        // In a multipart the missing delimiter says so too; the text of a
+        // message that is nothing but text has none.
+        if part.offset_end() as usize >= prefix.len() {
+            let problems = part.flags();
+            if text_cut || !(problems.is_empty() || problems == PartFlags::MISSING_DELIMITER) {
+                return None;
+            }
+            text_cut = true;
+        } else if part.has_problems() {
+            return None;
+        }
+        seen += 1;
+    }
+    if seen != text_parts {
+        return None;
+    }
+    let email = email_from_message(uid, folder, &message, flags, false);
+    // The snippet has to end well before the cut: where all of the text fits
+    // into it, the rest of the cut part would have been in it too.
+    if text_cut
+        && snippet_ends(&email.body_text, SNIPPET_LEN)
+            .is_none_or(|end| email.body_text.len() - end < SETTLED_MARGIN)
+    {
+        return None;
+    }
+    Some(email)
+}
+
 fn parse_email_inner(
     uid: u32,
     folder: &str,
@@ -313,9 +392,7 @@ fn parse_email_inner(
     flags: Vec<String>,
     include_html: bool,
 ) -> EmailFull {
-    let message = mail_parser::MessageParser::default().parse(raw);
-
-    let Some(message) = message else {
+    let Some(message) = mail_parser::MessageParser::default().parse(raw) else {
         return EmailFull {
             uid,
             folder: folder.to_string(),
@@ -336,7 +413,17 @@ fn parse_email_inner(
             body_parts_diverge: false,
         };
     };
+    email_from_message(uid, folder, &message, flags, include_html)
+}
 
+/// The fields of a parsed message, as [`parse_email`] reports them.
+fn email_from_message(
+    uid: u32,
+    folder: &str,
+    message: &Message<'_>,
+    flags: Vec<String>,
+    include_html: bool,
+) -> EmailFull {
     let from = message
         .from()
         .and_then(|list| list.first())
@@ -387,11 +474,11 @@ fn parse_email_inner(
     // Without tag characters, which no mail client shows: a model reading the
     // text would otherwise follow instructions the user never sees, and a
     // reply or forward would carry them on in its quote.
-    let body_text = without_tag_chars(extract_body_text(&message));
+    let body_text = without_tag_chars(extract_body_text(message));
     // Skipped entirely on the list/search path (`include_html == false`),
     // which never returns a body anyway.
     let body_html = if include_html {
-        own_html(&message).map(without_tag_chars)
+        own_html(message).map(without_tag_chars)
     } else {
         None
     };
@@ -405,9 +492,9 @@ fn parse_email_inner(
         && message
             .text_body()
             .any(|part| matches!(part.kind(), PartKind::Text))
-        && parts_diverge(&body_text, &without_tag_chars(rendered_html_body(&message)));
+        && parts_diverge(&body_text, &without_tag_chars(rendered_html_body(message)));
 
-    let attachments = attachment_parts(&message)
+    let attachments = attachment_parts(message)
         .enumerate()
         .map(|(index, att)| AttachmentInfo {
             index,
@@ -1066,10 +1153,21 @@ pub fn summarize(email: EmailFull, snippet_len: usize) -> EmailSummary {
 /// characters: dropping them glued the lines of a mail together, and a
 /// listing read `Liebe GrüßeMama`.
 fn build_snippet(body: &str, snippet_len: usize) -> String {
+    snippet_and_end(body, snippet_len).0
+}
+
+/// Where in `body` its snippet ends: the byte offset of the first visible
+/// character that no longer fits, `None` when all of `body` fits.
+fn snippet_ends(body: &str, snippet_len: usize) -> Option<usize> {
+    snippet_and_end(body, snippet_len).1
+}
+
+/// [`build_snippet`] together with [`snippet_ends`].
+fn snippet_and_end(body: &str, snippet_len: usize) -> (String, Option<usize>) {
     let mut out = String::with_capacity(snippet_len.min(body.len()) + 3);
-    let mut truncated = false;
+    let mut end = None;
     let mut space_pending = false;
-    for c in body.chars() {
+    for (at, c) in body.char_indices() {
         if c.is_whitespace() {
             space_pending = !out.is_empty();
             continue;
@@ -1081,7 +1179,7 @@ fn build_snippet(body: &str, snippet_len: usize) -> String {
         }
         let space = usize::from(space_pending);
         if out.len() + space + c.len_utf8() > snippet_len {
-            truncated = true;
+            end = Some(at);
             break;
         }
         if space_pending {
@@ -1090,10 +1188,10 @@ fn build_snippet(body: &str, snippet_len: usize) -> String {
         }
         out.push(c);
     }
-    if truncated {
+    if end.is_some() {
         out.push_str("...");
     }
-    out
+    (out, end)
 }
 
 #[cfg(test)]
@@ -2031,5 +2129,349 @@ mod tests {
                    Content-Type: text/html; charset=utf-8\r\n\r\n\
                    <html><body><p>Hello world, this is a message.</p></body></html>\r\n";
         assert!(!parse_email(1, "INBOX", raw.as_bytes(), vec![]).body_parts_diverge);
+    }
+
+    /// A file of `n` bytes as mailers write one: base64 in 76-column lines.
+    fn file_lines(n: usize) -> String {
+        use base64::Engine as _;
+        let data: Vec<u8> = (0..n).map(|i| u8::try_from(i * 7 % 251).unwrap()).collect();
+        let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+        encoded
+            .as_bytes()
+            .chunks(76)
+            .map(|line| std::str::from_utf8(line).unwrap())
+            .collect::<Vec<_>>()
+            .join("\r\n")
+    }
+
+    /// The header every test message starts with, `content_type` last.
+    fn head(content_type: &str) -> String {
+        format!(
+            "From: Stadtwerke <rechnung@stadtwerke.example>\r\nTo: Christian <c@example.de>\r\n\
+             Subject: Ihre Rechnung\r\nDate: Tue, 10 Nov 2026 09:00:00 +0100\r\n\
+             Message-ID: <r1@stadtwerke.example>\r\nMIME-Version: 1.0\r\n\
+             Content-Type: {content_type}\r\n\r\n"
+        )
+    }
+
+    /// One part: its header lines and its body.
+    fn part(headers: &str, body: &str) -> String {
+        format!("{headers}\r\n\r\n{body}")
+    }
+
+    /// A multipart body of `parts` under `boundary`.
+    fn multipart(boundary: &str, parts: &[String]) -> String {
+        use std::fmt::Write as _;
+        let mut out = String::new();
+        for p in parts {
+            write!(out, "--{boundary}\r\n{p}\r\n").unwrap();
+        }
+        write!(out, "--{boundary}--\r\n").unwrap();
+        out
+    }
+
+    fn pdf() -> String {
+        part(
+            "Content-Type: application/pdf; name=\"rechnung.pdf\"\r\n\
+             Content-Disposition: attachment; filename=\"rechnung.pdf\"\r\n\
+             Content-Transfer-Encoding: base64",
+            &file_lines(4000),
+        )
+    }
+
+    fn photo(name: &str) -> String {
+        part(
+            &format!(
+                "Content-Type: image/jpeg; name=\"{name}\"\r\nContent-Disposition: inline; \
+                 filename=\"{name}\"\r\nContent-Transfer-Encoding: base64"
+            ),
+            &file_lines(3000),
+        )
+    }
+
+    fn plain(text: &str) -> String {
+        part("Content-Type: text/plain; charset=utf-8", text)
+    }
+
+    fn html(text: &str) -> String {
+        part(
+            "Content-Type: text/html; charset=utf-8",
+            &format!(
+                "<html><head><style>p {{ margin: 0 }}</style></head><body><p>{text}</p></body></html>"
+            ),
+        )
+    }
+
+    /// The ways mail is put together, each with files that make it large.
+    // A table, one entry per shape; split up it would only be harder to scan.
+    #[allow(clippy::too_many_lines)]
+    fn layouts() -> Vec<(&'static str, String)> {
+        let long = "Sehr geehrter Herr Wohlert, anbei erhalten Sie Ihre Rechnung für den Monat \
+                    Oktober. Bitte überweisen Sie den Betrag bis zum 30.11. auf das unten \
+                    genannte Konto. Bei Fragen erreichen Sie uns werktags von 8 bis 18 Uhr. \
+                    Mit freundlichen Grüßen, Ihre Stadtwerke";
+        let alternative = |boundary: &str, parts: &[String]| {
+            part(
+                &format!("Content-Type: multipart/alternative; boundary=\"{boundary}\""),
+                &multipart(boundary, parts),
+            )
+        };
+        let nested = format!(
+            "{}{}",
+            head("text/plain; charset=utf-8").replace("Ihre Rechnung", "Weitergeleitet"),
+            "Die eigentliche Nachricht steht hier."
+        );
+        vec![
+            (
+                "invoice",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart("b1", &[plain("Anbei die Rechnung."), pdf()]),
+            ),
+            (
+                "invoice with a long text",
+                head("multipart/mixed; boundary=\"b1\"") + &multipart("b1", &[plain(long), pdf()]),
+            ),
+            (
+                "both versions and a file",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart(
+                        "b1",
+                        &[alternative("b2", &[plain(long), html(long)]), pdf()],
+                    ),
+            ),
+            (
+                "phone: text, photo, text",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart(
+                        "b1",
+                        &[
+                            plain("Hier das Foto"),
+                            photo("a.jpg"),
+                            plain("Und noch eins"),
+                        ],
+                    ),
+            ),
+            (
+                "photo first",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart("b1", &[photo("a.jpg"), plain("Gruß aus dem Urlaub")]),
+            ),
+            (
+                "newsletter with an embedded picture",
+                head("multipart/alternative; boundary=\"b1\"")
+                    + &multipart(
+                        "b1",
+                        &[
+                            plain(long),
+                            part(
+                                "Content-Type: multipart/related; boundary=\"b2\"",
+                                &multipart(
+                                    "b2",
+                                    &[
+                                        html(long),
+                                        part(
+                                            "Content-Type: image/png\r\nContent-ID: <logo>\r\n\
+                                             Content-Transfer-Encoding: base64",
+                                            &file_lines(3000),
+                                        ),
+                                    ],
+                                ),
+                            ),
+                        ],
+                    ),
+            ),
+            (
+                "HTML only and a file",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart("b1", &[html("Ihre Rechnung liegt bei."), pdf()]),
+            ),
+            (
+                "HTML before text, and a file",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart(
+                        "b1",
+                        &[
+                            alternative("b2", &[html(long), plain("Kurzfassung")]),
+                            pdf(),
+                        ],
+                    ),
+            ),
+            (
+                "nothing but a file",
+                head("application/pdf; name=\"scan.pdf\"").replace(
+                    "Content-Type: application/pdf; name=\"scan.pdf\"\r\n",
+                    "Content-Type: application/pdf; name=\"scan.pdf\"\r\n\
+                     Content-Transfer-Encoding: base64\r\n",
+                ) + &file_lines(4000),
+            ),
+            (
+                "a long text alone",
+                head("text/plain; charset=utf-8") + &format!("{long}\r\n").repeat(40),
+            ),
+            (
+                "an HTML newsletter alone",
+                head("text/html; charset=utf-8")
+                    + &format!(
+                        "<html><body>{}</body></html>",
+                        format!("<p>{long}</p>\r\n").repeat(40)
+                    ),
+            ),
+            (
+                "a style sheet before the text",
+                head("multipart/alternative; boundary=\"b1\"")
+                    + &multipart(
+                        "b1",
+                        &[part(
+                            "Content-Type: text/html; charset=utf-8\r\nContent-Transfer-Encoding: quoted-printable",
+                            &format!(
+                                "<html><head><style>{}</style></head><body>{}</body></html>",
+                                "p.x {{ margin: 0 }}\r\n".repeat(300),
+                                format!("<p>{long}</p>\r\n").repeat(30)
+                            ),
+                        )],
+                    ),
+            ),
+            (
+                "a forwarded message",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart(
+                        "b1",
+                        &[
+                            plain("Siehe unten."),
+                            part("Content-Type: message/rfc822", &nested),
+                            pdf(),
+                        ],
+                    ),
+            ),
+            (
+                "a text file among the files",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart(
+                        "b1",
+                        &[
+                            plain("Das Protokoll und die Rechnung."),
+                            part(
+                                "Content-Type: text/plain; name=\"protokoll.txt\"\r\n\
+                                 Content-Disposition: attachment; filename=\"protokoll.txt\"",
+                                "Zeile 1\r\nZeile 2",
+                            ),
+                            pdf(),
+                        ],
+                    ),
+            ),
+            (
+                "signed",
+                head("multipart/signed; protocol=\"application/pkcs7-signature\"; boundary=\"s1\"")
+                    + &multipart(
+                        "s1",
+                        &[
+                            part(
+                                "Content-Type: multipart/mixed; boundary=\"b1\"",
+                                &multipart("b1", &[plain(long), pdf()]),
+                            ),
+                            part(
+                                "Content-Type: application/pkcs7-signature; name=\"smime.p7s\"\r\n\
+                                 Content-Transfer-Encoding: base64",
+                                &file_lines(1500),
+                            ),
+                        ],
+                    ),
+            ),
+            (
+                "an invitation",
+                head("multipart/mixed; boundary=\"b1\"")
+                    + &multipart(
+                        "b1",
+                        &[
+                            alternative(
+                                "b2",
+                                &[
+                                    plain("Einladung zum Termin"),
+                                    html("Einladung zum Termin"),
+                                    part(
+                                        "Content-Type: text/calendar; method=REQUEST",
+                                        "BEGIN:VCALENDAR\r\nEND:VCALENDAR",
+                                    ),
+                                ],
+                            ),
+                            part(
+                                "Content-Type: application/ics; name=\"invite.ics\"\r\n\
+                                 Content-Disposition: attachment; filename=\"invite.ics\"\r\n\
+                                 Content-Transfer-Encoding: base64",
+                                &file_lines(2000),
+                            ),
+                        ],
+                    ),
+            ),
+        ]
+    }
+
+    /// What the BODYSTRUCTURE of `raw` says as far as a row needs it: its
+    /// text parts and whether it has any other part. Taken from the whole
+    /// message here, where the server and mail-parser see the same tree.
+    fn structure(raw: &[u8]) -> (usize, bool) {
+        let message = mail_parser::MessageParser::default().parse(raw).unwrap();
+        let mut text = 0;
+        let mut other = false;
+        for part in message.root().parts() {
+            match part.kind() {
+                PartKind::Text | PartKind::Html => text += 1,
+                PartKind::Multipart => {}
+                _ => other = true,
+            }
+        }
+        (text, other)
+    }
+
+    /// The listing row of `email`, attachments as the structure reports them.
+    fn listing_row(email: EmailFull, other_parts: bool) -> serde_json::Value {
+        let mut row = summarize(email, SNIPPET_LEN);
+        row.has_attachments |= other_parts;
+        serde_json::to_value(&row).unwrap()
+    }
+
+    /// Wherever the first bytes are taken, the row is the row of the whole
+    /// message; where they are not, the caller reads the whole message. In
+    /// the common shapes the start is enough: text before the files.
+    #[test]
+    fn a_row_from_the_first_bytes_is_the_row_of_the_whole_message() {
+        for (name, raw) in layouts() {
+            let raw = raw.as_bytes();
+            let (text_parts, other) = structure(raw);
+            let whole = listing_row(parse_email_no_html(7, "INBOX", raw, vec![]), false);
+            let mut taken = 0;
+            for cut in (0..raw.len()).step_by(7).chain([raw.len()]) {
+                let Some(email) = parse_prefix_no_html(7, "INBOX", &raw[..cut], vec![], text_parts)
+                else {
+                    continue;
+                };
+                taken += 1;
+                assert_eq!(listing_row(email, other), whole, "{name}, cut at {cut}");
+            }
+            let most = raw.len() * 85 / 100;
+            let start_will_do =
+                parse_prefix_no_html(7, "INBOX", &raw[..most], vec![], text_parts).is_some();
+            if matches!(name, "phone: text, photo, text" | "photo first") {
+                assert!(!start_will_do, "{name}: text follows the cut");
+            } else {
+                assert!(start_will_do, "{name}: the start holds the row");
+            }
+            assert!(taken > 0, "{name}");
+        }
+    }
+
+    /// Text parts that differ from the server's count, or a header cut short,
+    /// are not taken: a count that misses a part means text the first bytes
+    /// do not hold.
+    #[test]
+    fn a_row_needs_every_text_part_and_the_whole_header() {
+        let (_, raw) = layouts().swap_remove(0);
+        let raw = raw.as_bytes();
+        let (text_parts, _) = structure(raw);
+        let cut = raw.len() / 2;
+        assert!(parse_prefix_no_html(7, "INBOX", &raw[..cut], vec![], text_parts).is_some());
+        assert!(parse_prefix_no_html(7, "INBOX", &raw[..cut], vec![], text_parts + 1).is_none());
+        let header_end = raw.windows(4).position(|w| w == b"\r\n\r\n").unwrap();
+        assert!(parse_prefix_no_html(7, "INBOX", &raw[..header_end], vec![], text_parts).is_none());
     }
 }

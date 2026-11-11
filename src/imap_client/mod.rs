@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use async_imap::Session;
+use async_imap::imap_proto::BodyStructure;
 use async_imap::types::Fetch;
 use futures_util::TryStreamExt;
 use tokio::net::TcpStream;
@@ -32,7 +33,10 @@ pub use util::{
     host_supports_unicode_search, imap_astring, is_retryable_error, iso_to_imap_date, same_folder,
     sanitize_log_str, starts_with_ignore_ascii_case,
 };
-use util::{clean_message_id, is_connection_error, strip_email_prefixes, without_parse_dump};
+use util::{
+    clean_message_id, is_connection_error, is_parse_failure, strip_email_prefixes,
+    without_parse_dump,
+};
 
 /// Retry a read-only IMAP operation once on connection errors. After a connection
 /// error, the client is marked dead; the second call triggers `ensure_connected`
@@ -243,19 +247,31 @@ const _: () = assert!(crate::oauth2::OAUTH2_TIMEOUT.as_secs() < CONNECT_TIMEOUT.
 /// per-folder STATUS loop into a `DoS`.
 const MAX_FOLDER_COUNT: usize = 10_000;
 
-// TRUNCATED-BODY FETCH (deferred): an earlier iteration added
-// `BODY.PEEK[]<0.16384>` here to save 5–10× bandwidth on HTML-heavy
-// inboxes. It works against RFC-compliant servers, but `imap-proto`
-// (our parser, still as of 0.17) requires the literal SP between the
-// `<origin>` marker and the `{size}` literal that RFC 3501 §7.4.2
-// prescribes, and `GreenMail` (still as of 2.1.15) emits them adjacent
-// (`BODY[]<0>{416}`). That tripped the FETCH-response parser end-to-end.
-// Fixing it needs a fork of imap-proto (and by extension async-imap) to
-// accept the missing-SP form leniently. Kept as the existing full-body
-// fetch below until one side changes or we swap to a different IMAP crate.
-// INTERNALDATE feeds the sub-day `since`/`before` cut: IMAP's own
-// SINCE/BEFORE are day-granular, so the exact bound is applied client-side
-// against the arrival timestamp (not the sender-controlled Date header).
+/// How much of a message a listing row is read from. A row needs the
+/// header, the start of the text and whether there are files; the files sit
+/// behind the text in nearly every mail and make up nearly all of its size.
+/// Read whole, a page of 20 rows with a photo or a PDF in each took 86 MB
+/// and four seconds on loopback, and a search over every folder reads such a
+/// page per folder. The start covers the header and the text parts of
+/// ordinary mail, newsletters included; what it cannot settle is read whole
+/// (see `summarize_fetches`).
+const ROW_PREFIX_BYTES: usize = 128 * 1024;
+
+/// The FETCH of listing rows: the first [`ROW_PREFIX_BYTES`] of each
+/// message, its size to tell whether that was all of it, and its
+/// BODYSTRUCTURE, which says what a cut-off message holds beyond them.
+/// INTERNALDATE feeds the sub-day `since`/`before` cut: IMAP's own
+/// SINCE/BEFORE are day-granular, so the exact bound is applied client-side
+/// against the arrival timestamp (not the sender-controlled Date header).
+const ROW_FETCH_ITEMS: &str =
+    "(UID FLAGS INTERNALDATE RFC822.SIZE BODYSTRUCTURE BODY.PEEK[]<0.131072>)";
+
+/// Listing rows from whole messages: for a message the start does not
+/// settle, for a search through the full text (see `BodyTextFilter`) and
+/// for a server whose answer to [`ROW_FETCH_ITEMS`] cannot be read.
+/// `GreenMail` (still 2.1.15) writes `BODY[]<0>{416}` without the space RFC
+/// 3501 puts before the literal, and imap-proto (still 0.17) takes it as an
+/// error. Gmail, Outlook and Dovecot write the space.
 const SUMMARY_FETCH_ITEMS: &str = "(BODY.PEEK[] FLAGS UID INTERNALDATE)";
 /// One message in full: INTERNALDATE stands in for a missing Date header
 /// (see [`dated`]).
@@ -393,11 +409,57 @@ impl PostFetchFilter {
 /// rows. Centralizes the UID-skip + bounded body + parse + post-filter +
 /// summarize pipeline shared by `list_emails`, `list_unread_emails`, and
 /// `search_emails`.
+/// A listing row, or the UID of a message whose start did not settle its
+/// row and has to be read whole.
+enum Row {
+    Ready(Box<EmailSummary>),
+    Whole(u32),
+}
+
+impl Row {
+    fn ready(self) -> Option<EmailSummary> {
+        match self {
+            Self::Ready(summary) => Some(*summary),
+            Self::Whole(_) => None,
+        }
+    }
+
+    const fn whole(&self) -> Option<u32> {
+        match self {
+            Self::Ready(_) => None,
+            Self::Whole(uid) => Some(*uid),
+        }
+    }
+}
+
+/// What a message's BODYSTRUCTURE says as far as a listing row needs it:
+/// how many text parts the message has, and whether it has any other part.
+/// An attached message counts as one other part: its text is not the row's.
+fn structure_counts(structure: &BodyStructure<'_>) -> (usize, bool) {
+    match structure {
+        BodyStructure::Text { .. } => (1, false),
+        BodyStructure::Basic { .. } | BodyStructure::Message { .. } => (0, true),
+        BodyStructure::Multipart { bodies, .. } => bodies
+            .iter()
+            .map(structure_counts)
+            .fold((0, false), |(text, other), (more_text, more_other)| {
+                (text + more_text, other || more_other)
+            }),
+    }
+}
+
+/// The rows of `fetches`, in their order. `partial` says they were read with
+/// [`ROW_FETCH_ITEMS`]: a message cut off there gets its row from the start
+/// only where [`email::parse_prefix_no_html`] finds it certain, its files
+/// counted from the BODYSTRUCTURE, and is otherwise left to be read whole.
 fn summarize_fetches(
     fetches: &[Fetch],
     folder: &str,
     post_filter: &PostFetchFilter,
-) -> Vec<EmailSummary> {
+    partial: bool,
+) -> Vec<Row> {
+    // The full text needs the whole message.
+    debug_assert!(!partial || post_filter.body.is_empty());
     // Decoded once per call, not per row — display sugar for folder names
     // that travel as modified UTF-7 (`Gel&APY-schte Elemente`).
     let folder_display = safe_display_name(folder);
@@ -420,14 +482,39 @@ fn summarize_fetches(
             continue;
         }
         let flags = parse_flags(fetch);
-        let full = dated(email::parse_email_no_html(uid, folder, body, flags), fetch);
+        // Cut off, or possibly: a server may send the start of a longer
+        // message with fewer bytes than asked for, and a message of exactly
+        // the asked length looks the same as a longer one.
+        let cut = partial
+            && (body.len() >= ROW_PREFIX_BYTES
+                || fetch.size.is_some_and(|size| size as usize > body.len()));
+        let (parsed, other_parts) = if cut {
+            let from_start =
+                fetch
+                    .bodystructure()
+                    .map(structure_counts)
+                    .and_then(|(text_parts, other)| {
+                        email::parse_prefix_no_html(uid, folder, body, flags, text_parts)
+                            .map(|email| (email, other))
+                    });
+            let Some(from_start) = from_start else {
+                out.push(Row::Whole(uid));
+                continue;
+            };
+            from_start
+        } else {
+            (email::parse_email_no_html(uid, folder, body, flags), false)
+        };
+        let full = dated(parsed, fetch);
         // Full-text criteria run here, on the complete message, while it
         // still exists — `summarize` drops the body for the snippet right
         // after.
         if !post_filter.body.is_empty() && !post_filter.body.matches(&full) {
             continue;
         }
-        let mut summary = email::summarize(full, 200);
+        let mut summary = email::summarize(full, email::SNIPPET_LEN);
+        // A file beyond the bytes read is one the parse could not see.
+        summary.has_attachments |= other_parts;
         summary.folder_display.clone_from(&folder_display);
         // Echo the arrival time exactly when a sub-day bound cut on it:
         // `date` is the sender's header and may legitimately sit outside
@@ -438,7 +525,7 @@ fn summarize_fetches(
                 .internal_date()
                 .and_then(|d| email::unix_to_utc_iso(d.timestamp()));
         }
-        out.push(summary);
+        out.push(Row::Ready(Box::new(summary)));
     }
     out
 }
@@ -495,6 +582,10 @@ pub struct ImapClient {
     last_error: Option<String>,
     /// How long a command may wait without progress, see [`GuardedStream`].
     stall: Duration,
+    /// Listing rows are read from the start of each message
+    /// ([`ROW_FETCH_ITEMS`]). Off for good once the server's answer to that
+    /// could not be parsed.
+    partial_rows: bool,
 }
 
 /// Read-only snapshot of an `ImapClient`'s health for the `account_health`
@@ -546,6 +637,7 @@ impl ImapClient {
             active_refresh_token,
             last_error: None,
             stall: STALL_TIMEOUT,
+            partial_rows: true,
         }
     }
 
@@ -1257,15 +1349,93 @@ impl ImapClient {
         } else {
             format!("{start}:{end}")
         };
-        let session = self.session()?;
-        let stream = session.fetch(&seq_set, SUMMARY_FETCH_ITEMS).await?;
-        let mut fetches: Vec<Fetch> = stream.try_collect().await?;
+        let (mut fetches, partial) = self.fetch_rows(&seq_set, false, false).await?;
         // Sort descending by sequence number — IMAP's FETCH response order
         // isn't formally guaranteed, and we want newest-first in the output.
         fetches.sort_by_key(|f| std::cmp::Reverse(f.message));
 
-        let summaries = summarize_fetches(&fetches, folder, &PostFetchFilter::EMPTY);
+        let rows = summarize_fetches(&fetches, folder, &PostFetchFilter::EMPTY, partial);
+        let summaries = self
+            .finish_rows(rows, folder, &PostFetchFilter::EMPTY)
+            .await?;
         Ok((summaries, total, total))
+    }
+
+    /// The FETCH of listing rows for the messages `set` names, by UID or
+    /// (`by_uid` false) by sequence number, and whether it read only the
+    /// start of each message ([`ROW_FETCH_ITEMS`]). `whole` asks for whole
+    /// messages, which a search through the full text needs.
+    async fn fetch_rows(
+        &mut self,
+        set: &str,
+        by_uid: bool,
+        whole: bool,
+    ) -> Result<(Vec<Fetch>, bool)> {
+        let partial = self.partial_rows && !whole;
+        let items = if partial {
+            ROW_FETCH_ITEMS
+        } else {
+            SUMMARY_FETCH_ITEMS
+        };
+        let session = self.session()?;
+        let answer = if by_uid {
+            match session.uid_fetch(set, items).await {
+                Ok(stream) => stream.try_collect::<Vec<Fetch>>().await,
+                Err(e) => Err(e),
+            }
+        } else {
+            match session.fetch(set, items).await {
+                Ok(stream) => stream.try_collect::<Vec<Fetch>>().await,
+                Err(e) => Err(e),
+            }
+        };
+        match answer {
+            Ok(fetches) => Ok((fetches, partial)),
+            Err(e) => {
+                // The session goes with the error (`is_connection_error`),
+                // and the read is repeated with whole messages.
+                if partial && is_parse_failure(&e.to_string()) {
+                    self.partial_rows = false;
+                    tracing::warn!(
+                        account = %self.config.name,
+                        "The answer to a FETCH of the start of messages could not be parsed; \
+                         listings read whole messages on this account from now on"
+                    );
+                }
+                Err(e.into())
+            }
+        }
+    }
+
+    /// `rows` as listing rows in their order, the messages whose start did
+    /// not settle their row read whole first. One more FETCH, in the folder
+    /// still selected, for those alone.
+    async fn finish_rows(
+        &mut self,
+        rows: Vec<Row>,
+        folder: &str,
+        post_filter: &PostFetchFilter,
+    ) -> Result<Vec<EmailSummary>> {
+        let again: Vec<u32> = rows.iter().filter_map(Row::whole).collect();
+        if again.is_empty() {
+            return Ok(rows.into_iter().filter_map(Row::ready).collect());
+        }
+        let (fetches, _) = self.fetch_rows(&uid_set_string(&again), true, true).await?;
+        let mut whole: std::collections::HashMap<u32, EmailSummary> =
+            summarize_fetches(&fetches, folder, post_filter, false)
+                .into_iter()
+                .filter_map(Row::ready)
+                .map(|summary| (summary.uid, summary))
+                .collect();
+        // A message gone since the first FETCH has no row, as if it had
+        // been gone before.
+        Ok(rows
+            .into_iter()
+            .filter_map(|row| match row {
+                Row::Ready(summary) => Some(*summary),
+                Row::Whole(uid) => whole.remove(&uid),
+            })
+            .collect())
     }
 
     /// Unread-only list path: needs a UID SEARCH because the server is the
@@ -1296,13 +1466,15 @@ impl ImapClient {
         }
 
         let uid_set = uid_set_string(&paged_uids);
-        let stream = session.uid_fetch(&uid_set, SUMMARY_FETCH_ITEMS).await?;
-        let mut fetches: Vec<Fetch> = stream.try_collect().await?;
+        let (mut fetches, partial) = self.fetch_rows(&uid_set, true, false).await?;
         // The server answers in its own order, ascending on Dovecot and
         // GreenMail: without this the unread listing came oldest first,
         // although the UIDs were picked newest first.
         fetches.sort_by_key(|f| std::cmp::Reverse(f.uid));
-        let summaries = summarize_fetches(&fetches, folder, &PostFetchFilter::EMPTY);
+        let rows = summarize_fetches(&fetches, folder, &PostFetchFilter::EMPTY, partial);
+        let summaries = self
+            .finish_rows(rows, folder, &PostFetchFilter::EMPTY)
+            .await?;
         Ok((summaries, total, matched))
     }
 
@@ -1471,9 +1643,11 @@ impl ImapClient {
         }
 
         let uid_set = uid_set_string(&uids);
-        let stream = session.uid_fetch(&uid_set, SUMMARY_FETCH_ITEMS).await?;
-        let fetches: Vec<Fetch> = stream.try_collect().await?;
-        Ok((summarize_fetches(&fetches, folder, post_filter), matched))
+        let (fetches, partial) = self
+            .fetch_rows(&uid_set, true, !post_filter.body.is_empty())
+            .await?;
+        let rows = summarize_fetches(&fetches, folder, post_filter, partial);
+        Ok((self.finish_rows(rows, folder, post_filter).await?, matched))
     }
 
     /// `strict=true` (recommended): match only via `Message-ID` /
@@ -2866,6 +3040,169 @@ mod tests {
         .expect("no hang")
         .expect("the third SELECT is answered");
         assert!(rows.is_empty() && total == 0);
+    }
+
+    /// The FETCH asks for exactly the start the rows are judged by.
+    #[test]
+    fn the_row_fetch_reads_the_start_it_judges_by() {
+        assert!(
+            ROW_FETCH_ITEMS.contains(&format!("BODY.PEEK[]<0.{ROW_PREFIX_BYTES}>")),
+            "{ROW_FETCH_ITEMS}"
+        );
+    }
+
+    /// The BODYSTRUCTURE of an invoice with a forwarded message, as servers
+    /// write it: two text parts, and a PDF and a message as other parts. The
+    /// text of the forwarded message is not the row's.
+    #[test]
+    fn the_structure_counts_text_parts_and_tells_of_others() {
+        let line = b"* 1 FETCH (BODYSTRUCTURE ((\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \
+            \"7BIT\" 19 1 NIL NIL NIL NIL)(\"text\" \"html\" (\"charset\" \"utf-8\") NIL NIL \"7bit\" \
+            40 1 NIL NIL NIL NIL)(\"MESSAGE\" \"RFC822\" NIL NIL NIL \"7BIT\" 300 (\"Tue, 10 Nov 2026 \
+            09:00:00 +0100\" \"Original\" ((\"Ben\" NIL \"ben\" \"example.de\")) ((\"Ben\" NIL \"ben\" \
+            \"example.de\")) ((\"Ben\" NIL \"ben\" \"example.de\")) NIL NIL NIL NIL \"<o@example.de>\") \
+            (\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"7BIT\" 30 1 NIL NIL NIL NIL) 12 NIL NIL \
+            NIL NIL)(\"APPLICATION\" \"PDF\" (\"NAME\" \"r.pdf\") NIL NIL \"BASE64\" 4000 NIL \
+            (\"ATTACHMENT\" (\"FILENAME\" \"r.pdf\")) NIL NIL) \"MIXED\" (\"BOUNDARY\" \"b1\") NIL NIL \
+            NIL))\r\n";
+        let (_, response) = async_imap::imap_proto::Response::parse(line).expect("parses");
+        let async_imap::imap_proto::Response::Fetch(_, attrs) = response else {
+            panic!("a FETCH response");
+        };
+        let structure = attrs
+            .iter()
+            .find_map(|a| match a {
+                async_imap::imap_proto::AttributeValue::BodyStructure(s) => Some(s),
+                _ => None,
+            })
+            .expect("a BODYSTRUCTURE");
+        assert_eq!(structure_counts(structure), (2, true));
+    }
+
+    /// An invoice (text, then a PDF) and a phone's mail (text, photo, text),
+    /// each about 270 KB.
+    fn invoice_and_phone() -> (String, String) {
+        use base64::Engine as _;
+        let file = |n: usize| {
+            let data: Vec<u8> = (0..n).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            base64::engine::general_purpose::STANDARD
+                .encode(data)
+                .as_bytes()
+                .chunks(76)
+                .map(|line| std::str::from_utf8(line).unwrap())
+                .collect::<Vec<_>>()
+                .join("\r\n")
+        };
+        let head = |subject: &str| {
+            format!(
+                "From: Stadtwerke <r@stadtwerke.example>\r\nTo: c@example.de\r\nSubject: {subject}\r\n\
+                 Date: Tue, 10 Nov 2026 09:00:00 +0100\r\nMessage-ID: <{subject}@x>\r\n\
+                 Content-Type: multipart/mixed; boundary=\"b1\"\r\n\r\n"
+            )
+        };
+        let text =
+            |t: &str| format!("--b1\r\nContent-Type: text/plain; charset=utf-8\r\n\r\n{t}\r\n");
+        let invoice = format!(
+            "{}{}--b1\r\nContent-Type: application/pdf; name=\"r.pdf\"\r\nContent-Disposition: \
+             attachment; filename=\"r.pdf\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n--b1--\r\n",
+            head("Rechnung"),
+            text("Anbei die Rechnung."),
+            file(200_000)
+        );
+        let phone = format!(
+            "{}{}--b1\r\nContent-Type: image/jpeg; name=\"a.jpg\"\r\nContent-Disposition: inline; \
+             filename=\"a.jpg\"\r\nContent-Transfer-Encoding: base64\r\n\r\n{}\r\n{}--b1--\r\n",
+            head("Foto"),
+            text("Hier das Foto"),
+            file(200_000),
+            text("Und noch eins")
+        );
+        (invoice, phone)
+    }
+
+    /// A server that answers the FETCH of the start of messages as RFC 3501
+    /// says, with a page of two: an invoice whose row the start settles, and
+    /// a phone's mail with text after its photo, read again whole. Both rows
+    /// are the rows of the whole messages, in their order.
+    #[tokio::test]
+    async fn rows_come_from_the_start_and_whole_where_the_start_does_not_settle_them() {
+        let (invoice, phone) = invoice_and_phone();
+        let text_part =
+            "(\"TEXT\" \"PLAIN\" (\"CHARSET\" \"utf-8\") NIL NIL \"7BIT\" 13 1 NIL NIL NIL NIL)";
+        let file_part =
+            |ty: &str| format!("({ty} (\"NAME\" \"x\") NIL NIL \"BASE64\" 266668 NIL NIL NIL NIL)");
+        let rows = |seq: u32, uid: u32, raw: &str, structure: &str| {
+            let start = &raw[..ROW_PREFIX_BYTES];
+            format!(
+                "* {seq} FETCH (UID {uid} FLAGS () INTERNALDATE \"10-Nov-2026 09:00:00 +0100\" \
+                 RFC822.SIZE {} BODYSTRUCTURE ({structure} \"MIXED\" (\"BOUNDARY\" \"b1\") NIL NIL \
+                 NIL) BODY[]<0> {{{}}}\r\n{start})\r\n",
+                raw.len(),
+                start.len()
+            )
+        };
+        let page = format!(
+            "{}{}",
+            rows(
+                1,
+                10,
+                &phone,
+                &format!("{text_part}{}{text_part}", file_part("\"IMAGE\" \"JPEG\""))
+            ),
+            rows(
+                2,
+                20,
+                &invoice,
+                &format!("{text_part}{}", file_part("\"APPLICATION\" \"PDF\""))
+            )
+        );
+        let whole = format!(
+            "* 1 FETCH (UID 10 FLAGS () INTERNALDATE \"10-Nov-2026 09:00:00 +0100\" BODY[] {{{}}}\r\n{phone})\r\n",
+            phone.len()
+        );
+        let read_whole = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = Arc::clone(&read_whole);
+        let addr = fake_server(Arc::new(move |tag, word, _| match word {
+            "SELECT" => Some(format!(
+                "* 2 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+            )),
+            "FETCH" => Some(format!("{page}{tag} OK FETCH completed\r\n")),
+            "UID" => {
+                seen.lock().unwrap().push(tag.to_string());
+                Some(format!("{whole}{tag} OK FETCH completed\r\n"))
+            }
+            _ => Some(format!("{tag} OK done\r\n")),
+        }))
+        .await;
+        let mut client = fake_client(addr).await;
+        let (got, total, _) = client
+            .list_emails("INBOX", 2, 0, false)
+            .await
+            .expect("a page of two");
+        assert_eq!(total, 2);
+        assert_eq!(
+            read_whole.lock().unwrap().len(),
+            1,
+            "the phone's mail alone, read whole"
+        );
+        let expected: Vec<serde_json::Value> = [(20, &invoice), (10, &phone)]
+            .into_iter()
+            .map(|(uid, raw)| {
+                let row = email::summarize(
+                    email::parse_email_no_html(uid, "INBOX", raw.as_bytes(), vec![]),
+                    email::SNIPPET_LEN,
+                );
+                serde_json::to_value(&row).unwrap()
+            })
+            .collect();
+        let got: Vec<serde_json::Value> = got
+            .iter()
+            .map(|row| serde_json::to_value(row).unwrap())
+            .collect();
+        assert_eq!(got, expected);
+        assert_eq!(got[0]["snippet"], "Anbei die Rechnung.");
+        assert_eq!(got[1]["snippet"], "Hier das Foto Und noch eins");
+        assert!(got.iter().all(|row| row["has_attachments"] == true));
     }
 
     /// An answer the parser cannot read stays in async-imap's buffer, where
