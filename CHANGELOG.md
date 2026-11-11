@@ -96,7 +96,7 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   the client-side `from` match was never tried by name, and
   `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
 
-367 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
+368 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
 end-to-end script.
 
 ## 3.1.1
