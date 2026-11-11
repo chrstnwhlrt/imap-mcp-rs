@@ -132,7 +132,7 @@ Drafts are rendered as **Outlook Web–style HTML** with proper structure: `<htm
 - **`message_id_domain`** — Domain used in generated `Message-ID` headers (`<random@domain>`). Optional: defaults to the domain of the sender address
 - **`locale = "en"` / `"de"`** — Controls reply prefix (`Re:` / `AW:`), forward prefix (`Fwd:` / `WG:`), quote labels (`From/Sent/To/Subject` / `Von/Gesendet/An/Betreff`), date format, and body font (Aptos for EN, Tahoma for DE)
 
-**Attachments** — all draft tools accept an optional `attachments` parameter (array of local file paths). Attachment paths must be within `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs` on systemd Linux, otherwise `$XDG_CACHE_HOME/imap-mcp-rs`, with a per-user `/tmp/imap-mcp-rs-$USER` fallback — `download_attachment` saves here). Paths outside the whitelist are rejected, and symlink/`..` escapes are blocked via `canonicalize`. Per-file cap: 50 MiB, aggregate cap per draft: 100 MiB. See [Security](#security) for the threat model.
+**Attachments** — all draft tools accept an optional `attachments` parameter (array of local file paths). Attachment paths must be within `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs` on systemd Linux, otherwise `$XDG_CACHE_HOME/imap-mcp-rs`, with a per-user `/tmp/imap-mcp-rs-$USER` fallback — `download_attachment` saves here). Paths outside the whitelist are rejected, and symlink/`..` escapes are blocked via `canonicalize`. Per-file cap: 50 MiB, aggregate cap per draft: 100 MiB, counting what a forward or reply takes from the original. See [Security](#security) for the threat model.
 
 **Inline images** — an attachment entry can also be an object, which places the file *inside* the body instead of appending it:
 
@@ -747,7 +747,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 366 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 367 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code

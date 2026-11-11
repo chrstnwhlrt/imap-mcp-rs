@@ -334,6 +334,19 @@ async fn fetch_original_with_raw(
     }
 }
 
+/// The original of a reply or forward with what the draft takes of it (see
+/// [`original_attachments`]); the raw message goes once that is read.
+async fn original_with_parts(
+    client_arc: &Arc<Mutex<ImapClient>>,
+    folder: &str,
+    uid: u32,
+    files: bool,
+) -> Result<(EmailFull, AttachmentData, Vec<InlineImage>), String> {
+    let (original, raw) = fetch_original_with_raw(client_arc, folder, uid).await?;
+    let (carried, images) = original_attachments(&raw, original.body_html.as_deref(), files);
+    Ok((original, carried, images))
+}
+
 /// The attachments of a message being forwarded or replied to, as a mail
 /// client carries them along: every part `get_email` lists (see
 /// [`crate::email::attachment_parts`]), decoded, under the name and type it
@@ -387,6 +400,41 @@ fn original_attachments(
 fn carry_along(passed: &mut AttachmentData, carried: AttachmentData) {
     passed.retain(|(_, _, bytes)| !carried.iter().any(|(_, _, carried)| carried == bytes));
     passed.splice(0..0, carried);
+}
+
+/// What all attachments of one draft may come to together: the files a
+/// call passes, and in a forward or reply what it carries of the original.
+const MAX_TOTAL_ATTACHMENTS_SIZE: usize = 100 * 1024 * 1024;
+
+/// The aggregate cap over everything a draft carries, checked once the
+/// original's parts are in: a forward of a large mail plus the files passed
+/// along went past the documented cap unchecked.
+fn check_total(prepared: &PreparedAttachments, cap: usize) -> Result<(), String> {
+    let total = prepared
+        .regular
+        .iter()
+        .map(|(_, _, bytes)| bytes.len())
+        .chain(prepared.inline.iter().map(|image| image.bytes.len()))
+        .fold(0usize, usize::saturating_add);
+    if total > cap {
+        return Err(format!(
+            "Total attachment size exceeds the {cap}-byte aggregate cap, the original's \
+             attachments included"
+        ));
+    }
+    Ok(())
+}
+
+/// Add what a draft takes from its original (see `original_attachments`) to
+/// what the call passed, and check the aggregate cap over all of it.
+fn take_from_original(
+    prepared: &mut PreparedAttachments,
+    files: AttachmentData,
+    images: Vec<InlineImage>,
+) -> Result<(), String> {
+    carry_along(&mut prepared.regular, files);
+    prepared.inline.extend(images);
+    check_total(prepared, MAX_TOTAL_ATTACHMENTS_SIZE)
 }
 
 /// The `saved` of every draft response.
@@ -610,12 +658,11 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Tool
     };
     let acct = DraftAccount::from_config(account_config);
 
-    let (original, raw) = fetch_original_with_raw(&client_arc, &req.folder, req.uid).await?;
     // A reply carries no attachments, but the images its quote shows (a
     // signature's logo) stay, as in every mail client: without them the
     // quote showed broken pictures.
-    let (_, quoted_images) = original_attachments(&raw, original.body_html.as_deref(), false);
-    drop(raw);
+    let (original, _, quoted_images) =
+        original_with_parts(&client_arc, &req.folder, req.uid, false).await?;
 
     let reply_all = req.reply_all.unwrap_or(false);
     let (to_list, cc_list) =
@@ -645,7 +692,9 @@ pub async fn draft_reply(server: &ImapMcpServer, req: DraftReplyRequest) -> Tool
         Ok(v) => v,
         Err(e) => return Err(error_json(&e)),
     };
-    prepared.inline.extend(quoted_images);
+    if let Err(e) = take_from_original(&mut prepared, Vec::new(), quoted_images) {
+        return Err(error_json(&e));
+    }
 
     // Scoped so the borrows of `prepared` end before it is moved into the
     // MIME assembly below.
@@ -748,12 +797,10 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
     };
     let acct = DraftAccount::from_config(account_config);
 
-    let (original, raw) = fetch_original_with_raw(&client_arc, &req.folder, req.uid).await?;
-    // A forward carries the original's attachments, as every mail client
-    // does: forwarding an invoice without the invoice helped nobody, and the
-    // draft quoted the text alone. Ahead of the files the call adds.
-    let (carried, carried_inline) = original_attachments(&raw, original.body_html.as_deref(), true);
-    drop(raw);
+    // The original's attachments come along, as in every mail client: an
+    // invoice forwarded without the invoice helped nobody.
+    let (original, carried, carried_inline) =
+        original_with_parts(&client_arc, &req.folder, req.uid, true).await?;
 
     let subject_raw = if has_forward_prefix(&original.subject) {
         original.subject.clone()
@@ -775,8 +822,9 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
         Ok(v) => v,
         Err(e) => return Err(error_json(&e)),
     };
-    carry_along(&mut prepared.regular, carried);
-    prepared.inline.extend(carried_inline);
+    if let Err(e) = take_from_original(&mut prepared, carried, carried_inline) {
+        return Err(error_json(&e));
+    }
 
     let (plain_body, html_body) = {
         let refs = inline_refs(&prepared.inline);
@@ -1306,7 +1354,6 @@ async fn read_attachments(
     // one-byte files, each costing canonicalize/stat/read syscalls, a MIME
     // part, and an entry in every per-ref lookup.
     const MAX_ATTACHMENT_SIZE: usize = 50 * 1024 * 1024;
-    const MAX_TOTAL_ATTACHMENTS_SIZE: usize = 100 * 1024 * 1024;
     const MAX_ATTACHMENT_COUNT: usize = 100;
 
     let Some(specs) = attachments else {
@@ -1907,6 +1954,23 @@ mod tests {
         carry_along(&mut passed, vec![file("Rechnung.pdf", b"%PDF-1")]);
         let names: Vec<&str> = passed.iter().map(|(_, name, _)| name.as_str()).collect();
         assert_eq!(names, ["Rechnung.pdf", "Notiz.pdf"]);
+    }
+
+    /// The aggregate cap counts everything a draft carries, the original's
+    /// parts included.
+    #[test]
+    fn the_aggregate_cap_counts_what_the_original_brings() {
+        let prepared = PreparedAttachments {
+            regular: vec![(
+                "application/pdf".to_string(),
+                "a.pdf".to_string(),
+                vec![0; 6],
+            )],
+            inline: vec![img("logo")],
+        };
+        assert!(check_total(&prepared, 9).is_ok());
+        let err = check_total(&prepared, 8).unwrap_err();
+        assert!(err.contains("aggregate cap"), "{err}");
     }
 
     /// The logo in an Outlook signature sits inline under a Content-ID that

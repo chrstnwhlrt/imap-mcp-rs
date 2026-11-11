@@ -43,7 +43,8 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   Content-ID (the logo in an Outlook signature) stays inline under that
   id, so the quote shows it. A file passed along that has the same content
   as a carried attachment (the invoice, downloaded to forward it) is not
-  attached a second time. The original is fetched once for all of it.
+  attached a second time. The 100 MiB cap per draft counts what comes from
+  the original as well. The original is fetched once for all of it.
 - **The quote of a reply showed broken images.** It quoted the original's
   HTML with its `cid:` references but without the images behind them. A
   reply now keeps the images its quote shows, as mail clients do, and
@@ -95,7 +96,7 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   the client-side `from` match was never tried by name, and
   `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
 
-366 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
+367 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
 end-to-end script.
 
 ## 3.1.1
