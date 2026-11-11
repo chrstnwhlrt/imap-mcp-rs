@@ -434,7 +434,38 @@ FRESH_NUR_LESEN = [
                      answer_lacks(CLAIMS_DONE, "claims it was done"))),
 ]
 
-for case in CASES + HELD + FRESH + EXTRA + NUR_LESEN + FRESH_NUR_LESEN:
+# K-M1 and K-M3 of the review of 3.2.0, measured old against new (2026-11-11). K-M1 with run/config.toml: a list of
+# conversations paged on. The first five conversations of the INBOX take six emails; paging on by five brought back
+# the older email of Jonas's conversation as one of its own and lost LinkedIn. K-M3 with run/config-km3.toml
+# (allow_move = false, the trash outside allowed_folders): delete where the account has no trash and may not move,
+# and move_email is not among the tools.
+# Measured 2026-11-11 with Gemma 4 E4B, 10 runs each, 3.2.2 against the candidate: km3 9/10 against 9/10, the old
+# text once had Gemma offer a move the account may not make, the new one never (kept in 3.2.3). km1 with "Mail-":
+# 0/10 against 0/10; the candidate's "hint": "Older conversations: call again with offset 6." reached Gemma 4
+# times and was never followed. Claude (Sonnet 5.5, both questions in one claude -p session over stream-json, 5 runs
+# each): old 0/5, every run paging with offset 5 and naming Jonas's older email as the start of conversation 3;
+# candidate 3/5, the hint followed in 3 of 5 runs. Below the bar of 4 of 5: dropped, K-M1 stays as it is.
+KM = [
+    dict(group="km1", context=["Was sind meine letzten fünf Unterhaltungen?"], q="Und die älteren?",
+         check=ok_if(no_changes(), answer_has(r"(LinkedIn|Kontaktanfrage)", "not LinkedIn, the oldest"),
+                     answer_lacks(r"(DHL|Mama|Mittagessen|Jonas|Projektbesprechung|Postfach-Service|fast voll|"
+                                  r"Stadtwerke)", "a conversation of the first page again"))),
+    # The same with "Mail-": asked about "Unterhaltungen" alone, Gemma took them for its own chat history in 14 of
+    # 20 runs and called no mail tool.
+    dict(group="km1", context=["Was sind meine letzten fünf Mail-Unterhaltungen?"], q="Und die älteren?",
+         check=ok_if(no_changes(), answer_has(r"(LinkedIn|Kontaktanfrage)", "not LinkedIn, the oldest"),
+                     answer_lacks(r"(DHL|Mama|Mittagessen|Jonas|Projektbesprechung|Postfach-Service|fast voll|"
+                                  r"Stadtwerke)", "a conversation of the first page again"))),
+    dict(group="km3", q="Lösch die Mail von LinkedIn.",
+         check=ok_if(lambda calls, context, answer, state: "move_email called" if any(
+                         c["name"] == "move_email" for c in calls) else None,
+                     no_changes(),
+                     answer_has(r"(endgültig|unwiderruflich|dauerhaft|für immer|permanent|nichts gelöscht|"
+                                r"nicht gelöscht|kein(en)? Papierkorb)",
+                                "neither asks about deleting for good nor says nothing was deleted"))),
+]
+
+for case in CASES + HELD + FRESH + EXTRA + NUR_LESEN + FRESH_NUR_LESEN + KM:
     case.setdefault("context", [])
     case.setdefault("says", None)
     case["key"] = " / ".join(case["context"] + [case["q"]])

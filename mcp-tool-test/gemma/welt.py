@@ -598,9 +598,17 @@ def cmd_config(_args):
     # serves the reading tools alone.
     write_private(RUN / "config-nur-lesen.toml",
                   head + account("Privat", ME, "true") + account("Arbeit", ME_WORK, "true"))
+    # For K-M3 (cases.KM): an account that may delete but not move, and has
+    # no trash folder as far as the server can see. The trash stays in the
+    # world, allowed_folders only hides it.
+    no_trash = account("Privat", ME, "false").replace("allow_move = true", "allow_move = false").replace(
+        "allow_delete = true\n",
+        f"allow_delete = true\nallowed_folders = {json.dumps([INBOX, DRAFTS, SENT, BILLS], ensure_ascii=False)}\n")
+    write_private(RUN / "config-km3.toml", head + no_trash)
     print(f"{RUN / 'config.toml'} (Konto Privat)\n"
           f"{RUN / 'config-zwei-konten.toml'} (Privat, dazu Arbeit read_only)\n"
-          f"{RUN / 'config-nur-lesen.toml'} (Privat und Arbeit, beide read_only)")
+          f"{RUN / 'config-nur-lesen.toml'} (Privat und Arbeit, beide read_only)\n"
+          f"{RUN / 'config-km3.toml'} (Privat ohne Verschieben, Papierkorb ausgeblendet)")
 
 
 def main():
