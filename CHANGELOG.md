@@ -37,6 +37,14 @@ the MCP tool surface and the config format are the public API.
   accounts connect in the background; a call on an account waits for its
   connect, as it waited for the start before.
 
+- jiff 0.2.43 (with jiff-core 0.1.5 and jiff-static 0.2.43) and the
+  rust-overlay input of the flake; the toolchain stays Rust 1.99.1. The other
+  dependencies are at their newest versions. A few older major versions
+  remain in the tree because the newest releases of the crates using them
+  still ask for them: async-imap 0.12.0 brings thiserror 1, pin-utils and,
+  through stop-token, async-channel 1; tracing, pin-project and jiff still
+  build their macros with syn 2.
+
 - **The installed binary is a fifth smaller**, 13.8 MB instead of 17.3 MB:
   the Nix package now strips the symbol table as well as the debug info.
   Symbols only name the frames of a backtrace, which a panic prints under
