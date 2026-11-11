@@ -55,6 +55,11 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   match looked only at the recipients' addresses, while a term like
   "Müller" sits in the name. It now checks names and addresses, as the
   parameter says and as `from` always did.
+- **`list_folders` and a search across all folders went by a stale
+  folder list.** The names were cached per session, so a folder created
+  in another client since was missing until the next reconnect, and one
+  deleted there was still listed. Both now list afresh; resolving a single
+  folder name keeps the cache and renews it on a miss, as before.
 - **An empty `IMAP_MCP_CONFIG` stopped the server with "Failed to read
   config file: " and no path,** and a path in it that is not UTF-8 was
   skipped, so the server started on the default config instead. An empty
@@ -68,7 +73,7 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   the client-side `from` match was never tried by name, and
   `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
 
-362 unit tests, 23 GreenMail integration tests and 74 checks in the MCP
+362 unit tests, 23 GreenMail integration tests and 75 checks in the MCP
 end-to-end script.
 
 ## 3.1.1

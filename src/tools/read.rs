@@ -1513,7 +1513,7 @@ impl Search<'_> {
             // Every folder, INBOX first so its copy of a Gmail message
             // shown under several labels wins the dedup below (better than
             // an `[Gmail]/All Mail` or label-folder UID).
-            None => match client.get_folder_names().await {
+            None => match client.current_folder_names().await {
                 Ok(mut names) => {
                     names.sort_by_key(|f| i32::from(!f.eq_ignore_ascii_case("INBOX")));
                     names

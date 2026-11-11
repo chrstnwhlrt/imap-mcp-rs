@@ -948,6 +948,11 @@ impl ImapClient {
     }
 
     async fn list_folders_once(&mut self) -> Result<Vec<FolderInfo>> {
+        // Listed afresh, not from the cache: the call that shows the folders
+        // missed one created in another client since and kept one deleted
+        // there, until the next reconnect. Next to a STATUS per folder the
+        // LIST costs nothing.
+        self.cached_folder_names = None;
         let names = self.get_folder_names_once().await?;
 
         // Cap — a malicious or misconfigured server could return millions
@@ -1003,6 +1008,14 @@ impl ImapClient {
     /// Get folder names with caching (IMAP LIST is called once per session).
     pub async fn get_folder_names(&mut self) -> Result<Vec<String>> {
         retry_read!(self.get_folder_names_once())
+    }
+
+    /// The folder names as the server lists them now, for a call that goes
+    /// through every folder (a search across all of them): from the cache it
+    /// skipped a folder created in another client since.
+    pub async fn current_folder_names(&mut self) -> Result<Vec<String>> {
+        self.cached_folder_names = None;
+        self.get_folder_names().await
     }
 
     async fn get_folder_names_once(&mut self) -> Result<Vec<String>> {

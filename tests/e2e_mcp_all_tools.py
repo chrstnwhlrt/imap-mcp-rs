@@ -25,9 +25,11 @@ Exits 0 when every check passes, 1 otherwise. The run mutates the mailbox
 (moves, deletes, drafts) — always give it a fresh container.
 """
 import atexit
+import imaplib
 import json
 import os
 import shutil
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -217,6 +219,21 @@ ok(
     str(folders["folders"]),
 )
 drafts_folder = roles.get("drafts", "Drafts")
+# A folder another client creates shows up at the next listing, not only
+# after a reconnect (the folder names are cached per session).
+_ctx = ssl.create_default_context()
+_ctx.check_hostname = False
+_ctx.verify_mode = ssl.CERT_NONE
+_other = imaplib.IMAP4_SSL("127.0.0.1", 3993, ssl_context=_ctx)
+_other.login("test", "password")
+_other.create("Steuer")
+_other.logout()
+again = call("list_folders")
+ok(
+    "list_folders: a folder created meanwhile in another client is listed",
+    any(f["name"] == "Steuer" for f in again["folders"]),
+    str([f["name"] for f in again["folders"]]),
+)
 
 # --- 3 list_emails ---
 inbox = call("list_emails", {"folder": "INBOX", "limit": 50})

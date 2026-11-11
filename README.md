@@ -310,7 +310,7 @@ A name that fits nothing goes to the server unchanged, and its refusal comes bac
 The server maintains one persistent IMAP connection per account with several resilience features:
 
 - **SELECT caching** — avoids redundant IMAP SELECT commands when operating on the same folder. Listings (`list_emails`, `list_drafts`) select afresh every time, because the message count they page by would otherwise miss mail that arrived since the last SELECT
-- **Folder name caching** — IMAP LIST is called once per session per account, and again when a name is not in the cached list (a folder created in another client meanwhile)
+- **Folder name caching** — IMAP LIST is called once per session per account, and again when a name is not in the cached list (a folder created in another client meanwhile). `list_folders` and a search across all folders always list afresh, so they show what the server has now
 - **TCP keepalive** — first probe after 30 seconds of silence, then every 10 seconds; three unanswered probes drop the connection, so a dead one is noticed within about 60 seconds (Linux and macOS)
 - **Auto-reconnect** — if a connection drops, the next tool call automatically reconnects. Failed accounts at startup reconnect on first use
 - **Server-closed sessions** count as dead connections. A session the server has ended (an idle timeout, an admin's kick) makes the next command fail instead of "succeed" with an empty answer, which is how async-imap reads a closed connection. Reads then reconnect and repeat; before a write a NOOP checks the session and reconnects when needed
@@ -794,7 +794,7 @@ One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 to
 ```bash
 ./test-server.sh                     # fresh container (run right before — the sub-day search asserts a 1-hour window)
 cargo build --release                # or nix build, then pass result/bin/imap-mcp-rs
-python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 74 checks across all 19 tools
+python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 75 checks across all 19 tools
 podman rm -f imap-test
 ```
 
@@ -841,7 +841,7 @@ src/
 tests/
 ├── integration_greenmail.rs  End-to-end tests against GreenMail container (23 tests, `#[ignore]`-gated)
 └── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls, then
-                              two accounts and two read-only accounts (74 checks)
+                              two accounts and two read-only accounts (75 checks)
 mcp-tool-test/gemma/          Measurement kit for small models: mail world, request catalog, runners
                               (see "Measuring with a small model")
 ```
