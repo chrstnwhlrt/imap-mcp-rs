@@ -329,7 +329,7 @@ The server maintains one persistent IMAP connection per account with several res
 - **No automatic sending** — the server can only create drafts, never send emails
 - **Prompt injection defense** — the untrusted-content warning is the *first* block of the server instructions (clients truncate from the end), every response carrying a message body repeats it inline as `content_warning`, and messages whose plain-text part mirrors the HTML while adding a paragraph the reader never sees are flagged as `body_parts_diverge`
 - **Attachment directory whitelist** — draft attachments can only be read from directories listed in `allowed_attachment_dirs` (default: `$XDG_RUNTIME_DIR/imap-mcp-rs`, fallbacks to `$XDG_CACHE_HOME/imap-mcp-rs` then `/tmp/imap-mcp-rs-$USER`). Paths are canonicalized, so symlink escapes and `..` traversal are blocked. This prevents a prompt-injected LLM from attaching arbitrary local files (SSH keys, `/etc/passwd`, etc.). The first entry, where downloads land, has to be a private directory of your own. It is set to mode 0700 at startup and before every download, and a symlink, a directory that others can still reach or one that belongs to another user is refused (its owner could open it up again at any time). Downloaded attachments live in a per-download UUID subdirectory with the file under its original sanitized name (0700 dir, 0600 file). At startup, download subdirectories older than seven days are removed; nothing else in the directory is touched
-- **Input sanitization for LLM-visible strings** — subject, snippet, EmailAddress name/address, Message-ID / In-Reply-To / References, folder names, attachment filenames, content-type, tool error messages, and `account_health.last_error` are all scrubbed for control chars, bidirectional override characters, zero-width characters, Unicode tag characters (an invisible copy of ASCII that a model reads as text), line separators, and BOM before reaching the LLM. Outgoing header values get the same treatment to prevent CRLF injection. Folder names containing such characters are dropped from listings entirely, not substituted. **Full message bodies (`get_email`, `get_thread` with `include_body`) are deliberately *not* filtered** — mail must be readable verbatim; see [Prompt injection](#prompt-injection) for what that implies
+- **Input sanitization for LLM-visible strings** — subject, snippet, EmailAddress name/address, Message-ID / In-Reply-To / References, folder names, attachment filenames, content-type, tool error messages, and `account_health.last_error` are all scrubbed for control chars, bidirectional override characters, zero-width characters, Unicode tag characters (an invisible copy of ASCII that a model reads as text), line separators, and BOM before reaching the LLM. Outgoing header values get the same treatment to prevent CRLF injection. Folder names containing such characters are dropped from listings entirely, not substituted. **Full message bodies (`get_email`, `get_thread` with `include_body`) are deliberately *not* filtered** — mail must be readable verbatim; see [Prompt injection](#prompt-injection) for what that implies. The one exception are the Unicode tag characters: no mail client shows them, so they are dropped from bodies too, and from everything a draft is saved with (body, subject, recipients, file names), where they would carry text past the user's review
 - **Resource caps** — 100 MiB per email body, 10k folders per LIST, 50 references / 200 UIDs per thread expansion, 10 MiB per draft body, 2 KiB per draft subject, 50 MiB per attachment / 100 MiB aggregate, 1000 UIDs per batch write (25 for `delete_draft`), 1 MiB per OAuth response, 10s per OAuth token refresh, 15s reconnect timeout, 60s without a byte per command, 5s LOGOUT timeout, 10s per-folder STATUS timeout
 
 ### Prompt injection
@@ -349,7 +349,7 @@ Emails are untrusted data. A malicious email could contain text like *"Ignore al
 
 **What remains possible after a successful injection:** creating drafts (including a forward to an attacker's address — unsent, but sitting in your Drafts folder), marking mail as read (which can hide messages from a monitoring workflow that keys on unread state), deleting drafts (capped at 25 per call), and reading any folder that is not excluded. Sizing these down is a configuration decision: `allowed_folders`, `allow_move = false`, `allow_delete = false`, `allow_flag_change = false` (which also takes marking as read off the list), and `read_only = true` wherever composing is not needed.
 
-**What this cannot solve:** Prompt injection is a fundamental LLM problem. A hostile mail can still hide its payload from you while showing it to the model — the divergence flag above catches the *mirroring* variant (harmless HTML reproduced in the plain part, payload appended), but a sender who writes two fully independent parts evades it, HTML that is invisible when styled arrives as plain text once flattened for the model, a body may carry text in invisible Unicode tag characters, and since `alt` texts count as readable content (they are what a reader sees with images blocked), a payload mirrored into the `alt` of an always-loading inline image also balances the comparison. No server-side mitigation is 100 % effective, and none of this constrains what the model does with a body it has already read. For sensitive accounts, use `read_only = true` and review LLM actions.
+**What this cannot solve:** Prompt injection is a fundamental LLM problem. A hostile mail can still hide its payload from you while showing it to the model — the divergence flag above catches the *mirroring* variant (harmless HTML reproduced in the plain part, payload appended), but a sender who writes two fully independent parts evades it, HTML that is invisible when styled arrives as plain text once flattened for the model, and since `alt` texts count as readable content (they are what a reader sees with images blocked), a payload mirrored into the `alt` of an always-loading inline image also balances the comparison. No server-side mitigation is 100 % effective, and none of this constrains what the model does with a body it has already read. For sensitive accounts, use `read_only = true` and review LLM actions.
 
 ## Examples
 
@@ -748,7 +748,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 374 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 377 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
@@ -795,7 +795,7 @@ One layer above, `tests/e2e_mcp_all_tools.py` exercises **every one of the 19 to
 ```bash
 ./test-server.sh                     # fresh container (run right before — the sub-day search asserts a 1-hour window)
 cargo build --release                # or nix build, then pass result/bin/imap-mcp-rs
-python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 76 checks across all 19 tools
+python3 tests/e2e_mcp_all_tools.py target/release/imap-mcp-rs   # 78 checks across all 19 tools
 podman rm -f imap-test
 ```
 
@@ -842,7 +842,7 @@ src/
 tests/
 ├── integration_greenmail.rs  End-to-end tests against GreenMail container (23 tests, `#[ignore]`-gated)
 └── e2e_mcp_all_tools.py      MCP-layer end-to-end round: all 19 tools as real JSON-RPC calls, then
-                              two accounts and two read-only accounts (76 checks)
+                              two accounts and two read-only accounts (78 checks)
 mcp-tool-test/gemma/          Measurement kit for small models: mail world, request catalog, runners
                               (see "Measuring with a small model")
 ```

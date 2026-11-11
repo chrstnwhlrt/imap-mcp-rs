@@ -1196,9 +1196,17 @@ fn has_forward_prefix(subject: &str) -> bool {
 /// BOM U+FEFF — these are category `Cf`, not `Cc`, so `char::is_control`
 /// misses them, but some MIME folders / header writers treat them as line
 /// breaks, reopening the CRLF-injection risk through a different channel.
+///
+/// And the tag characters (see [`crate::email::is_tag_char`]): in a subject
+/// or a recipient's name they would carry text the user cannot see when
+/// reviewing the draft.
 pub(super) fn sanitize_header_value(s: &str) -> String {
     s.chars()
-        .filter(|c| !c.is_control() && !matches!(*c, '\u{2028}' | '\u{2029}' | '\u{FEFF}'))
+        .filter(|&c| {
+            !c.is_control()
+                && !matches!(c, '\u{2028}' | '\u{2029}' | '\u{FEFF}')
+                && !crate::email::is_tag_char(c)
+        })
         .collect()
 }
 
@@ -1397,14 +1405,10 @@ async fn read_attachments(
             .file_name()
             .and_then(|n| n.to_str())
             .unwrap_or("attachment");
-        // Defense-in-depth: strip control chars + Unicode line separators
-        // from the filename before it ends up in the outgoing MIME
-        // Content-Disposition header. mail-builder should encode it, but
-        // we don't want to rely on that alone.
-        let filename: String = raw_filename
-            .chars()
-            .filter(|c| !c.is_control() && !matches!(*c, '\u{2028}' | '\u{2029}' | '\u{FEFF}'))
-            .collect();
+        // Defense-in-depth: the header filter on the filename before it ends
+        // up in the outgoing MIME Content-Disposition header. mail-builder
+        // should encode it, but we don't want to rely on that alone.
+        let filename = sanitize_header_value(raw_filename);
         let content_type =
             mime_type_from_extension(path.extension().and_then(|e| e.to_str()).unwrap_or(""));
 
@@ -2051,6 +2055,21 @@ mod tests {
         assert_eq!(sanitize_header_value("a\tb"), "ab"); // tab is control too
         assert_eq!(sanitize_header_value("clean text"), "clean text");
         assert_eq!(sanitize_header_value("ünïcödë"), "ünïcödë");
+    }
+
+    /// Subject and recipients of a draft carry no tag characters, an
+    /// invisible copy of ASCII the user would not see before sending.
+    #[test]
+    fn draft_headers_carry_no_tag_characters() {
+        let hidden: String = "Bcc mallory"
+            .chars()
+            .map(|c| char::from_u32(0xE0000 + u32::from(c)).unwrap())
+            .collect();
+        assert_eq!(sanitize_header_value(&format!("Plan{hidden}")), "Plan");
+        let (name, address) =
+            parse_recipient(&format!("Ben{hidden} <ben@example.com{hidden}>")).unwrap();
+        assert_eq!(name.as_deref(), Some("Ben"));
+        assert_eq!(address, "ben@example.com");
     }
 
     #[test]

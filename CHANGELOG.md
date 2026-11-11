@@ -3,6 +3,26 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.2
+
+### Security
+
+- **The text of a mail and of a draft no longer carries tag characters.**
+  Since 3.2.1 these invisible characters, a copy of ASCII that a model
+  reads as text, were dropped from subjects, names, filenames and the
+  start of the text in a listing row. Now the full text of an email loses
+  them as well, the plain part and the HTML alike, so a mail cannot hand
+  the model instructions the user never sees. A draft loses them in
+  everything it is saved with: its text, the quote of the original, the
+  subject, the recipients and the file names of its attachments. A model
+  steered by a mail could otherwise write text into a draft that the user
+  cannot see when reviewing it before sending. Everything else of a text
+  stays as it was: line breaks, markup and the other formatting
+  characters.
+
+377 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
+end-to-end script.
+
 ## 3.2.1
 
 ### Security
