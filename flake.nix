@@ -50,6 +50,11 @@
           s = perSystem system;
           pkg = s.craneLib.buildPackage (s.commonArgs // {
             inherit (s) cargoArtifacts;
+            # The symbol table as well, not only the debug info: 23% of the
+            # binary, used for nothing but backtraces, which a panic prints
+            # only under RUST_BACKTRACE. The panic message keeps its file
+            # and line either way.
+            stripAllList = [ "bin" ];
             meta = {
               description = "IMAP MCP Server — email tools for LLM assistants";
               mainProgram = "imap-mcp-rs";

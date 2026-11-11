@@ -30,6 +30,11 @@ the MCP tool surface and the config format are the public API.
   folders. MOVE moves all or nothing. Whether the server has it is asked
   once per session; without it the three steps stay as they were.
 
+- **The installed binary is a fifth smaller**, 13.8 MB instead of 17.3 MB:
+  the Nix package now strips the symbol table as well as the debug info.
+  Symbols only name the frames of a backtrace, which a panic prints under
+  `RUST_BACKTRACE` alone; its message keeps file and line.
+
 ### Fixed
 
 - **An answer the parser cannot read no longer blocks the account until a
