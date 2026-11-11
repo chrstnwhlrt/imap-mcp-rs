@@ -1,11 +1,13 @@
 //! MIME parsing into the response types ([`EmailFull`] / [`EmailSummary`])
 //! returned by IMAP read operations.
 //!
-//! Wraps [`mail_parser`] with two performance-shaped variants:
+//! Wraps [`mail_parser`] with three performance-shaped variants:
 //! - [`parse_email`] — full email including HTML body
 //! - [`parse_email_no_html`] — skips `body_html` allocation; used by
 //!   `list_emails` / `search_emails` where only the snippet is needed
 //!   (40–60 KB saved per HTML newsletter).
+//! - [`parse_prefix_no_html`] — the same from the first bytes of a message,
+//!   where they settle a listing row (see there).
 //!
 //! [`summarize`] is the partner that *consumes* an [`EmailFull`] into an
 //! [`EmailSummary`] without cloning, since the full struct is dropped right

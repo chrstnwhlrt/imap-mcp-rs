@@ -363,14 +363,17 @@ pub(super) fn is_parse_failure(msg: &str) -> bool {
 const UNREADABLE_ANSWER: &str = "io: the server's answer could not be parsed";
 
 /// `msg` without the buffer dump of a parse failure (see
-/// [`UNREADABLE_ANSWER`]); other messages unchanged. For logs and
-/// `last_error`, which keep the rest of a message as it is.
+/// [`UNREADABLE_ANSWER`]); other messages unchanged. What a caller put
+/// before the error stays ("Failed to save draft: "): the dump begins with
+/// async-imap's own `io: `, the last one before [`PARSE_FAILURE`] (the
+/// parser's report in between holds byte values and names, the server's
+/// bytes come after it), and runs to the end.
 pub fn without_parse_dump(msg: &str) -> std::borrow::Cow<'_, str> {
-    if msg.contains(PARSE_FAILURE) {
-        std::borrow::Cow::Borrowed(UNREADABLE_ANSWER)
-    } else {
-        std::borrow::Cow::Borrowed(msg)
-    }
+    let Some(marker) = msg.find(PARSE_FAILURE) else {
+        return std::borrow::Cow::Borrowed(msg);
+    };
+    let context = msg[..marker].rfind("io: ").map_or("", |dump| &msg[..dump]);
+    std::borrow::Cow::Owned(format!("{context}{UNREADABLE_ANSWER}"))
 }
 
 /// Reformat a raw async-imap error string into a concise user-facing message.
@@ -389,7 +392,7 @@ pub fn without_parse_dump(msg: &str) -> std::borrow::Cow<'_, str> {
 /// boundary.
 pub fn clean_imap_error(raw: &str) -> String {
     if raw.contains(PARSE_FAILURE) {
-        return UNREADABLE_ANSWER.to_string();
+        return without_parse_dump(raw).into_owned();
     }
     // Neither marker is a substring of the other ("information" does not
     // contain "info: "), so the order of the two does not matter.
@@ -583,6 +586,16 @@ mod tests {
         assert_eq!(clean_imap_error(&dump), UNREADABLE_ANSWER);
         assert_eq!(without_parse_dump(&dump), UNREADABLE_ANSWER);
         assert_eq!(without_parse_dump("broken pipe"), "broken pipe");
+        // What the caller put before it stays.
+        let saving = format!("Failed to save draft: {dump}");
+        assert_eq!(
+            clean_imap_error(&saving),
+            format!("Failed to save draft: {UNREADABLE_ANSWER}")
+        );
+        assert_eq!(
+            without_parse_dump(&saving),
+            format!("Failed to save draft: {UNREADABLE_ANSWER}")
+        );
     }
 
     #[test]
