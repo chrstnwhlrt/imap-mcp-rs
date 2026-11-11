@@ -23,6 +23,15 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   time and read or replace every download. `config.sample.toml` and the
   README promised this check already.
 
+### Security
+
+- **A broken line of the config or the token state reached the log in
+  full.** toml's error rendering quotes the line it stopped at: a typo
+  next to a password printed the password at startup, and a damaged
+  `tokens.toml` logged a refresh token, both to the stderr that MCP
+  clients keep in their logs. The errors now give line, column and
+  message only.
+
 ### Fixed
 
 - **A forward left the original's attachments behind.** `draft_forward`
@@ -78,7 +87,7 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   the client-side `from` match was never tried by name, and
   `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
 
-362 unit tests, 23 GreenMail integration tests and 75 checks in the MCP
+364 unit tests, 23 GreenMail integration tests and 75 checks in the MCP
 end-to-end script.
 
 ## 3.1.1

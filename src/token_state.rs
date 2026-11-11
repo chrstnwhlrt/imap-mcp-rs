@@ -115,9 +115,11 @@ fn load_from(dir: &Path, key: &str) -> Option<StoredToken> {
     match toml::from_str::<StateFile>(&content) {
         Ok(state) => state.tokens.get(key).cloned(),
         Err(e) => {
+            // Never `%e`: toml's rendering quotes the broken line, a refresh
+            // token as likely as not.
             tracing::warn!(
                 path = %path.display(),
-                error = %e,
+                error = %crate::config::toml_error(&e, &content),
                 "Token state file unparseable — ignoring this entry"
             );
             None
@@ -189,7 +191,10 @@ fn store_in(dir: &Path, key: &str, refresh_token: &str) -> Result<()> {
         |_| StateFile::default(),
         |content| {
             toml::from_str(&content).unwrap_or_else(|e| {
-                tracing::warn!(error = %e, "Token state file unparseable — rewriting it");
+                tracing::warn!(
+                    error = %crate::config::toml_error(&e, &content),
+                    "Token state file unparseable — rewriting it"
+                );
                 StateFile::default()
             })
         },
@@ -377,6 +382,21 @@ mod tests {
         // A broken sidecar must not block persisting a fresh token.
         store_in(dir.path(), "k", "rt").unwrap();
         assert_eq!(load_from(dir.path(), "k").unwrap().refresh_token, "rt");
+    }
+
+    /// What the log gets of a broken state file: where it broke, never the
+    /// line, which holds a token.
+    #[test]
+    fn state_file_errors_leave_the_token_out() {
+        let broken = "[tokens.\"u|h|c\"]\nrefresh_token = \"rt-SECRET-123\nupdated_at_unix = 7\n";
+        let e = toml::from_str::<StateFile>(broken).unwrap_err();
+        assert!(
+            e.to_string().contains("rt-SECRET-123"),
+            "toml's own rendering quotes it"
+        );
+        let logged = crate::config::toml_error(&e, broken);
+        assert!(!logged.contains("SECRET"), "{logged}");
+        assert!(logged.starts_with("line 2, column "), "{logged}");
     }
 
     #[test]

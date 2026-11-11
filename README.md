@@ -322,7 +322,7 @@ The server maintains one persistent IMAP connection per account with several res
 
 - **TLS enforced** — all connections use TLS via rustls. `accept_invalid_certs` is available for testing with self-signed certificates but should never be used in production
 - **IMAP injection prevention** — all user input and untrusted data (Message-IDs from emails) are escaped before use in IMAP commands. Control characters are stripped, quotes and backslashes escaped
-- **Credential protection** — passwords, client secrets, and tokens are redacted in debug/log output. The config is expected at `chmod 600` and the server warns at startup if it is readable by others
+- **Credential protection** — passwords, client secrets, and tokens are redacted in debug/log output, and a config or token file that does not parse is reported by line and column, without the line itself. The config is expected at `chmod 600` and the server warns at startup if it is readable by others
 - **Token storage at rest** — refresh tokens live in `$XDG_STATE_HOME/imap-mcp-rs/tokens.toml` (file `0600`, directory `0700`), written under an exclusive lock via write-temp-then-rename so the file is never observed half-written. Directory, lock file and data file are each checked against symlinks before use, and temp files abandoned by a crash are swept on the next write — they would otherwise keep a token on disk indefinitely
 - **Authorization code bound to PKCE** — `reauth` sends an S256 challenge (RFC 7636) and redeems the code with a verifier that never leaves the process. Without it, an app registered as a public client authenticates on the code alone, so any local process that claimed the loopback port first — or observed the redirect — could redeem it for mailbox access
 - **No automatic sending** — the server can only create drafts, never send emails
@@ -747,7 +747,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 362 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 364 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code

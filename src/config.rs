@@ -336,6 +336,7 @@ pub fn load_config(path: Option<&str>) -> Result<ServerConfig> {
     warn_if_not_private(&config_path);
 
     let config: ServerConfig = toml::from_str(&content)
+        .map_err(|e| anyhow::anyhow!(toml_error(&e, &content)))
         .with_context(|| format!("Failed to parse config file: {}", config_path.display()))?;
 
     // Validate
@@ -427,6 +428,20 @@ pub fn load_config(path: Option<&str>) -> Result<ServerConfig> {
     }
 
     Ok(config)
+}
+
+/// A TOML error without the line it quotes. toml's own rendering prints the
+/// offending line, and in the config that may hold a password or a client
+/// secret, in the token state a refresh token: printed at startup or logged,
+/// it reached whatever keeps the server's stderr. Position and message are
+/// enough to find the mistake.
+pub(crate) fn toml_error(e: &toml::de::Error, input: &str) -> String {
+    let Some(before) = e.span().and_then(|span| input.get(..span.start)) else {
+        return e.message().to_string();
+    };
+    let line = before.matches('\n').count() + 1;
+    let column = before.rsplit('\n').next().map_or(0, |l| l.chars().count()) + 1;
+    format!("line {line}, column {column}: {}", e.message())
 }
 
 /// The config file to read: `--config`, else `IMAP_MCP_CONFIG`, else the
@@ -534,6 +549,24 @@ mod tests {
         assert!(help.contains("reauth"));
         // …and no token in the config.
         assert!(help.contains("no token belongs in the config"));
+    }
+
+    /// A broken line must not reach the log with its content: in the config
+    /// it may be the password line.
+    #[test]
+    fn config_errors_name_the_position_not_the_line() {
+        let scratch = Scratch::new();
+        let path = scratch.0.join("config.toml");
+        fs::write(
+            &path,
+            "[[accounts]]\nname = \"A\"\nhost = \"h\"\nusername = \"u@h\"\n\
+             password = \"geheim-123\n",
+        )
+        .unwrap();
+        let err = format!("{:#}", load_config(path.to_str()).unwrap_err());
+        assert!(!err.contains("geheim-123"), "{err}");
+        assert!(err.contains("line 5"), "{err}");
+        assert!(err.contains("Failed to parse config file"), "{err}");
     }
 
     /// `--config` wins, then `IMAP_MCP_CONFIG` when it names a path; an empty
