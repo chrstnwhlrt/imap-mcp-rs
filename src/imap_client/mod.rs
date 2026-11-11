@@ -586,6 +586,9 @@ pub struct ImapClient {
     /// ([`ROW_FETCH_ITEMS`]). Off for good once the server's answer to that
     /// could not be parsed.
     partial_rows: bool,
+    /// Whether the server of this session takes MOVE (RFC 6851); asked at
+    /// the first move of a session.
+    can_move: Option<bool>,
 }
 
 /// Read-only snapshot of an `ImapClient`'s health for the `account_health`
@@ -638,6 +641,7 @@ impl ImapClient {
             last_error: None,
             stall: STALL_TIMEOUT,
             partial_rows: true,
+            can_move: None,
         }
     }
 
@@ -905,6 +909,7 @@ impl ImapClient {
         self.session = Some(session);
         self.selected_folder = None;
         self.cached_folder_names = None;
+        self.can_move = None;
         Ok(())
     }
 
@@ -1943,6 +1948,15 @@ impl ImapClient {
             return Ok(existing);
         }
         let uid_set = uid_set_string(&existing);
+        if self.server_can_move().await? {
+            // One command that moves all or nothing: no state with the
+            // messages in both folders, and two round trips fewer.
+            self.session()?.uid_mv(&uid_set, target).await?;
+            // The move expunged the messages from the folder, which
+            // renumbered it.
+            self.selected_folder = None;
+            return Ok(existing);
+        }
         // COPY first. If it fails the source is unchanged — the caller may
         // safely retry. If it SUCCEEDS, any subsequent failure leaves the
         // messages in BOTH folders; we contextualize those errors so the
@@ -1980,6 +1994,16 @@ impl ImapClient {
         // operation starts from a fresh SELECT.
         self.selected_folder = None;
         Ok(existing)
+    }
+
+    /// Whether the server takes MOVE (RFC 6851), asked once per session.
+    async fn server_can_move(&mut self) -> Result<bool> {
+        if let Some(can) = self.can_move {
+            return Ok(can);
+        }
+        let can = self.session()?.capabilities().await?.has_str("MOVE");
+        self.can_move = Some(can);
+        Ok(can)
     }
 
     /// The subset of `uids` that exists in the currently selected folder

@@ -23,6 +23,13 @@ the MCP tool surface and the config format are the public API.
   GreenMail is one, it writes `BODY[]<0>{416}` without the space RFC 3501
   puts before the literal.
 
+- **Moving and deleting to the trash take one command where the server
+  offers MOVE** (RFC 6851; Gmail, Outlook, Dovecot and GreenMail do).
+  Before, every move was COPY, STORE `\Deleted` and EXPUNGE: two round
+  trips more, and a failure between them left the messages in both
+  folders. MOVE moves all or nothing. Whether the server has it is asked
+  once per session; without it the three steps stay as they were.
+
 ### Fixed
 
 - **An answer the parser cannot read no longer blocks the account until a
