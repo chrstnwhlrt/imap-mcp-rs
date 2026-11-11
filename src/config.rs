@@ -48,7 +48,7 @@ pub fn default_attachment_dir() -> String {
 }
 
 /// Create the attachment directory if needed and make sure it is private: a
-/// real directory (no symlink) at mode 0700.
+/// real directory (no symlink) of this process's own user, at mode 0700.
 ///
 /// `download_attachment` writes into it, `draft_*` reads from it and the
 /// startup prune deletes in it, so whoever controls it could read every
@@ -89,7 +89,7 @@ pub async fn prepare_attachment_dir(dir: &Path) -> Result<()> {
     {
         use std::os::unix::fs::PermissionsExt;
         // Not checked here: on a directory someone else owns this fails,
-        // and the verification below reports the mode that stayed open.
+        // and the checks below refuse it.
         let _ = tokio::fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).await;
     }
 
