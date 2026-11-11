@@ -1260,6 +1260,7 @@ mod tests {
                 address: "me@example.com".to_string(),
             }],
             cc: vec![],
+            reply_to: vec![],
             subject: "Hello".to_string(),
             date: Some("2026-07-30T21:18:00+02:00".to_string()),
             date_original: None,

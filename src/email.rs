@@ -229,6 +229,11 @@ pub struct EmailFull {
     pub from: Option<EmailAddress>,
     pub to: Vec<EmailAddress>,
     pub cc: Vec<EmailAddress>,
+    /// Where the sender asks replies to go (`Reply-To`), empty without the
+    /// header. Read by `draft_reply`; not part of the response, which keeps
+    /// the shape the texts were measured with.
+    #[serde(skip)]
+    pub reply_to: Vec<EmailAddress>,
     pub subject: String,
     pub flags: Vec<String>,
     pub attachments: Vec<AttachmentInfo>,
@@ -286,6 +291,7 @@ fn parse_email_inner(
             from: None,
             to: vec![],
             cc: vec![],
+            reply_to: vec![],
             subject: String::new(),
             date: None,
             date_original: None,
@@ -312,6 +318,11 @@ fn parse_email_inner(
 
     let cc = message
         .cc()
+        .map(|list| EmailAddress::list_from_address(&list))
+        .unwrap_or_default();
+
+    let reply_to = message
+        .reply_to()
         .map(|list| EmailAddress::list_from_address(&list))
         .unwrap_or_default();
 
@@ -382,6 +393,7 @@ fn parse_email_inner(
         from,
         to,
         cc,
+        reply_to,
         subject,
         date,
         date_original,
@@ -1261,6 +1273,21 @@ mod tests {
         assert_eq!(email.message_id.as_deref(), Some("<m3@example.com>"));
         assert_eq!(email.in_reply_to.as_deref(), Some("<m2@example.com>"));
         assert_eq!(email.references, ["<m1@example.com>", "<m2@example.com>"]);
+    }
+
+    /// Reply-To is read for `draft_reply` and stays out of the response,
+    /// whose shape the texts were measured with.
+    #[test]
+    fn parse_email_reads_reply_to_without_showing_it() {
+        let raw =
+            b"From: Shop <noreply@shop.example>\r\nReply-To: Service <service@shop.example>\r\n\
+                    Subject: T\r\n\r\nbody";
+        let email = parse_email(1, "INBOX", raw, vec![]);
+        assert_eq!(email.reply_to.len(), 1);
+        assert_eq!(email.reply_to[0].address, "service@shop.example");
+        assert_eq!(email.reply_to[0].name.as_deref(), Some("Service"));
+        let shown = serde_json::to_value(&email).unwrap();
+        assert!(shown.get("reply_to").is_none(), "{shown}");
     }
 
     #[test]

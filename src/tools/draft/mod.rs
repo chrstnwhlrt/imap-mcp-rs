@@ -965,6 +965,11 @@ pub async fn delete_draft(server: &ImapMcpServer, req: DeleteDraftRequest) -> To
 /// through `sanitize_header_value` to strip `\r\n` header-injection payloads;
 /// `extra_cc` arrives already parsed and validated ([`parse_recipients`]).
 ///
+/// The reply goes where the sender asks replies to go: the `Reply-To`
+/// addresses when the original names any, as every mail client reads it,
+/// otherwise its `From`. Ignoring `Reply-To` sent replies to a `noreply@`
+/// sender instead of the service desk the mail named.
+///
 /// In reply-all, the user's own `from` address is excluded (no self-addressed
 /// drafts) and entries without an address (a bare group name, a display name
 /// with nothing behind it) are skipped rather than written as an empty `<>`.
@@ -977,19 +982,32 @@ fn build_reply_recipients(
     from: &str,
     extra_cc: Vec<Recipient>,
 ) -> Result<(Vec<Recipient>, Vec<Recipient>), &'static str> {
-    let to_recipient = match original.from.as_ref() {
-        Some(a) if !a.address.is_empty() => recipient_from(a),
-        _ => return Err("Cannot reply: original email has no sender address"),
+    let named: Vec<&crate::email::EmailAddress> = original
+        .reply_to
+        .iter()
+        .filter(|a| !a.address.is_empty())
+        .collect();
+    let primary = if named.is_empty() {
+        match original.from.as_ref() {
+            Some(a) if !a.address.is_empty() => vec![a],
+            _ => return Err("Cannot reply: original email has no sender address"),
+        }
+    } else {
+        named
     };
 
     let mut seen = std::collections::HashSet::new();
-    seen.insert(to_recipient.1.to_ascii_lowercase());
+    let mut to_list: Vec<Recipient> = Vec::new();
+    for addr in primary {
+        if seen.insert(addr.address.to_ascii_lowercase()) {
+            to_list.push(recipient_from(addr));
+        }
+    }
     let mut keep = |addr: &crate::email::EmailAddress| {
         !addr.address.is_empty()
             && !addr.address.eq_ignore_ascii_case(from)
             && seen.insert(addr.address.to_ascii_lowercase())
     };
-    let mut to_list = vec![to_recipient];
     let mut cc_list: Vec<Recipient> = Vec::new();
     if reply_all {
         to_list.extend(original.to.iter().filter(|a| keep(a)).map(recipient_from));
@@ -1058,8 +1076,15 @@ fn apply_threading_headers<'a>(
     let unwrap = |s: &str| s.trim_matches(|c| c == '<' || c == '>').to_string();
     let clean_msg_id = sanitize_header_value(&unwrap(msg_id));
     builder = builder.in_reply_to(clean_msg_id.clone());
-    let refs: Vec<String> = original
-        .references
+    // RFC 5322 3.6.4: the parent's References, or where it has none, its
+    // In-Reply-To, then its own Message-ID. Without the fallback a reply to a
+    // reply that carried only In-Reply-To lost the thread's start.
+    let ancestors: &[String] = if original.references.is_empty() {
+        original.in_reply_to.as_slice()
+    } else {
+        &original.references
+    };
+    let refs: Vec<String> = ancestors
         .iter()
         .map(|s| sanitize_header_value(&unwrap(s)))
         .map(|s| format!("<{s}>"))
@@ -1799,6 +1824,7 @@ mod tests {
             from: from.map(addr),
             to: to.into_iter().map(addr).collect(),
             cc: cc.into_iter().map(addr).collect(),
+            reply_to: vec![],
             subject: subject.to_string(),
             date: None,
             date_original: None,
@@ -1909,6 +1935,52 @@ mod tests {
         let (to, cc) = build_reply_recipients(&original, false, "me@example.com", vec![]).unwrap();
         assert_eq!(addresses_only(&to), vec!["alice@example.com"]);
         assert_eq!(cc, vec![]);
+    }
+
+    /// A reply goes where the sender asks replies to go: the Reply-To
+    /// addresses, not a noreply From. Reply-all adds the other recipients,
+    /// the user left out and nobody twice.
+    #[test]
+    fn build_reply_recipients_follows_reply_to() {
+        let mut original = email(
+            "Test",
+            Some("noreply@shop.example"),
+            vec!["me@example.com"],
+            vec!["bob@example.com"],
+        );
+        original.reply_to = vec![addr("service@shop.example"), addr("SERVICE@shop.example")];
+        let (to, cc) = build_reply_recipients(&original, false, "me@example.com", vec![]).unwrap();
+        assert_eq!(addresses_only(&to), vec!["service@shop.example"]);
+        assert_eq!(cc, vec![]);
+        let (to, cc) = build_reply_recipients(&original, true, "me@example.com", vec![]).unwrap();
+        assert_eq!(addresses_only(&to), vec!["service@shop.example"]);
+        assert_eq!(addresses_only(&cc), vec!["bob@example.com"]);
+        // A Reply-To is enough to answer a mail without a From.
+        original.from = None;
+        assert!(build_reply_recipients(&original, false, "me@example.com", vec![]).is_ok());
+    }
+
+    /// RFC 5322 3.6.4: a parent without References hands on its In-Reply-To,
+    /// so the reply keeps the start of the thread.
+    #[test]
+    fn references_fall_back_to_in_reply_to() {
+        let mut original = email("Test", Some("a@b.com"), vec![], vec![]);
+        original.message_id = Some("<m2@example.com>".to_string());
+        original.in_reply_to = Some("<m1@example.com>".to_string());
+        let (builder, threaded) = apply_threading_headers(
+            MessageBuilder::new()
+                .from("me@example.com")
+                .subject("s")
+                .text_body("b"),
+            &original,
+        );
+        assert!(threaded);
+        let raw = String::from_utf8(builder.write_to_vec().unwrap()).unwrap();
+        let refs = raw
+            .lines()
+            .find(|l| l.starts_with("References: "))
+            .expect("References header");
+        assert_eq!(refs, "References: <m1@example.com> <m2@example.com>");
     }
 
     #[test]

@@ -31,6 +31,15 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   attachment `get_email` lists, decoded as it arrived and ahead of the
   files the call adds; inline images come along as ordinary attachments.
   The original is fetched once for both.
+- **A reply ignored `Reply-To`.** `draft_reply` addressed the original's
+  `From` even when the mail named another address for replies, as shops,
+  ticket systems and mailing lists do, so the draft went to a `noreply@`
+  sender instead of the service desk. It now goes to the `Reply-To`
+  addresses when there are any, as every mail client reads them. The
+  response shows them in `to`; `get_email` stays as it was.
+- **A reply to a reply without `References` lost the start of the
+  thread.** The new draft's `References` now falls back to the parent's
+  `In-Reply-To`, as RFC 5322 prescribes.
 - **`body_parts_diverge` missed mirrored text in mail from Outlook.** The
   HTML part was read with its `<style>` block, whose CSS words outnumbered
   the message's own, so the plain part never covered the HTML and a
@@ -55,7 +64,7 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   the client-side `from` match was never tried by name, and
   `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
 
-358 unit tests, 23 GreenMail integration tests and 74 checks in the MCP
+361 unit tests, 23 GreenMail integration tests and 74 checks in the MCP
 end-to-end script.
 
 ## 3.1.1

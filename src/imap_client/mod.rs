@@ -2741,6 +2741,7 @@ mod tests {
             }),
             to: vec![],
             cc: vec![],
+            reply_to: vec![],
             subject: subject.to_string(),
             date: None,
             date_original: None,

@@ -116,7 +116,7 @@ All organizing tools support **batch operations** — pass an array of UIDs to o
 
 | Tool | Description |
 |------|-------------|
-| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, Outlook-style quoting). Supports `reply_all` (excludes your own address automatically), `cc`, `attachments` (incl. inline images via `{path, inline, cid}` + `![alt](cid:<id>)` in the body), and `replaces_uid` (revise an existing draft). |
+| `draft_reply` | Create a reply draft with proper threading (In-Reply-To, References, Outlook-style quoting), addressed to the original's `Reply-To` when it names one and to its sender otherwise. Supports `reply_all` (excludes your own address automatically), `cc`, `attachments` (incl. inline images via `{path, inline, cid}` + `![alt](cid:<id>)` in the body), and `replaces_uid` (revise an existing draft). |
 | `draft_forward` | Forward an email with the original text and its attachments included, as a mail client does (inline images come along as ordinary attachments). **Requires `to`** — forwarding never auto-selects recipients the way `draft_reply` does. Optionally add message body, `cc`, `attachments`, and `replaces_uid`. |
 | `draft_email` | Compose a new email from scratch with `to`, `subject`, `body`, `cc`, `bcc`, `attachments`, and `replaces_uid`. |
 | `list_drafts` | List pending drafts in the account's Drafts folder (newest first). Supports `limit` / `offset` pagination and returns `total` (all drafts) alongside `returned`. `compact: true` trims each row as in `list_emails`. Useful for tracking drafts awaiting manual send. |
@@ -747,7 +747,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 358 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 361 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
