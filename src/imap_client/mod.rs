@@ -1014,6 +1014,12 @@ impl ImapClient {
         !self.config.read_only && self.config.allow_delete
     }
 
+    /// Whether this account may move emails: the error for a missing trash
+    /// folder offers `move_email` only then.
+    const fn may_move(&self) -> bool {
+        !self.config.read_only && self.config.allow_move
+    }
+
     /// The folder list when it does not contain `folder`; `None` when it does
     /// or cannot be read. A miss in the cached list is checked against a
     /// fresh LIST first: a folder created in another client since must not be
@@ -1950,12 +1956,22 @@ impl ImapClient {
             let Some(trash) = self.find_folder_by_role(TRASH_FOLDER_NAMES).await? else {
                 // Ask, not `permanent: true` outright: a small model reads a
                 // suggestion in an error as the next call, and a deletion for
-                // good is not one to take on its own.
+                // good is not one to take on its own. Moving is offered only
+                // where this account may move: elsewhere move_email is
+                // refused, and where no account may, the model does not even
+                // have the tool.
+                if self.may_move() {
+                    anyhow::bail!(
+                        "This account has no trash folder under a known name (Trash, Deleted \
+                         Items, Papierkorb, Gelöschte Elemente, …), so nothing was deleted. Ask \
+                         the user whether to delete for good (`permanent: true`) or to move the \
+                         emails with move_email to a folder from list_folders"
+                    );
+                }
                 anyhow::bail!(
                     "This account has no trash folder under a known name (Trash, Deleted Items, \
                      Papierkorb, Gelöschte Elemente, …), so nothing was deleted. Ask the user \
-                     whether to delete for good (`permanent: true`) or to move the emails with \
-                     move_email to a folder from list_folders"
+                     whether to delete for good (`permanent: true`)."
                 );
             };
             // Deleting from the Trash itself: a move would leave the messages
@@ -2785,9 +2801,14 @@ mod tests {
     /// A client of the fake server at `addr` that gives up after 300 ms of
     /// silence instead of a minute.
     async fn fake_client(addr: std::net::SocketAddr) -> ImapClient {
+        fake_client_with(addr, "").await
+    }
+
+    /// [`fake_client`] with more lines for its account block.
+    async fn fake_client_with(addr: std::net::SocketAddr, extra: &str) -> ImapClient {
         let account: AccountConfig = toml::from_str(&format!(
             "name = \"Fake\"\nhost = \"127.0.0.1\"\nport = {}\nusername = \"u@h\"\n\
-             password = \"p\"\naccept_invalid_certs = true\n",
+             password = \"p\"\naccept_invalid_certs = true\n{extra}",
             addr.port()
         ))
         .unwrap();
@@ -2867,6 +2888,47 @@ mod tests {
             !client.connection_state().connected,
             "the session whose LIST stalled must be gone"
         );
+    }
+
+    /// Without a trash folder nothing is deleted, and the error names what
+    /// the user can choose. Moving is offered only where the account may
+    /// move: elsewhere `move_email` is refused, and where no account may move,
+    /// the model does not have the tool at all.
+    #[tokio::test]
+    async fn without_a_trash_the_error_offers_moving_only_with_the_right_to_move() {
+        let addr = fake_server(Arc::new(|tag, word, _| match word {
+            "LIST" => Some(format!(
+                "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n{tag} OK LIST completed\r\n"
+            )),
+            _ => Some(format!("{tag} OK done\r\n")),
+        }))
+        .await;
+        let mut may_move = fake_client(addr).await;
+        let err = may_move
+            .delete_emails("INBOX", &[1], false)
+            .await
+            .expect_err("no trash")
+            .to_string();
+        assert_eq!(
+            err,
+            "This account has no trash folder under a known name (Trash, Deleted Items, \
+             Papierkorb, Gelöschte Elemente, …), so nothing was deleted. Ask the user whether to \
+             delete for good (`permanent: true`) or to move the emails with move_email to a folder \
+             from list_folders",
+            "the text of 3.2.2, unchanged where the account may move"
+        );
+
+        let mut no_move = fake_client_with(addr, "allow_move = false\n").await;
+        let err = no_move
+            .delete_emails("INBOX", &[1], false)
+            .await
+            .expect_err("no trash")
+            .to_string();
+        assert!(
+            err.ends_with("Ask the user whether to delete for good (`permanent: true`)."),
+            "{err}"
+        );
+        assert!(!err.contains("move_email"), "{err}");
     }
 
     /// A write step wraps the cause in what it means for the caller. A dead

@@ -3,6 +3,28 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.3
+
+### Fixed
+
+- **Without a trash folder, the delete error no longer offers a move the
+  account may not make.** `delete_email` on an account without a trash
+  folder answers that nothing was deleted and suggests asking the user
+  about deleting for good or moving the emails with `move_email`. On an
+  account with `allow_move = false` that move is refused, and where no
+  account may move, the model does not have `move_email` at all. There the
+  error now ends after the question about deleting for good; accounts that
+  may move get the text unchanged. Measured with Gemma 4 E4B, 10 runs
+  each: 9 of 10 right before and after, and the offer of a move that Gemma
+  made once with the old text did not come again.
+
+The tool surface is unchanged: `tools/list` and the instructions are byte
+for byte those of 3.1.1, and `initialize` differs only in the version it
+reports.
+
+378 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
+end-to-end script.
+
 ## 3.2.2
 
 ### Security

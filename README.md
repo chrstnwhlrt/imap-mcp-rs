@@ -110,7 +110,7 @@ All organizing tools support **batch operations** — pass an array of UIDs to o
 | `flag_email` | Set the `\Flagged` flag (star in Gmail, flag in Outlook/Apple Mail). Supports `dry_run: true`; blocked by `allow_flag_change = false`. |
 | `unflag_email` | Remove the `\Flagged` flag. Supports `dry_run: true`; blocked by `allow_flag_change = false`. |
 | `move_email` | Move one or more emails from a source folder to a different destination folder (a move into the source folder itself is refused, it would only renumber the messages). Requires `allow_move = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, target_folder, uids, would_move}`; permission checks still fire so the preview also confirms the action would be allowed. Uses IMAP COPY + `\Deleted` + UID EXPUNGE; on partial failure surfaces a structured error so the caller doesn't retry into a duplicated message. `succeeded` lists only UIDs that actually existed in the source folder when the operation ran (verified with a `UID SEARCH` up front); `failed` spells out the rest, so a partial success can never be read as a full one. |
-| `delete_email` | Delete one or more emails. Moves to Trash by default (`permanent: false`); `permanent: true` uses UID EXPUNGE scoped to just these UIDs. Messages already in the Trash folder need `permanent: true`, since moving them there would change nothing. Requires `allow_delete = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, uids, permanent, would_move_to_trash \| would_expunge_permanently}` (which field is present depends on `permanent`). `succeeded`/`failed` report exactly what existed and what didn't, like `move_email`. |
+| `delete_email` | Delete one or more emails. Moves to Trash by default (`permanent: false`); `permanent: true` uses UID EXPUNGE scoped to just these UIDs. Messages already in the Trash folder need `permanent: true`, since moving them there would change nothing. On an account without a trash folder nothing is deleted, and the error suggests asking the user about deleting for good, and about moving with `move_email` only where the account may move. Requires `allow_delete = true`. Set `dry_run: true` to preview without touching IMAP — returns `{account, dry_run: true, folder, uids, permanent, would_move_to_trash \| would_expunge_permanently}` (which field is present depends on `permanent`). `succeeded`/`failed` report exactly what existed and what didn't, like `move_email`. |
 
 ### Composing
 
@@ -748,7 +748,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 377 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 378 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
