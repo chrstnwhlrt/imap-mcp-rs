@@ -40,7 +40,9 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   attachment `get_email` lists, decoded as it arrived and ahead of the
   files the call adds. An image the original's HTML shows by its
   Content-ID (the logo in an Outlook signature) stays inline under that
-  id, so the quote shows it. The original is fetched once for all of it.
+  id, so the quote shows it. A file passed along that has the same content
+  as a carried attachment (the invoice, downloaded to forward it) is not
+  attached a second time. The original is fetched once for all of it.
 - **The quote of a reply showed broken images.** It quoted the original's
   HTML with its `cid:` references but without the images behind them. A
   reply now keeps the images its quote shows, as mail clients do, and
@@ -92,7 +94,7 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   the client-side `from` match was never tried by name, and
   `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
 
-365 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
+366 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
 end-to-end script.
 
 ## 3.1.1

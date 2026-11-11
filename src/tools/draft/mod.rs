@@ -371,6 +371,15 @@ fn original_attachments(raw: &[u8], html: Option<&str>) -> (AttachmentData, Vec<
     (regular, inline)
 }
 
+/// Put the original's attachments ahead of the files a forward passes. A
+/// passed file with the same content as a carried one is left out: a model
+/// that downloaded the invoice to forward it, as `download_attachment`
+/// suggests, would otherwise attach it twice.
+fn carry_along(passed: &mut AttachmentData, carried: AttachmentData) {
+    passed.retain(|(_, _, bytes)| !carried.iter().any(|(_, _, carried)| carried == bytes));
+    passed.splice(0..0, carried);
+}
+
 /// The `saved` of every draft response.
 const SAVED_AS_DRAFT: &str = "as a draft in Drafts; nothing was sent, the user sends it";
 
@@ -757,7 +766,7 @@ pub async fn draft_forward(server: &ImapMcpServer, req: DraftForwardRequest) -> 
         Ok(v) => v,
         Err(e) => return Err(error_json(&e)),
     };
-    prepared.regular.splice(0..0, carried);
+    carry_along(&mut prepared.regular, carried);
     prepared.inline.extend(carried_inline);
 
     let (plain_body, html_body) = {
@@ -1868,6 +1877,27 @@ mod tests {
             original_attachments(b"From: a@b\r\nSubject: s\r\n\r\nText\r\n", None);
         assert_eq!(carried, Vec::new(), "a plain message carries nothing");
         assert!(inline.is_empty(), "{} inline parts", inline.len());
+    }
+
+    /// The original's attachments come first; a passed file with the same
+    /// content as one of them (the invoice, downloaded to forward it) is not
+    /// attached a second time, a different one is.
+    #[test]
+    fn carried_attachments_are_not_attached_twice() {
+        let file = |name: &str, bytes: &[u8]| {
+            (
+                "application/pdf".to_string(),
+                name.to_string(),
+                bytes.to_vec(),
+            )
+        };
+        let mut passed = vec![
+            file("Rechnung.pdf", b"%PDF-1"),
+            file("Notiz.pdf", b"%PDF-2"),
+        ];
+        carry_along(&mut passed, vec![file("Rechnung.pdf", b"%PDF-1")]);
+        let names: Vec<&str> = passed.iter().map(|(_, name, _)| name.as_str()).collect();
+        assert_eq!(names, ["Rechnung.pdf", "Notiz.pdf"]);
     }
 
     /// The logo in an Outlook signature sits inline under a Content-ID that
