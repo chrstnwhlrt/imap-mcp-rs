@@ -328,13 +328,7 @@ pub fn load_config(path: Option<&str>) -> Result<ServerConfig> {
     // could set `IMAP_MCP_CONFIG` — or the XDG variables that place the token
     // state and the attachment directory — and so inject exactly the
     // attacker-chosen config `find_config_file` refuses to pick up from there.
-    let config_path = if let Some(p) = path {
-        PathBuf::from(p)
-    } else if let Ok(p) = env::var("IMAP_MCP_CONFIG") {
-        PathBuf::from(p)
-    } else {
-        find_config_file().context(missing_config_help())?
-    };
+    let config_path = config_path(path, env::var_os("IMAP_MCP_CONFIG"))?;
 
     let content = fs::read_to_string(&config_path)
         .with_context(|| format!("Failed to read config file: {}", config_path.display()))?;
@@ -435,6 +429,21 @@ pub fn load_config(path: Option<&str>) -> Result<ServerConfig> {
     Ok(config)
 }
 
+/// The config file to read: `--config`, else `IMAP_MCP_CONFIG`, else the
+/// standard locations. An empty variable counts as unset, as with most
+/// variables; it used to end in "Failed to read config file: " with no path.
+/// Read as an `OsString`: a path that is not UTF-8 was skipped silently, and
+/// the server started on the default config instead of the one named.
+fn config_path(path: Option<&str>, from_env: Option<std::ffi::OsString>) -> Result<PathBuf> {
+    if let Some(p) = path {
+        return Ok(PathBuf::from(p));
+    }
+    if let Some(p) = from_env.filter(|p| !p.is_empty()) {
+        return Ok(PathBuf::from(p));
+    }
+    find_config_file().context(missing_config_help())
+}
+
 /// First-run guidance. A bare "no config found" leaves a new user guessing
 /// where the file goes and what belongs in it — and inside an MCP client the
 /// only visible symptom is a server that refuses to start. So name the exact
@@ -525,6 +534,37 @@ mod tests {
         assert!(help.contains("reauth"));
         // …and no token in the config.
         assert!(help.contains("no token belongs in the config"));
+    }
+
+    /// `--config` wins, then `IMAP_MCP_CONFIG` when it names a path; an empty
+    /// value counts as unset, and a path that is not UTF-8 is still a path.
+    #[test]
+    fn the_config_path_comes_from_the_argument_then_the_variable() {
+        use std::ffi::OsString;
+        assert_eq!(
+            config_path(Some("/a.toml"), Some(OsString::from("/b.toml"))).unwrap(),
+            PathBuf::from("/a.toml")
+        );
+        assert_eq!(
+            config_path(None, Some(OsString::from("/b.toml"))).unwrap(),
+            PathBuf::from("/b.toml")
+        );
+        // Empty: the standard locations, which may or may not hold a file
+        // on this machine, but never the empty path.
+        let empty = config_path(None, Some(OsString::new()));
+        assert!(
+            !matches!(&empty, Ok(p) if p.as_os_str().is_empty()),
+            "{empty:?}"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let raw = OsString::from_vec(b"/tmp/\xff.toml".to_vec());
+            assert_eq!(
+                config_path(None, Some(raw.clone())).unwrap(),
+                PathBuf::from(raw)
+            );
+        }
     }
 
     /// `~` is not expanded, so an entry starting with it is refused at load

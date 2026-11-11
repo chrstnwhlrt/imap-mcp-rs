@@ -55,6 +55,10 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   match looked only at the recipients' addresses, while a term like
   "Müller" sits in the name. It now checks names and addresses, as the
   parameter says and as `from` always did.
+- **An empty `IMAP_MCP_CONFIG` stopped the server with "Failed to read
+  config file: " and no path,** and a path in it that is not UTF-8 was
+  skipped, so the server started on the default config instead. An empty
+  value now counts as unset, and the path is read as it is.
 - **The `Host` header for a custom token endpoint lacked a port other
   than 443**, which RFC 9110 requires.
 - **The GreenMail integration tests could not fail for a missing
@@ -64,7 +68,7 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   the client-side `from` match was never tried by name, and
   `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
 
-361 unit tests, 23 GreenMail integration tests and 74 checks in the MCP
+362 unit tests, 23 GreenMail integration tests and 74 checks in the MCP
 end-to-end script.
 
 ## 3.1.1
