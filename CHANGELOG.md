@@ -5,6 +5,17 @@ the MCP tool surface and the config format are the public API.
 
 ## 3.2.1
 
+### Security
+
+- **Text in Unicode tag characters passed the filter for invisible
+  characters.** Tag characters (U+E0000 to U+E007F) mirror ASCII: a mail
+  client shows them as nothing, while a model reads them as text. A
+  subject, a sender's name or an attachment's filename could carry
+  instructions the user never sees, and so could the start of the text in
+  a listing row. They are now dropped there like the zero-width characters,
+  and so is the Arabic letter mark U+061C next to the other two direction
+  marks. The full text of an email stays as it was sent, as before.
+
 ### Fixed
 
 - **A server that stopped answering held the account until a restart.**
@@ -36,7 +47,7 @@ the MCP tool surface and the config format are the public API.
   out" against an IMAP server that was fine. The refresh now gives up after
   10 seconds with its own error, "OAuth2 token refresh timed out".
 
-373 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
+374 unit tests, 23 GreenMail integration tests and 76 checks in the MCP
 end-to-end script.
 
 ## 3.2.0
