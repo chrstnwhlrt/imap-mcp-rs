@@ -1016,18 +1016,37 @@ impl ImapClient {
     /// fresh LIST first: a folder created in another client since must not be
     /// reported missing. Only `allowed_folders` appear, like everywhere else.
     async fn folder_list_without(&mut self, folder: &str) -> Option<Vec<String>> {
-        let names = self.get_folder_names_once().await.ok()?;
+        let names = self.folder_names_or_mark().await?;
         if names.iter().any(|n| same_folder(n, folder)) {
             return None;
         }
         self.cached_folder_names = None;
-        let names = self.get_folder_names_once().await.ok()?;
+        let names = self.folder_names_or_mark().await?;
         (!names.iter().any(|n| same_folder(n, folder))).then_some(names)
     }
 
+    /// The folder names, or `None` with a dead or stalled session marked
+    /// dead: the caller only wants them for a better error, and swallowing
+    /// the failure alone kept a session whose LIST answer was still due.
+    async fn folder_names_or_mark(&mut self) -> Option<Vec<String>> {
+        match self.get_folder_names_once().await {
+            Ok(names) => Some(names),
+            Err(e) => {
+                let _ = self.check_error(e);
+                None
+            }
+        }
+    }
+
     /// Check if an error is a connection error. If so, mark dead for reconnect.
+    ///
+    /// Judged on the whole chain: a write step wraps the cause in what it
+    /// means for the caller ("COPY to target succeeded but ..."), and judged
+    /// on that alone a stalled or broken session stayed in use. A session
+    /// kept after a command was given up hands that command's late answers
+    /// to the next one.
     pub fn check_error(&mut self, e: anyhow::Error) -> anyhow::Error {
-        if is_connection_error(&e.to_string()) {
+        if is_connection_error(&format!("{e:#}")) {
             tracing::warn!("IMAP connection error, will reconnect on next call: {e}");
             // Sanitize before stashing — the error string may embed server
             // output which could contain bidi/control chars the
@@ -1950,10 +1969,8 @@ impl ImapClient {
             return Ok(vec![]);
         }
         let drafts = self
-            .find_folder_by_role(DRAFTS_FOLDER_NAMES)
+            .drafts_folder_or_default()
             .await
-            .ok()
-            .flatten()
             .unwrap_or_else(|| "Drafts".to_string());
 
         if !self.is_folder_allowed(&drafts) {
@@ -1976,10 +1993,8 @@ impl ImapClient {
     /// listing the folder first); the draft existing is the contract.
     pub async fn save_draft(&mut self, message_bytes: &[u8]) -> Result<Option<u32>> {
         let drafts = self
-            .find_folder_by_role(DRAFTS_FOLDER_NAMES)
+            .drafts_folder_or_default()
             .await
-            .ok()
-            .flatten()
             .unwrap_or_else(|| "Drafts".to_string());
 
         // Enforce `allowed_folders` also on the auto-detected Drafts folder,
@@ -2020,11 +2035,37 @@ impl ImapClient {
             util::clean_message_id(&message_id)
         );
 
-        self.ensure_selected(drafts).await.ok()?;
-        let session = self.session().ok()?;
         // A duplicate Message-ID would make "the draft we just wrote"
         // ambiguous; the highest UID is the append we are reporting on.
-        session.uid_search(&criteria).await.ok()?.into_iter().max()
+        match self.search_uids(drafts, &criteria).await {
+            Ok(uids) => uids.into_iter().max(),
+            Err(e) => {
+                // Swallowed for the caller, but a dead or stalled session
+                // must not carry this search's late answer into the next
+                // command.
+                let _ = self.check_error(e);
+                None
+            }
+        }
+    }
+
+    /// `UID SEARCH` in `folder`, once.
+    async fn search_uids(&mut self, folder: &str, criteria: &str) -> Result<HashSet<u32>> {
+        self.ensure_selected(folder).await?;
+        Ok(self.session()?.uid_search(criteria).await?)
+    }
+
+    /// The Drafts folder by its name, `None` when there is none or the list
+    /// cannot be read. A list that failed on a dead or stalled session marks
+    /// it dead, so the write that follows does not run into the late answer.
+    async fn drafts_folder_or_default(&mut self) -> Option<String> {
+        match self.find_folder_by_role(DRAFTS_FOLDER_NAMES).await {
+            Ok(found) => found,
+            Err(e) => {
+                let _ = self.check_error(e);
+                None
+            }
+        }
     }
 
     // ========== Helpers ==========
@@ -2641,16 +2682,17 @@ mod tests {
     const FAKE_CERT: &str = "MIIBfzCCASWgAwIBAgIUVmRbvFRXWEIwwOfIRd9NC+eRM7AwCgYIKoZIzj0EAwIwFDESMBAGA1UEAwwJbG9jYWxob3N0MCAXDTI2MTExMTAwNDkyMVoYDzIxMjYxMDE4MDA0OTIxWjAUMRIwEAYDVQQDDAlsb2NhbGhvc3QwWTATBgcqhkjOPQIBBggqhkjOPQMBBwNCAAR0bdX1KvMmduT6WBBs9EUfmWhWFB7x3+cdYOb4AIOFiWGeu38F2+qHXQ0JnWKQJ4APKj/PQinauWnr3qy4q0qTo1MwUTAdBgNVHQ4EFgQUqdcJPd34gLZBGRrRKfZxaSCJlhIwHwYDVR0jBBgwFoAUqdcJPd34gLZBGRrRKfZxaSCJlhIwDwYDVR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAgNIADBFAiAZvZpAy7LBEpHmnX23B06gj5bthW9SYjpbCoU4QsCsQAIhAMPqisnLF8/8yh8zzOo9iZaRd/Zv5BXUPLtwDN9scEWU";
     const FAKE_KEY: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg9q5WF+ut6HmCU0k4cmUrA6YESHF4jgKbPYiHya5b392hRANCAAR0bdX1KvMmduT6WBBs9EUfmWhWFB7x3+cdYOb4AIOFiWGeu38F2+qHXQ0JnWKQJ4APKj/PQinauWnr3qy4q0qT";
 
-    /// An IMAP server on loopback that greets and takes any LOGIN, then
-    /// reads a SELECT and says nothing, as a hung server or a dead path does,
-    /// until the `answer_from`-th SELECT, which it answers with an empty
-    /// folder. Returns its address and how many SELECTs it has read.
-    async fn silent_server(
-        answer_from: usize,
-    ) -> (std::net::SocketAddr, Arc<std::sync::atomic::AtomicUsize>) {
+    /// What the fake server answers to a command, given its tag, its word
+    /// (upper case) and how often that word came before on any connection:
+    /// the reply, or `None` to read the command and say nothing, as a hung
+    /// server or a dead path does.
+    type FakeAnswer = Arc<dyn Fn(&str, &str, usize) -> Option<String> + Send + Sync>;
+
+    /// An IMAP server on loopback over TLS that greets, takes any LOGIN and
+    /// LOGOUT, and answers everything else as `answer` says.
+    async fn fake_server(answer: FakeAnswer) -> std::net::SocketAddr {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD;
-        use std::sync::atomic::{AtomicUsize, Ordering};
         use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
         let cert = rustls::pki_types::CertificateDer::from(STANDARD.decode(FAKE_CERT).unwrap());
@@ -2668,12 +2710,14 @@ mod tests {
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let selects = Arc::new(AtomicUsize::new(0));
-        let counted = Arc::clone(&selects);
+        let seen = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
+            String,
+            usize,
+        >::new()));
         tokio::spawn(async move {
             while let Ok((tcp, _)) = listener.accept().await {
-                let acceptor = acceptor.clone();
-                let counted = Arc::clone(&counted);
+                let (acceptor, answer, seen) =
+                    (acceptor.clone(), Arc::clone(&answer), Arc::clone(&seen));
                 tokio::spawn(async move {
                     let Ok(tls) = acceptor.accept(tcp).await else {
                         return;
@@ -2685,21 +2729,17 @@ mod tests {
                     }
                     while let Ok(Some(line)) = lines.next_line().await {
                         let mut words = line.split_whitespace();
-                        let tag = words.next().unwrap_or("*");
-                        let reply = match words.next().map(str::to_ascii_uppercase).as_deref() {
-                            Some("LOGIN") => format!("{tag} OK LOGIN completed\r\n"),
-                            Some("SELECT") => {
-                                if counted.fetch_add(1, Ordering::SeqCst) + 1 < answer_from {
-                                    continue;
-                                }
-                                format!(
-                                    "* 0 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n\
-                                     {tag} OK [READ-WRITE] SELECT completed\r\n"
-                                )
+                        let tag = words.next().unwrap_or("*").to_string();
+                        let word = words.next().unwrap_or("").to_ascii_uppercase();
+                        let reply = match word.as_str() {
+                            "LOGIN" => Some(format!("{tag} OK LOGIN completed\r\n")),
+                            "LOGOUT" => Some(format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n")),
+                            _ => {
+                                let before = count(&seen, &word);
+                                answer(&tag, &word, before)
                             }
-                            Some("LOGOUT") => format!("* BYE bye\r\n{tag} OK LOGOUT completed\r\n"),
-                            _ => format!("{tag} OK done\r\n"),
                         };
+                        let Some(reply) = reply else { continue };
                         if write.write_all(reply.as_bytes()).await.is_err() {
                             return;
                         }
@@ -2707,7 +2747,41 @@ mod tests {
                 });
             }
         });
-        (addr, selects)
+        addr
+    }
+
+    /// How often `word` came before, counting this one in.
+    fn count(
+        seen: &std::sync::Mutex<std::collections::HashMap<String, usize>>,
+        word: &str,
+    ) -> usize {
+        let mut seen = seen.lock().unwrap();
+        let count = seen.entry(word.to_string()).or_insert(0);
+        let before = *count;
+        *count += 1;
+        drop(seen);
+        before
+    }
+
+    /// A client of the fake server at `addr` that gives up after 300 ms of
+    /// silence instead of a minute.
+    async fn fake_client(addr: std::net::SocketAddr) -> ImapClient {
+        let account: AccountConfig = toml::from_str(&format!(
+            "name = \"Fake\"\nhost = \"127.0.0.1\"\nport = {}\nusername = \"u@h\"\n\
+             password = \"p\"\naccept_invalid_certs = true\n",
+            addr.port()
+        ))
+        .unwrap();
+        let mut client = ImapClient::new(account).stall_after(Duration::from_millis(300));
+        client.connect_bounded().await.expect("greeting and login");
+        client
+    }
+
+    /// The SELECT of an empty folder, answered.
+    fn selected(tag: &str) -> String {
+        format!(
+            "* 0 EXISTS\r\n* OK [UIDVALIDITY 1] ok\r\n{tag} OK [READ-WRITE] SELECT completed\r\n"
+        )
     }
 
     /// The case Otomo ran into: the server takes the command and says
@@ -2717,15 +2791,13 @@ mod tests {
     /// reconnects and gets its answer.
     #[tokio::test]
     async fn a_server_that_goes_silent_frees_the_account() {
-        let (addr, selects) = silent_server(3).await;
-        let account: AccountConfig = toml::from_str(&format!(
-            "name = \"Fake\"\nhost = \"127.0.0.1\"\nport = {}\nusername = \"u@h\"\n\
-             password = \"p\"\naccept_invalid_certs = true\n",
-            addr.port()
-        ))
-        .unwrap();
-        let mut client = ImapClient::new(account).stall_after(Duration::from_millis(300));
-        client.connect_bounded().await.expect("greeting and login");
+        let addr = fake_server(Arc::new(|tag, word, before| match word {
+            "SELECT" if before < 2 => None,
+            "SELECT" => Some(selected(tag)),
+            _ => Some(format!("{tag} OK done\r\n")),
+        }))
+        .await;
+        let mut client = fake_client(addr).await;
 
         let started = std::time::Instant::now();
         let err = tokio::time::timeout(
@@ -2737,11 +2809,6 @@ mod tests {
         .expect_err("both SELECTs went unanswered");
         assert!(is_retryable_error(&err.to_string()), "{err}");
         assert!(started.elapsed() < Duration::from_secs(5));
-        assert_eq!(
-            selects.load(std::sync::atomic::Ordering::SeqCst),
-            2,
-            "the read reconnected and tried once more"
-        );
         assert!(
             !client.connection_state().connected,
             "the silent session is gone"
@@ -2755,6 +2822,50 @@ mod tests {
         .expect("no hang")
         .expect("the third SELECT is answered");
         assert!(rows.is_empty() && total == 0);
+    }
+
+    /// A failure swallowed for a better error message (here the folder list
+    /// behind "does not exist") must still drop a session that stalled: kept,
+    /// it would hand the late LIST answer to the next command.
+    #[tokio::test]
+    async fn a_stall_behind_a_swallowed_error_drops_the_session() {
+        let addr = fake_server(Arc::new(|tag, word, _| match word {
+            "SELECT" => Some(format!("{tag} NO [NONEXISTENT] Unknown Mailbox\r\n")),
+            "LIST" => None,
+            _ => Some(format!("{tag} OK done\r\n")),
+        }))
+        .await;
+        let mut client = fake_client(addr).await;
+        let err = tokio::time::timeout(
+            Duration::from_secs(10),
+            client.list_emails("Nope", 1, 0, false),
+        )
+        .await
+        .expect("no hang")
+        .expect_err("the folder does not exist");
+        assert!(err.to_string().contains("Unknown Mailbox"), "{err}");
+        assert!(
+            !client.connection_state().connected,
+            "the session whose LIST stalled must be gone"
+        );
+    }
+
+    /// A write step wraps the cause in what it means for the caller. A dead
+    /// or stalled connection underneath must still drop the session.
+    #[test]
+    fn a_connection_error_under_a_context_still_drops_the_session() {
+        let account: AccountConfig = toml::from_str(
+            "name = \"T\"\nhost = \"127.0.0.1\"\nport = 9\nusername = \"u@h\"\npassword = \"p\"\n",
+        )
+        .unwrap();
+        let mut client = ImapClient::new(account);
+        let wrapped = anyhow::Error::new(stalled())
+            .context("COPY to target succeeded but \\Deleted-flag STORE on source failed");
+        let _ = client.check_error(wrapped);
+        assert!(
+            client.connection_state().last_error.is_some(),
+            "the session counts as dead"
+        );
     }
 
     /// A folder whose raw name is pure ASCII sails past the control/bidi

@@ -748,7 +748,7 @@ nix develop                    # Enter dev shell
 cargo build                    # Build debug binary
 nix build                      # Build release binary
 nix flake check                # Run nix build + flake checks
-cargo test --all-targets       # Run the 371 unit tests (integration tests are #[ignore]d)
+cargo test --all-targets       # Run the 373 unit tests (integration tests are #[ignore]d)
 cargo clippy --all-targets -- -D warnings -W clippy::pedantic -W clippy::nursery
 nix profile add .              # Install release binary to PATH
 cargo fmt                      # Format code
