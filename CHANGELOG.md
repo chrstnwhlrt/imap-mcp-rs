@@ -20,6 +20,13 @@ the MCP tool surface and the config format are the public API.
   stays as it was: line breaks, markup and the other formatting
   characters.
 
+### Changed
+
+- Patch updates of const-oid (0.10.3), rustls-pki-types (1.16.0) and
+  webpki-roots (1.0.12). The tool surface is unchanged: `tools/list` and
+  the instructions are byte for byte those of 3.1.1, and `initialize`
+  differs only in the version it reports.
+
 377 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
 end-to-end script.
 
