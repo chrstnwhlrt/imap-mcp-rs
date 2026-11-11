@@ -54,9 +54,11 @@ pub fn default_attachment_dir() -> String {
 /// startup prune deletes in it, so whoever controls it could read every
 /// download or swap a file between the download and the draft that attaches
 /// it. The checks therefore run twice: before creating (a planted symlink
-/// must not be created and chmod-ed *through*) and after the chmod, which is
-/// what catches a directory someone else owns — the chmod cannot take effect
-/// there, so the mode stays open. On a `/tmp` fallback another user can
+/// must not be created and chmod-ed *through*) and after the chmod. Then a
+/// mode that stayed open means others can reach the directory, and an owner
+/// other than this process means someone else controls it even when it is
+/// private to them: they can open it up again at any time. The mode check
+/// alone let such a directory through. On a `/tmp` fallback another user can
 /// pre-create exactly that.
 pub async fn prepare_attachment_dir(dir: &Path) -> Result<()> {
     let refuse_symlink = |meta: &fs::Metadata| -> Result<()> {
@@ -100,22 +102,46 @@ pub async fn prepare_attachment_dir(dir: &Path) -> Result<()> {
     }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = meta.permissions().mode() & 0o777;
-        if mode & 0o077 != 0 {
-            bail!(
-                "attachment dir \"{}\" is accessible to other users (mode {mode:04o}) and could \
-                 not be restricted to 0700 — it is probably owned by someone else. Point \
-                 `allowed_attachment_dirs` at a directory of your own",
-                dir.display()
-            );
-        }
+        // SAFETY: `geteuid` takes no arguments, cannot fail and touches no
+        // memory of ours.
+        let euid = unsafe { libc::geteuid() };
+        refuse_foreign(dir, &meta, euid)?;
     }
     Ok(())
 }
 
+/// The checks after the chmod: the directory must be closed to others and
+/// belong to `euid`, the user this process runs as.
+#[cfg(unix)]
+fn refuse_foreign(dir: &Path, meta: &fs::Metadata, euid: u32) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let mode = meta.permissions().mode() & 0o777;
+    if mode & 0o077 != 0 {
+        bail!(
+            "attachment dir \"{}\" is accessible to other users (mode {mode:04o}) and could \
+             not be restricted to 0700 — it is probably owned by someone else. Point \
+             `allowed_attachment_dirs` at a directory of your own",
+            dir.display()
+        );
+    }
+    if meta.uid() != euid {
+        bail!(
+            "attachment dir \"{}\" belongs to another user (uid {}), who could read and replace \
+             every download in it. Point `allowed_attachment_dirs` at a directory of your own",
+            dir.display(),
+            meta.uid()
+        );
+    }
+    Ok(())
+}
+
+/// One `[[accounts]]` block. A key it does not know is an error: ignored, a
+/// misspelled `read_only` or `allow_delete` left the account writable or
+/// deletable, the opposite of what the line says. Same reasoning as the
+/// strict command line (`main.rs`).
 #[allow(clippy::struct_excessive_bools)]
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct AccountConfig {
     pub name: String,
     pub host: String,
@@ -233,7 +259,9 @@ const fn default_auth_method() -> AuthMethod {
     AuthMethod::Password
 }
 
+/// `[accounts.oauth2]`, strict for the same reason as the account block.
 #[derive(Deserialize, Clone)]
+#[serde(deny_unknown_fields)]
 pub struct OAuth2Config {
     #[serde(default = "default_provider")]
     pub provider: OAuth2Provider,
@@ -527,6 +555,45 @@ mod tests {
         assert!(load_config(path.to_str()).is_ok());
     }
 
+    /// A misspelled permission switch must not leave the account writable:
+    /// an unknown key in an account block is an error naming it, in the
+    /// `OAuth2` section as well.
+    #[test]
+    fn unknown_account_keys_are_refused() {
+        let account = |extra: &str| {
+            format!(
+                "[[accounts]]\nname = \"A\"\nhost = \"h\"\nusername = \"u@h\"\npassword = \"p\"\n\
+                 {extra}\n"
+            )
+        };
+        for (extra, key) in [
+            ("read_onyl = true", "read_onyl"),
+            ("readonly = true", "readonly"),
+            ("allow-delete = false", "allow-delete"),
+            (
+                "auth_method = \"oauth2\"\n[accounts.oauth2]\nclient-id = \"x\"",
+                "client-id",
+            ),
+        ] {
+            let err = toml::from_str::<ServerConfig>(&account(extra))
+                .expect_err(extra)
+                .to_string();
+            assert!(err.contains(key), "{extra}: {err}");
+        }
+        // Every documented key still loads.
+        let full = account(
+            "email = \"u@h\"\ndisplay_name = \"U\"\nsignature_html = \"<p>s</p>\"\n\
+             signature_text = \"s\"\nmessage_id_domain = \"h\"\nlocale = \"de\"\nport = 993\n\
+             read_only = true\nallow_delete = false\nallow_move = false\n\
+             allow_flag_change = false\naccept_invalid_certs = false\n\
+             allow_unsafe_expunge = false\nallowed_folders = [\"INBOX\"]\n\
+             auth_method = \"oauth2\"\n[accounts.oauth2]\nprovider = \"outlook365\"\n\
+             client_id = \"c\"\nclient_secret = \"s\"\nrefresh_token = \"r\"\ntenant = \"t\"\n\
+             token_url = \"https://h/t\"",
+        );
+        toml::from_str::<ServerConfig>(&full).expect("every documented key");
+    }
+
     /// `tool_set` chose between two tool surfaces before there was one for
     /// every client. A config that still carries it must keep loading.
     #[test]
@@ -650,6 +717,24 @@ mod tests {
         fs::set_permissions(&open, fs::Permissions::from_mode(0o755)).unwrap();
         prepare_attachment_dir(&open).await.unwrap();
         assert_eq!(mode(&open), 0o700);
+    }
+
+    /// A directory private to another user passes the mode check, yet its
+    /// owner can open it again at any time: refused by its owner.
+    #[cfg(unix)]
+    #[test]
+    fn a_private_directory_of_another_user_is_refused() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let scratch = Scratch::new();
+        let dir = scratch.0.join("downloads");
+        fs::create_dir(&dir).unwrap();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o700)).unwrap();
+        let meta = fs::symlink_metadata(&dir).unwrap();
+        refuse_foreign(&dir, &meta, meta.uid()).expect("the owner's own directory");
+        let err = refuse_foreign(&dir, &meta, meta.uid().wrapping_add(1))
+            .expect_err("another user's private directory")
+            .to_string();
+        assert!(err.contains("belongs to another user"), "{err}");
     }
 
     #[cfg(unix)]

@@ -814,11 +814,12 @@ pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> ToolRe
 struct ClientFilter {
     subject: Vec<String>,
     from: Vec<String>,
-    /// Known gap, accepted: summaries carry only the first
+    /// Matched against the names and addresses of the recipients, as the
+    /// parameter says. Known gap, accepted: summaries carry only the first
     /// [`crate::email::SUMMARY_TO_PREVIEW`] recipients, so a non-ASCII `to`
-    /// fallback matches those alone. Non-ASCII in the *address* is rare
-    /// enough (IDN mailboxes) that widening the plumbing is not worth it —
-    /// unlike `text`, which hit every long body.
+    /// fallback matches those alone. Widening the plumbing for recipients
+    /// further down a list is not worth it, unlike `text`, which hit every
+    /// long body.
     to: Vec<String>,
     from_any: Vec<Vec<String>>,
     /// Everything the IMAP client applies per fetched message: full-text
@@ -863,12 +864,16 @@ impl ClientFilter {
                 return false;
             }
         }
+        // Name and address, like `from`: a term outside ASCII ("Müller")
+        // only ever comes here, and it is mostly part of a name. Matching the
+        // addresses alone found nobody.
         for s in &self.to {
-            if !email
-                .to
-                .iter()
-                .any(|a| a.address.to_lowercase().contains(s.as_str()))
-            {
+            if !email.to.iter().any(|a| {
+                a.address.to_lowercase().contains(s.as_str())
+                    || a.name
+                        .as_deref()
+                        .is_some_and(|n| n.to_lowercase().contains(s.as_str()))
+            }) {
                 return false;
             }
         }
@@ -2950,12 +2955,13 @@ mod tests {
         let mut req = empty_req();
         req.unread_only = Some(true);
         let (criteria, _) = build(&req, true);
-        assert!(criteria.contains("UNSEEN"), "{criteria}");
+        assert_eq!(criteria, "UNSEEN");
 
+        // Exact: "UNSEEN" contains "SEEN" as well.
         let mut req = empty_req();
         req.unread_only = Some(false);
         let (criteria, _) = build(&req, true);
-        assert!(criteria.contains("SEEN"), "{criteria}");
+        assert_eq!(criteria, "SEEN");
 
         // Contradiction is refused, agreement is accepted.
         let mut req = empty_req();
@@ -3097,6 +3103,41 @@ mod tests {
         filter.from.push("alice".to_string());
         let s = summary_with("Test", "", "alice@example.com");
         assert!(filter.matches(&s));
+        // The name alone: the case the fallback exists for ("Müller").
+        let mut filter = ClientFilter::default();
+        filter.from.push("müller".to_string());
+        let mut s = summary_with("Test", "", "jm@example.de");
+        assert!(!filter.matches(&s));
+        s.from = Some(crate::email::EmailAddress {
+            name: Some("Jörg Müller".to_string()),
+            address: "jm@example.de".to_string(),
+        });
+        assert!(filter.matches(&s));
+    }
+
+    /// `to` is a recipient's name or address, on the fallback path as on
+    /// the server. A term outside ASCII sits in a name nearly always, and
+    /// matching the addresses alone found nobody.
+    #[test]
+    fn client_filter_to_matches_address_or_name() {
+        let recipient = |name: Option<&str>, address: &str| crate::email::EmailAddress {
+            name: name.map(str::to_string),
+            address: address.to_string(),
+        };
+        let mut s = summary_with("Test", "", "a@example.com");
+        s.to = vec![
+            recipient(None, "info@example.de"),
+            recipient(Some("Jörg Müller"), "jm@example.de"),
+        ];
+        let mut filter = ClientFilter::default();
+        filter.to.push("müller".to_string());
+        assert!(filter.matches(&s), "by name");
+        let mut filter = ClientFilter::default();
+        filter.to.push("jm@".to_string());
+        assert!(filter.matches(&s), "by address");
+        let mut filter = ClientFilter::default();
+        filter.to.push("schröder".to_string());
+        assert!(!filter.matches(&s), "nobody of that name");
     }
 
     #[test]

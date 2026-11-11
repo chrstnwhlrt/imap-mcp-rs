@@ -767,6 +767,7 @@ dependencies = [
  "dirs",
  "futures-util",
  "jiff",
+ "libc",
  "mail-builder",
  "mail-parser",
  "rmcp",

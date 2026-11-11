@@ -54,3 +54,9 @@ base64 = "0.23.1"
 # clients do, instead of mail-builder's UTC fallback.
 ammonia = "4.2.4"
 jiff = "0.2.42"
+
+# `geteuid` for the owner check of the attachment directory: std has no safe
+# way to ask for the process's user. Already in the tree through tokio and
+# socket2, so this adds no crate.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.191"

@@ -262,30 +262,47 @@ fn signature_text_from_html(html: &str) -> String {
     // structure below comes exclusively from tags (`<br>`, closing blocks).
     let collapsed = html.split_whitespace().collect::<Vec<_>>().join(" ");
 
+    // A signature saved from Outlook is a whole document, with a head and a
+    // style sheet: what no client shows stays out of the text as well.
+    let mut hidden = crate::email::HiddenText::default();
     let mut out = String::with_capacity(collapsed.len());
     let mut rest = collapsed.as_str();
     while let Some(start) = rest.find('<') {
-        out.push_str(&rest[..start]);
+        if !hidden.opens_tag(&rest[start..]) {
+            // Raw text of a script or style element, hidden like the rest.
+            rest = &rest[start + 1..];
+            continue;
+        }
+        if !hidden.hides() {
+            out.push_str(&rest[..start]);
+        }
         let after = &rest[start + 1..];
         let Some(end) = after.find('>') else {
             // Unterminated tag: treat the remainder as text.
-            out.push_str(&rest[start..]);
+            if !hidden.hides() {
+                out.push_str(&rest[start..]);
+            }
             rest = "";
             break;
         };
         let tag = after[..end].trim().to_ascii_lowercase();
+        hidden.tag(&tag);
         let name = tag
             .trim_start_matches('/')
             .split([' ', '\t', '/'])
             .next()
             .unwrap_or("");
         // Opening <br>, and closing block tags, produce line breaks.
-        if name == "br" || (tag.starts_with('/') && matches!(name, "p" | "div" | "tr" | "li")) {
+        if !hidden.hides()
+            && (name == "br" || (tag.starts_with('/') && matches!(name, "p" | "div" | "tr" | "li")))
+        {
             out.push('\n');
         }
         rest = &after[end + 1..];
     }
-    out.push_str(rest);
+    if !hidden.hides() {
+        out.push_str(rest);
+    }
 
     // The full entity table, not just the markup basics: signatures pasted
     // from Outlook or a web editor spell umlauts as `&uuml;`, and the text
@@ -1191,6 +1208,25 @@ mod tests {
         assert_eq!(
             signature_text_from_html(html),
             "Phone: +49 40 0000\nLine two"
+        );
+    }
+
+    /// A signature saved from Outlook is a whole document: its head and
+    /// style sheet must not reach the text part of every draft.
+    #[test]
+    fn signature_text_from_html_leaves_out_head_and_style() {
+        let html = "<html><head><meta charset=\"utf-8\"><title>Signatur</title>\
+                    <style>p.MsoNormal { margin: 0cm; font-family: \"Calibri\"; }</style>\
+                    </head><body><p class=\"MsoNormal\">Viele Gr&uuml;&szlig;e<br>Christian \
+                    Wohlert</p></body></html>";
+        assert_eq!(
+            signature_text_from_html(html),
+            "Viele Grüße\nChristian Wohlert"
+        );
+        // A `<` inside a script is no tag and does not hide the rest.
+        assert_eq!(
+            signature_text_from_html("<script>if (a<b) {}</script><p>Gruß</p>"),
+            "Gruß"
         );
     }
 

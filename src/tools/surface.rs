@@ -347,8 +347,10 @@ fn either(words: &[&str], conjunction: &str) -> String {
 
 /// `schema` without what changes nothing for the caller: `$schema`, the
 /// integer `format`s and the `minimum: 0` schemars writes for unsigned
-/// fields, and the `"null"` beside the type of a field that is not required
-/// anyway (the server reads a missing field and a null alike).
+/// fields, and the `"null"` beside the type of an `Option` field (the server
+/// reads a null like a missing field). That holds for the required ones too:
+/// a `to` or `subject` sent as null is a left-out one, which a revision
+/// takes from the draft it replaces.
 fn stripped(schema: &JsonObject) -> JsonObject {
     schema
         .iter()

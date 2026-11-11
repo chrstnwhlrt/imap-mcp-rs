@@ -363,7 +363,7 @@ pub async fn minimal_https_post(url: &str, body: &str) -> Result<(u16, String)> 
          \r\n\
          {}",
         url_parsed.path,
-        url_parsed.host,
+        url_parsed.host_header(),
         body.len(),
         body
     );
@@ -706,6 +706,37 @@ mod url_parts {
             }
 
             Ok(Self { host, port, path })
+        }
+    }
+
+    impl UrlParts {
+        /// The `Host` header: the URL's authority, its port included unless
+        /// it is the default 443. RFC 9110 §7.2 makes it a MUST; a custom
+        /// token endpoint on another port was addressed without it.
+        pub fn host_header(&self) -> String {
+            if self.port == 443 {
+                self.host.clone()
+            } else {
+                format!("{}:{}", self.host, self.port)
+            }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::UrlParts;
+
+        #[test]
+        fn the_host_header_carries_a_port_other_than_443() {
+            let parts = |url: &str| url.parse::<UrlParts>().unwrap();
+            let gmail = parts("https://oauth2.googleapis.com/token");
+            assert_eq!(gmail.host_header(), "oauth2.googleapis.com");
+            assert_eq!(gmail.path, "/token");
+            let custom = parts("https://auth.example.de:8443/oauth/token");
+            assert_eq!(custom.host_header(), "auth.example.de:8443");
+            assert_eq!(custom.host, "auth.example.de");
+            assert_eq!(custom.port, 8443);
+            assert_eq!(parts("https://h:443/t").host_header(), "h");
         }
     }
 }

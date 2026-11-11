@@ -25,6 +25,10 @@
 # no account may use (read_only, allow_move, allow_delete,
 # allow_flag_change) is not offered at all.
 
+# A key the server does not know in an account block stops it at startup with
+# the key named: a misspelled `read_only` would otherwise leave the account
+# writable.
+
 [[accounts]]
 name = "Personal"
 host = "imap.gmail.com"

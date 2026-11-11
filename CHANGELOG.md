@@ -3,6 +3,55 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.0
+
+Fixes from a review of the whole code. The tool surface is unchanged:
+`initialize` and `tools/list` are byte for byte those of 3.1.1.
+
+### Changed
+
+- **An unknown key in an account block stops the server at startup.** It
+  used to be ignored, so `read_onyl = true` or `allow-delete = false` left
+  the account writable or deletable, the opposite of what the line says.
+  The error names the key. The same holds for `[accounts.oauth2]`; unknown
+  keys at the top level (such as a leftover `tool_set`) still load. A
+  config that only loaded because a misspelled key went unnoticed needs
+  that key fixed.
+- **The first attachment directory must belong to the user the server
+  runs as.** The mode check let a directory through that another user owns
+  and keeps private for the moment; its owner could open it again at any
+  time and read or replace every download. `config.sample.toml` and the
+  README promised this check already.
+
+### Fixed
+
+- **`body_parts_diverge` missed mirrored text in mail from Outlook.** The
+  HTML part was read with its `<style>` block, whose CSS words outnumbered
+  the message's own, so the plain part never covered the HTML and a
+  paragraph hidden from the reader went unflagged. The content of `<head>`,
+  `<style>`, `<script>` and `<template>` no longer counts as text, as in
+  mail-parser's own conversion, and a `<` inside a script no longer hides
+  the rest of the mail.
+- **A signature copied out of Outlook put its CSS into the text part of
+  every draft.** The text derived from `signature_html` leaves out the same
+  elements.
+- **`search_emails` with `to` and a term outside ASCII found nobody on
+  Outlook 365.** Such terms are matched there after the fetch, and that
+  match looked only at the recipients' addresses, while a term like
+  "Müller" sits in the name. It now checks names and addresses, as the
+  parameter says and as `from` always did.
+- **The `Host` header for a custom token endpoint lacked a port other
+  than 443**, which RFC 9110 requires.
+- **The GreenMail integration tests could not fail for a missing
+  server.** Each returned early when nothing answered and counted as
+  passed. Run with `--ignored`, they now fail and say to start
+  `./test-server.sh`. Two unit tests asserted less than their names say:
+  the client-side `from` match was never tried by name, and
+  `unread_only: false` passed with `UNSEEN` as well as with `SEEN`.
+
+357 unit tests, 23 GreenMail integration tests and 73 checks in the MCP
+end-to-end script.
+
 ## 3.1.1
 
 All dependencies and the toolchain at their newest releases. Nothing a

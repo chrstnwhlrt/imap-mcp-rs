@@ -62,16 +62,24 @@ async fn serial() -> tokio::sync::MutexGuard<'static, ()> {
     MAILBOX.lock().await
 }
 
-/// Skip helper: if the test server isn't reachable, produce a clear
-/// `#[ignore]`-appropriate message rather than a cryptic connect error.
-async fn client_or_skip() -> Option<ImapClient> {
+/// A session on the test server, or a failed test with the reason. The
+/// tests run only when asked for (`--ignored`), so an unreachable server is
+/// an error: returning early let every test pass without having checked
+/// anything.
+async fn connected() -> ImapClient {
     let mut client = ImapClient::new(greenmail_config());
-    let result = tokio::time::timeout(std::time::Duration::from_secs(3), client.connect()).await;
-    if matches!(result, Ok(Ok(()))) {
-        Some(client)
-    } else {
-        eprintln!("GreenMail not reachable at 127.0.0.1:3993 — run ./test-server.sh first");
-        None
+    match tokio::time::timeout(std::time::Duration::from_secs(3), client.connect()).await {
+        Ok(Ok(())) => client,
+        Ok(Err(e)) => {
+            panic!(
+                "connecting to GreenMail at 127.0.0.1:3993 failed ({e:#}): run ./test-server.sh first"
+            )
+        }
+        Err(elapsed) => {
+            panic!(
+                "GreenMail at 127.0.0.1:3993 did not answer ({elapsed}): run ./test-server.sh first"
+            )
+        }
     }
 }
 
@@ -79,9 +87,7 @@ async fn client_or_skip() -> Option<ImapClient> {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn connect_and_disconnect() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     client.disconnect().await;
 }
 
@@ -89,9 +95,7 @@ async fn connect_and_disconnect() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn list_folders_contains_inbox_and_drafts() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let folders = client.list_folders().await.expect("list_folders failed");
     let names: Vec<&str> = folders.iter().map(|f| f.name.as_str()).collect();
     assert!(names.contains(&"INBOX"), "INBOX missing: {names:?}");
@@ -112,9 +116,7 @@ async fn list_folders_contains_inbox_and_drafts() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn list_emails_inbox_returns_seeded_messages() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (emails, total, _matched) = client
         .list_emails("INBOX", 50, 0, false)
         .await
@@ -174,9 +176,7 @@ async fn search_time_bounds_cut_on_internaldate_over_the_wire() {
     // of running this test — so "since an hour ago" must keep them all and
     // "before an hour ago" must drop them all, with `matched` reporting
     // the count after the time cut (rows a caller can actually get).
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("clock")
@@ -224,9 +224,7 @@ async fn search_time_bounds_cut_on_internaldate_over_the_wire() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn get_email_full_content_with_body_text() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (emails, _, _) = client
         .list_emails("INBOX", 50, 0, false)
         .await
@@ -252,9 +250,7 @@ async fn get_email_full_content_with_body_text() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn search_emails_from_bob() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     // `GreenMail` seeds a reply from bob@example.com.
     let (summaries, matched) = client
         .search_emails(
@@ -317,9 +313,7 @@ async fn search_emails_applies_the_body_filter_to_full_bodies() {
     // there) must filter on each message's FULL body over the wire — the
     // unit tests cover it only with synthetic strings. "room 4B" sits in the
     // seeded meeting mail's body text and in no other message.
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let filter = PostFetchFilter {
         body: BodyTextFilter {
             all: vec!["room 4b".to_string()],
@@ -373,9 +367,7 @@ async fn get_thread_strict_follows_references_only() {
     // + References → msg1), plus a *separate* msg4 (charlie) sharing the
     // exact subject "Project Update Q2" but without References. strict=true
     // (the default) must NOT merge msg4 into msg1's thread.
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (emails, _, _) = client
         .list_emails("INBOX", 50, 0, false)
         .await
@@ -431,9 +423,7 @@ async fn get_thread_non_strict_merges_subject_collisions() {
     // Opposite of the strict test: strict=false enables the subject-kernel
     // fallback, so charlie's mail (same subject, no References) DOES get
     // pulled in. This is the Lotus-Notes-friendly mode.
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (emails, _, _) = client
         .list_emails("INBOX", 50, 0, false)
         .await
@@ -474,9 +464,7 @@ async fn get_thread_standalone_returns_single_message() {
     let _serial = serial().await;
     // The Team Meeting mail has no References and a unique subject — even
     // strict=false's subject-fallback shouldn't find anyone to merge.
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (emails, _, _) = client
         .list_emails("INBOX", 50, 0, false)
         .await
@@ -505,17 +493,12 @@ async fn get_thread_standalone_returns_single_message() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn mark_flags_intersects_against_input() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (emails, _, _) = client
         .list_emails("INBOX", 1, 0, false)
         .await
         .expect("list_emails failed");
-    let Some(first) = emails.first() else {
-        eprintln!("no emails to test mark_flags against");
-        return;
-    };
+    let first = emails.first().expect("seeded INBOX is empty");
     // Pass a real UID mixed with a bogus one — only the real one should come back.
     let succeeded = client
         .mark_flags("INBOX", &[first.uid, 99_999_999], "\\Seen", true)
@@ -537,9 +520,7 @@ async fn mark_flags_intersects_against_input() {
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn get_folder_names_lists_every_mailbox_and_serves_repeats_from_cache() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let first = client
         .get_folder_names()
         .await
@@ -563,9 +544,7 @@ async fn get_folder_names_lists_every_mailbox_and_serves_repeats_from_cache() {
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn move_emails_lands_the_message_in_the_target_and_clears_the_source() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let drafts = client
         .detect_drafts_folder()
         .await
@@ -644,9 +623,7 @@ async fn move_emails_lands_the_message_in_the_target_and_clears_the_source() {
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn delete_emails_moves_to_trash_by_default_and_expunges_when_asked() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let drafts = client
         .detect_drafts_folder()
         .await
@@ -725,9 +702,7 @@ async fn delete_emails_moves_to_trash_by_default_and_expunges_when_asked() {
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn fetch_raw_returns_the_verbatim_message_and_none_for_unknown_uids() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (rows, _, _) = client
         .list_emails("INBOX", 5, 0, false)
         .await
@@ -762,9 +737,7 @@ async fn fetch_raw_returns_the_verbatim_message_and_none_for_unknown_uids() {
 #[ignore = "requires a running GreenMail server (./test-server.sh)"]
 async fn save_draft_reports_the_uid_it_landed_on() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let drafts = client
         .detect_drafts_folder()
         .await
@@ -835,9 +808,7 @@ async fn save_draft_reports_the_uid_it_landed_on() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn draft_replacement_keeps_new_version_and_drops_the_old() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let drafts = client
         .detect_drafts_folder()
         .await
@@ -929,12 +900,8 @@ async fn draft_replacement_keeps_new_version_and_drops_the_old() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn list_emails_sees_mail_that_arrived_after_the_folder_was_selected() {
     let _serial = serial().await;
-    let Some(mut reader) = client_or_skip().await else {
-        return;
-    };
-    let Some(mut writer) = client_or_skip().await else {
-        return;
-    };
+    let mut reader = connected().await;
+    let mut writer = connected().await;
     let drafts = reader
         .detect_drafts_folder()
         .await
@@ -984,9 +951,7 @@ async fn list_emails_sees_mail_that_arrived_after_the_folder_was_selected() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn get_thread_includes_sibling_branches() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let drafts = client
         .detect_drafts_folder()
         .await
@@ -1054,9 +1019,7 @@ async fn get_thread_includes_sibling_branches() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn moves_that_cannot_move_anything_are_refused() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (rows, _, _) = client
         .list_emails("INBOX", 1, 0, false)
         .await
@@ -1091,9 +1054,7 @@ async fn moves_that_cannot_move_anything_are_refused() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn unread_listings_come_newest_first() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let (all, _, _) = client
         .list_emails("INBOX", 50, 0, false)
         .await
@@ -1127,9 +1088,7 @@ async fn unread_listings_come_newest_first() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn missing_folders_are_refused_with_the_existing_names() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     let err = client
         .list_emails("Papierkorb", 10, 0, false)
         .await
@@ -1172,9 +1131,7 @@ async fn missing_folders_are_refused_with_the_existing_names() {
 #[ignore = "requires GreenMail via ./test-server.sh"]
 async fn folder_names_resolve_as_people_say_them() {
     let _serial = serial().await;
-    let Some(mut client) = client_or_skip().await else {
-        return;
-    };
+    let mut client = connected().await;
     for (requested, wire) in [
         ("inbox", "INBOX"),
         ("trash", "Trash"),
