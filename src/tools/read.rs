@@ -409,7 +409,7 @@ pub async fn list_emails(server: &ImapMcpServer, req: ListEmailsRequest) -> Tool
             match client.find_folder(folder).await {
                 Ok(Some(wire)) => wire,
                 Ok(None) => {
-                    return Answer::NoFolder(client.get_folder_names().await.unwrap_or_default());
+                    return Answer::NoFolder(client.folder_names_or_none().await);
                 }
                 Err(e) => return Answer::Failed(client.check_error(e).to_string()),
             }
@@ -1506,7 +1506,7 @@ impl Search<'_> {
             Some(folder) => match client.find_folder(folder).await {
                 Ok(Some(wire)) => vec![wire],
                 Ok(None) => {
-                    return Answer::NoFolder(client.get_folder_names().await.unwrap_or_default());
+                    return Answer::NoFolder(client.folder_names_or_none().await);
                 }
                 Err(e) => return Answer::Failed(client.check_error(e).to_string()),
             },
@@ -2153,7 +2153,7 @@ pub async fn list_drafts(server: &ImapMcpServer, req: ListDraftsRequest) -> Tool
         let drafts = match client.detect_drafts_folder().await {
             Ok(Some(folder)) => folder,
             Ok(None) => {
-                return Answer::NoFolder(client.get_folder_names().await.unwrap_or_default());
+                return Answer::NoFolder(client.folder_names_or_none().await);
             }
             Err(e) => return Answer::Failed(client.check_error(e).to_string()),
         };

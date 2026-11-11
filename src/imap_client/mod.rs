@@ -1140,6 +1140,20 @@ impl ImapClient {
         retry_read!(self.get_folder_names_once())
     }
 
+    /// The folder names for an answer that only shows them (a read over
+    /// several accounts, one of which lacks the folder asked for): empty
+    /// when they cannot be read, and a dead or stalled session is marked
+    /// dead rather than kept with its LIST answer still due.
+    pub async fn folder_names_or_none(&mut self) -> Vec<String> {
+        match self.get_folder_names().await {
+            Ok(names) => names,
+            Err(e) => {
+                let _ = self.check_error(e);
+                Vec::new()
+            }
+        }
+    }
+
     /// The folder names as the server lists them now, for a call that goes
     /// through every folder (a search across all of them): from the cache it
     /// skipped a folder created in another client since.

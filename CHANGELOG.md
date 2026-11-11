@@ -21,8 +21,9 @@ the MCP tool surface and the config format are the public API.
   The tool surface and the texts of the responses are unchanged.
 - **A session whose command was given up stayed in use where the error
   was swallowed or wrapped.** The lookup of a saved draft's UID, the Drafts
-  folder lookup before a write and the folder list behind "does not exist"
-  swallowed their failures, and a write step's error wrapped its cause in
+  folder lookup before a write, the folder list behind "does not exist"
+  and the one a read over several accounts shows for an account without
+  the folder swallowed their failures, and a write step's error wrapped its cause in
   what it means for the caller, so a dead or stalled connection there was
   not recognized. The next command would have read the late answers (a
   SEARCH, a LIST) as its own. These now drop the session like every other
