@@ -987,6 +987,11 @@ impl ImapClient {
                 }
                 Err(_elapsed) => {
                     tracing::warn!(folder = %sanitize_log_str(&name), "STATUS timed out after 10s, using 0/0");
+                    // The STATUS went out and its answer is still on the
+                    // way: kept, the session would read that answer as the
+                    // one to the next command, the next folder's counts
+                    // among them. Dropped, the next folder reconnects first.
+                    self.mark_dead();
                     (0, 0)
                 }
             };

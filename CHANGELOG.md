@@ -60,6 +60,11 @@ Fixes from a review of the whole code. The tool surface is unchanged:
   in another client since was missing until the next reconnect, and one
   deleted there was still listed. Both now list afresh; resolving a single
   folder name keeps the cache and renews it on a miss, as before.
+- **A STATUS that timed out in `list_folders` could hand its counts to
+  the next folder.** The command was given up after 10 seconds while its
+  answer was still on the way, and the session read that answer as the
+  one to the next STATUS. The session is now dropped there, and the next
+  folder reconnects first.
 - **An empty `IMAP_MCP_CONFIG` stopped the server with "Failed to read
   config file: " and no path,** and a path in it that is not UTF-8 was
   skipped, so the server started on the default config instead. An empty
