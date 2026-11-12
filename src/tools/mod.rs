@@ -142,8 +142,7 @@ impl ImapMcpServer {
                 self.config
                     .accounts
                     .first()
-                    .map(|a| a.name.to_lowercase())
-                    .unwrap_or_default()
+                    .map_or_default(|a| a.name.to_lowercase())
             },
             str::to_lowercase,
         );
