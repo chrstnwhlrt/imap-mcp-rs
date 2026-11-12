@@ -742,10 +742,7 @@ pub async fn get_thread(server: &ImapMcpServer, req: GetThreadRequest) -> ToolRe
             if truncated {
                 emails.drain(..original_count - max_messages);
             }
-            let subject = emails
-                .first()
-                .map(|e| e.subject.clone())
-                .unwrap_or_default();
+            let subject = emails.first().map_or_default(|e| e.subject.clone());
 
             // Collect the flag before the messages are consumed. Cloning them
             // to read it afterwards would copy every body in the thread — up

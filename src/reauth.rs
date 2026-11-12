@@ -507,8 +507,7 @@ fn validate_redirect(
             error: printable(error),
             description: params
                 .get("error_description")
-                .map(|d| printable(d))
-                .unwrap_or_default(),
+                .map_or_default(|d| printable(d)),
         });
     }
     let Some(code) = params.get("code") else {

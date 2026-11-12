@@ -433,18 +433,15 @@ fn email_from_message(
 
     let to = message
         .to()
-        .map(|list| EmailAddress::list_from_address(&list))
-        .unwrap_or_default();
+        .map_or_default(|list| EmailAddress::list_from_address(&list));
 
     let cc = message
         .cc()
-        .map(|list| EmailAddress::list_from_address(&list))
-        .unwrap_or_default();
+        .map_or_default(|list| EmailAddress::list_from_address(&list));
 
     let reply_to = message
         .reply_to()
-        .map(|list| EmailAddress::list_from_address(&list))
-        .unwrap_or_default();
+        .map_or_default(|list| EmailAddress::list_from_address(&list));
 
     // Sanitize subject before it lands in the LLM's view — bidi overrides
     // and U+2028/9 in a subject would otherwise let a malicious sender
@@ -470,8 +467,7 @@ fn email_from_message(
         .and_then(|list| list.first().map(wrap));
     let references: Vec<String> = message
         .references()
-        .map(|list| list.iter().map(wrap).collect())
-        .unwrap_or_default();
+        .map_or_default(|list| list.iter().map(wrap).collect());
 
     // Without tag characters, which no mail client shows: a model reading the
     // text would otherwise follow instructions the user never sees, and a
