@@ -311,9 +311,10 @@ The server maintains one persistent IMAP connection per account with several res
 
 - **SELECT caching** — avoids redundant IMAP SELECT commands when operating on the same folder. Listings (`list_emails`, `list_drafts`) select afresh every time, because the message count they page by would otherwise miss mail that arrived since the last SELECT
 - **Folder name caching** — IMAP LIST is called once per session per account, and again when a name is not in the cached list (a folder created in another client meanwhile). `list_folders` and a search across all folders always list afresh, so they show what the server has now
-- **TCP keepalive** — first probe after 30 seconds of silence, then every 10 seconds; three unanswered probes drop the connection, so a dead one is noticed within about 60 seconds (Linux and macOS)
+- **TCP keepalive** — first probe after 10 seconds of silence, then every 5 seconds; two unanswered probes drop the connection, so a dead one is noticed within about 20 seconds (Linux and macOS). On Linux, data the server has not acknowledged within 10 seconds drops it too, so a path that dies just before a command is noticed as quickly
 - **Auto-reconnect** — if a connection drops, the next tool call automatically reconnects. Failed accounts at startup reconnect on first use
 - **Silent servers** count as dead connections too. A command that gets no byte from the server for 60 seconds, or whose data the server stops taking, gives up with the error a dead connection gives: a hung server or a path that died without closing (a DSL reconnect at night) no longer holds the account until the server restarts. Answers that keep coming are not cut off, however long they take
+- **Cancelled reads** stop at once. A client that stops waiting for a call, say after a timeout of its own, cancels it with `notifications/cancelled`. A read then frees its account right away, and the next call replaces the session the read left in the middle of a command, instead of queueing behind a read that may wait a minute on a dead connection. A call that writes runs to its end, so a move is never left half done
 - **Server-closed sessions** count as dead connections. A session the server has ended (an idle timeout, an admin's kick) makes the next command fail instead of "succeed" with an empty answer, which is how async-imap reads a closed connection. Reads then reconnect and repeat; before a write a NOOP checks the session and reconnects when needed
 - **Transparent retry** — idempotent read-only operations (SEARCH, FETCH, LIST, STATUS) automatically retry once on connection errors, so transient `broken pipe` failures don't bubble up to the caller. Write operations (APPEND, COPY) never retry to avoid duplicate messages
 - **Connection error detection** — heuristic detection of network errors vs. IMAP protocol errors. Only network errors trigger reconnect
@@ -725,7 +726,7 @@ The Drafts folder doesn't exist on the server. Some IMAP servers (especially fre
 
 ### Connection drops / "broken pipe"
 
-Normal — the server auto-reconnects on the next tool call. TCP keepalive detects dead connections within ~60 seconds. If the problem persists, check your network or the IMAP server status.
+Normal — the server auto-reconnects on the next tool call. TCP keepalive detects dead connections within ~20 seconds. If the problem persists, check your network or the IMAP server status.
 
 ### "Account ... not found"
 

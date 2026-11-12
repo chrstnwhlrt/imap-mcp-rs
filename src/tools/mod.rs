@@ -579,6 +579,40 @@ impl ImapMcpServer {
 #[allow(clippy::unused_async_trait_impl)]
 #[tool_handler(router = self.tool_router)]
 impl ServerHandler for ImapMcpServer {
+    /// A tool call, given up when the client cancels it, if the tool only
+    /// reads. A client cancels a call it stops waiting for (Otomo after
+    /// 15 s); rmcp then drops the answer but lets the call run on. A read
+    /// stuck on a connection that died kept its account locked for the
+    /// minute the stall takes (see `GuardedStream`), so every later call on
+    /// the account ran into the client's timeout as well. Given up, the
+    /// read frees the account at once, and the next call replaces the
+    /// session it left in the middle of a command. A call that writes runs
+    /// to its end: stopped between its commands, a move could leave the
+    /// copy without removing the original.
+    async fn call_tool(
+        &self,
+        request: rmcp::model::CallToolRequestParams,
+        context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::CallToolResponse, rmcp::ErrorData> {
+        let cancelled = context.ct.clone();
+        let reads = self.tool_router.get(&request.name).is_some_and(only_reads);
+        let call = self
+            .tool_router
+            .call(rmcp::handler::server::tool::ToolCallContext::new(
+                self, request, context,
+            ));
+        if !reads {
+            return call.await;
+        }
+        tokio::select! {
+            result = call => result,
+            () = cancelled.cancelled() => Err(rmcp::ErrorData::internal_error(
+                "the client cancelled the call",
+                None,
+            )),
+        }
+    }
+
     fn get_info(&self) -> InitializeResult {
         InitializeResult::new(ServerCapabilities::builder().enable_tools().build())
             // Without this the handshake reports the SDK's own crate name and
@@ -592,6 +626,14 @@ impl ServerHandler for ImapMcpServer {
             ))
             .with_instructions(self.instructions.clone())
     }
+}
+
+/// Whether a tool only reads, as its annotations tell the client.
+fn only_reads(tool: &rmcp::model::Tool) -> bool {
+    tool.annotations
+        .as_ref()
+        .and_then(|annotations| annotations.read_only_hint)
+        == Some(true)
 }
 
 #[cfg(test)]
@@ -828,5 +870,151 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(framed["retryable"], true, "{framed}");
+    }
+
+    /// The tools a cancel stops are the ones that only read; every tool
+    /// that changes something runs to its end.
+    #[test]
+    fn only_reading_tools_are_given_up_at_a_cancel() {
+        let server = server_with_accounts(1);
+        let mut reading: Vec<String> = server
+            .tool_router
+            .list_all()
+            .iter()
+            .filter(|tool| only_reads(tool))
+            .map(|tool| tool.name.to_string())
+            .collect();
+        reading.sort();
+        for tool in ["search_emails", "list_emails", "get_email", "get_thread"] {
+            assert!(reading.iter().any(|r| r == tool), "{tool}: {reading:?}");
+        }
+        for tool in [
+            "move_email",
+            "delete_email",
+            "mark_as_read",
+            "flag_email",
+            "draft_email",
+            "draft_reply",
+            "delete_draft",
+            "download_attachment",
+        ] {
+            assert!(!reading.iter().any(|r| r == tool), "{tool}: {reading:?}");
+        }
+    }
+
+    async fn send_line(write: &mut (impl tokio::io::AsyncWrite + Unpin), msg: serde_json::Value) {
+        use tokio::io::AsyncWriteExt as _;
+        write
+            .write_all(format!("{msg}\n").as_bytes())
+            .await
+            .expect("the server reads its input");
+    }
+
+    /// Whether `client` is locked by a call, checked until `want` holds or
+    /// two seconds pass.
+    async fn locked_becomes(client: &Arc<Mutex<ImapClient>>, want: bool) -> bool {
+        for _ in 0..200 {
+            if client.try_lock().is_err() == want {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        false
+    }
+
+    /// A client that stops waiting (Otomo after 15 s) cancels the call.
+    /// rmcp only drops the answer and lets the call run on, so a read stuck
+    /// on a dead connection kept its account locked, and every later call
+    /// on it ran into the client's timeout too. A read is given up at the
+    /// cancel and frees the account; a write runs to its end.
+    #[tokio::test]
+    async fn a_cancelled_read_frees_its_account_and_a_write_runs_on() {
+        use rmcp::ServiceExt as _;
+        use serde_json::json;
+        use tokio::io::AsyncBufReadExt as _;
+
+        // A server that takes the connection and never answers: every call
+        // on the account waits in its connect, 15 s in service.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                tokio::spawn(async move {
+                    let _held_open = tcp;
+                    std::future::pending::<()>().await;
+                });
+            }
+        });
+        let config: ServerConfig = toml::from_str(&format!(
+            "[[accounts]]\nname = \"A\"\nhost = \"127.0.0.1\"\nport = {port}\n\
+             username = \"u@h\"\npassword = \"p\"\naccept_invalid_certs = true\n"
+        ))
+        .unwrap();
+        let client = Arc::new(Mutex::new(ImapClient::new(config.accounts[0].clone())));
+        let server = ImapMcpServer::new(
+            config,
+            HashMap::from([("a".to_string(), Arc::clone(&client))]),
+        );
+        let (ours, theirs) = tokio::io::duplex(1 << 16);
+        tokio::spawn(async move {
+            if let Ok(service) = server.serve(theirs).await {
+                let _ = service.waiting().await;
+            }
+        });
+        let (read, mut write) = tokio::io::split(ours);
+        let mut lines = tokio::io::BufReader::new(read).lines();
+        send_line(
+            &mut write,
+            json!({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "t", "version": "1"}}}),
+        )
+        .await;
+        lines
+            .next_line()
+            .await
+            .unwrap()
+            .expect("initialize answered");
+        send_line(
+            &mut write,
+            json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        )
+        .await;
+
+        for (id, tool, args, given_up) in [
+            (2, "list_emails", json!({"folder": "INBOX"}), true),
+            (
+                3,
+                "mark_as_read",
+                json!({"folder": "INBOX", "uids": [1]}),
+                false,
+            ),
+        ] {
+            send_line(
+                &mut write,
+                json!({"jsonrpc": "2.0", "id": id, "method": "tools/call",
+                       "params": {"name": tool, "arguments": args}}),
+            )
+            .await;
+            assert!(
+                locked_becomes(&client, true).await,
+                "{tool} takes the account"
+            );
+            send_line(
+                &mut write,
+                json!({"jsonrpc": "2.0", "method": "notifications/cancelled",
+                       "params": {"requestId": id, "reason": "request timeout after PT15S"}}),
+            )
+            .await;
+            if given_up {
+                assert!(
+                    locked_becomes(&client, false).await,
+                    "the cancelled {tool} must free the account"
+                );
+            } else {
+                tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+                assert!(client.try_lock().is_err(), "{tool} runs to its end");
+            }
+        }
     }
 }

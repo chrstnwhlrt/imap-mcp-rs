@@ -13,6 +13,7 @@
 
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -92,22 +93,35 @@ const STALL_TIMEOUT: Duration = Duration::from_secs(60);
 /// Both take the path of every other dead connection: reads reconnect and
 /// repeat, the caller of a write gets `retryable: true`, and the next call
 /// finds the account free.
+///
+/// It also keeps `waiting` up to date: set while a read or write waits,
+/// cleared when one completes. A command runs to its tagged answer, so a
+/// finished command leaves it clear. Left set, the call was dropped in the
+/// middle of a command (see [`ImapClient::drop_abandoned_session`]).
 #[derive(Debug)]
 struct GuardedStream<S> {
     inner: S,
     stall: Duration,
     read_wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
     write_wait: Option<std::pin::Pin<Box<tokio::time::Sleep>>>,
+    waiting: Arc<AtomicBool>,
 }
 
 impl<S> GuardedStream<S> {
-    const fn new(inner: S, stall: Duration) -> Self {
+    const fn new(inner: S, stall: Duration, waiting: Arc<AtomicBool>) -> Self {
         Self {
             inner,
             stall,
             read_wait: None,
             write_wait: None,
+            waiting,
         }
+    }
+
+    /// `poll` unchanged, with `waiting` set to whether it is still pending.
+    fn settle<T>(&self, poll: std::task::Poll<T>) -> std::task::Poll<T> {
+        self.waiting.store(poll.is_pending(), Ordering::Relaxed);
+        poll
     }
 }
 
@@ -154,19 +168,21 @@ impl<S: tokio::io::AsyncRead + Unpin> tokio::io::AsyncRead for GuardedStream<S> 
         let room = buf.remaining() > 0;
         let before = buf.filled().len();
         let this = &mut *self;
-        match std::pin::Pin::new(&mut this.inner).poll_read(cx, buf) {
+        let poll = match std::pin::Pin::new(&mut this.inner).poll_read(cx, buf) {
             std::task::Poll::Pending => pending_or_stalled(&mut this.read_wait, this.stall, cx),
             std::task::Poll::Ready(result) => {
                 this.read_wait = None;
                 if room && result.is_ok() && buf.filled().len() == before {
-                    return std::task::Poll::Ready(Err(std::io::Error::new(
+                    std::task::Poll::Ready(Err(std::io::Error::new(
                         std::io::ErrorKind::UnexpectedEof,
                         "connection closed by the server",
-                    )));
+                    )))
+                } else {
+                    std::task::Poll::Ready(result)
                 }
-                std::task::Poll::Ready(result)
             }
-        }
+        };
+        this.settle(poll)
     }
 }
 
@@ -177,13 +193,14 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for GuardedStream<S
         buf: &[u8],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = &mut *self;
-        match std::pin::Pin::new(&mut this.inner).poll_write(cx, buf) {
+        let poll = match std::pin::Pin::new(&mut this.inner).poll_write(cx, buf) {
             std::task::Poll::Pending => pending_or_stalled(&mut this.write_wait, this.stall, cx),
             ready @ std::task::Poll::Ready(_) => {
                 this.write_wait = None;
                 ready
             }
-        }
+        };
+        this.settle(poll)
     }
 
     fn poll_write_vectored(
@@ -192,13 +209,14 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for GuardedStream<S
         bufs: &[std::io::IoSlice<'_>],
     ) -> std::task::Poll<std::io::Result<usize>> {
         let this = &mut *self;
-        match std::pin::Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
+        let poll = match std::pin::Pin::new(&mut this.inner).poll_write_vectored(cx, bufs) {
             std::task::Poll::Pending => pending_or_stalled(&mut this.write_wait, this.stall, cx),
             ready @ std::task::Poll::Ready(_) => {
                 this.write_wait = None;
                 ready
             }
-        }
+        };
+        this.settle(poll)
     }
 
     fn is_write_vectored(&self) -> bool {
@@ -210,13 +228,14 @@ impl<S: tokio::io::AsyncWrite + Unpin> tokio::io::AsyncWrite for GuardedStream<S
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
         let this = &mut *self;
-        match std::pin::Pin::new(&mut this.inner).poll_flush(cx) {
+        let poll = match std::pin::Pin::new(&mut this.inner).poll_flush(cx) {
             std::task::Poll::Pending => pending_or_stalled(&mut this.write_wait, this.stall, cx),
             ready @ std::task::Poll::Ready(_) => {
                 this.write_wait = None;
                 ready
             }
-        }
+        };
+        this.settle(poll)
     }
 
     // Not watched: LOGOUT has its own five seconds, and a session dropped
@@ -588,6 +607,9 @@ pub struct ImapClient {
     /// Whether the server of this session takes MOVE (RFC 6851); asked at
     /// the first move of a session.
     can_move: Option<bool>,
+    /// Whether the session's stream was left waiting, a new one with every
+    /// session (see [`GuardedStream`]).
+    waiting: Arc<AtomicBool>,
 }
 
 /// Read-only snapshot of an `ImapClient`'s health for the `account_health`
@@ -641,6 +663,7 @@ impl ImapClient {
             stall: STALL_TIMEOUT,
             partial_rows: true,
             can_move: None,
+            waiting: Arc::default(),
         }
     }
 
@@ -796,7 +819,10 @@ impl ImapClient {
                 (None, None)
             };
         ConnectionState {
-            connected: self.session.is_some(),
+            // A session a cancelled call left in the middle of a command is
+            // replaced by the next call (see `drop_abandoned_session`); its
+            // connection may well be dead.
+            connected: self.session.is_some() && !self.waiting.load(Ordering::Relaxed),
             last_error: self.last_error.clone(),
             oauth_token_valid,
             oauth_expires_in_secs,
@@ -836,7 +862,12 @@ impl ImapClient {
             "connect() called while session is Some — caller forgot mark_dead/disconnect"
         );
         let tls_stream = self.establish_tls().await?;
-        let mut client = async_imap::Client::new(GuardedStream::new(tls_stream, self.stall));
+        let waiting = Arc::new(AtomicBool::new(false));
+        let mut client = async_imap::Client::new(GuardedStream::new(
+            tls_stream,
+            self.stall,
+            Arc::clone(&waiting),
+        ));
 
         // Read the server greeting before any commands.
         // async-imap's Client::new() doesn't consume the greeting, which causes
@@ -906,6 +937,7 @@ impl ImapClient {
         );
 
         self.session = Some(session);
+        self.waiting = waiting;
         self.selected_folder = None;
         self.cached_folder_names = None;
         self.can_move = None;
@@ -967,9 +999,25 @@ impl ImapClient {
         result
     }
 
+    /// Drop the session when a call was dropped in the middle of a command:
+    /// a read the client gave up on (see `ImapMcpServer::call_tool`), as
+    /// often as not one stuck on a connection that died. The answer to that
+    /// command is still to come, or never comes, and the next command would
+    /// read it as its own or wait behind it. A fresh session costs a login.
+    fn drop_abandoned_session(&mut self) {
+        if self.session.is_some() && self.waiting.load(Ordering::Relaxed) {
+            tracing::info!(
+                account = %self.config.name,
+                "A cancelled call left a command unanswered, reconnecting"
+            );
+            self.mark_dead();
+        }
+    }
+
     /// Ensure we have a live IMAP session, reconnecting if necessary (within
     /// [`CONNECT_TIMEOUT`], see [`Self::connect_bounded`]).
     async fn ensure_connected(&mut self) -> Result<()> {
+        self.drop_abandoned_session();
         if self.session.is_some() {
             return Ok(());
         }
@@ -1001,6 +1049,7 @@ impl ImapClient {
     /// those see the folder's current state either way. Counting by sequence
     /// number needs [`Self::select`] instead.
     async fn ensure_selected(&mut self, folder: &str) -> Result<()> {
+        self.drop_abandoned_session();
         // Fast path: if this folder is already selected, it was vetted against
         // `allowed_folders` on the prior SELECT — skip the re-check entirely.
         if self.selected_folder.as_deref() == Some(folder) {
@@ -2349,19 +2398,33 @@ impl ImapClient {
             .await
             .map_err(|e| anyhow::anyhow!("Failed to connect to {addr}: {e}"))?;
 
-        // TCP keepalive: first probe after 30 s idle, then every 10 s, and
-        // three unanswered probes drop the connection — a dead peer is
-        // noticed within ~60 s instead of the OS default of two hours before
-        // probing even starts. The probe count matters as much as the
-        // timing: Linux defaults to nine, which stretched detection to two
-        // minutes.
+        // TCP keepalive: first probe after 10 s idle, then every 5 s, and
+        // two unanswered probes drop the connection, so a peer that died is
+        // noticed within ~20 s instead of the OS default of two hours before
+        // probing even starts. A connection that died silently while the
+        // account was quiet is then gone before a call that comes later,
+        // which reconnects at once. Without it the call waits out the stall
+        // (see `GuardedStream`), a minute, much longer than a client such
+        // as Otomo waits (15 s). The probe count matters as much as the
+        // timing: Linux defaults to nine.
         let sock_ref = socket2::SockRef::from(&tcp_stream);
         let keepalive = socket2::TcpKeepalive::new()
-            .with_time(Duration::from_secs(30))
-            .with_interval(Duration::from_secs(10));
+            .with_time(Duration::from_secs(10))
+            .with_interval(Duration::from_secs(5));
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        let keepalive = keepalive.with_retries(3);
+        let keepalive = keepalive.with_retries(2);
         sock_ref.set_tcp_keepalive(&keepalive)?;
+        // Sent data the server has not acknowledged after 10 s ends the
+        // connection as well. Keepalive only probes a quiet connection: a
+        // path that dies just before a command left that command waiting
+        // out the stall. A live server acknowledges within milliseconds,
+        // however long it takes to answer.
+        // Not every kernel that runs Linux binaries takes the option (WSL1
+        // does not); without it the stall still ends such a wait.
+        #[cfg(target_os = "linux")]
+        if let Err(e) = sock_ref.set_tcp_user_timeout(Some(Duration::from_secs(10))) {
+            tracing::debug!(error = %e, "TCP_USER_TIMEOUT not available");
+        }
 
         // The crypto provider is pinned here rather than left to the process
         // default: `ClientConfig::builder()` resolves that from the enabled
@@ -2868,7 +2931,11 @@ mod tests {
     #[tokio::test]
     async fn a_closed_connection_reads_as_an_error_not_as_the_end() {
         use tokio::io::AsyncReadExt as _;
-        let mut stream = GuardedStream::new(&b"* BYE Disconnected\r\n"[..], STALL_TIMEOUT);
+        let mut stream = GuardedStream::new(
+            &b"* BYE Disconnected\r\n"[..],
+            STALL_TIMEOUT,
+            Arc::default(),
+        );
         let mut buf = [0u8; 64];
         assert_eq!(stream.read(&mut buf).await.unwrap(), 20);
         let err = stream.read(&mut buf).await.unwrap_err();
@@ -2886,7 +2953,7 @@ mod tests {
     async fn silence_ends_a_read_and_a_write_as_a_dead_connection() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let (near, _far) = tokio::io::duplex(8);
-        let mut stream = GuardedStream::new(near, Duration::from_millis(100));
+        let mut stream = GuardedStream::new(near, Duration::from_millis(100), Arc::default());
         let mut buf = [0u8; 4];
         let err = tokio::time::timeout(Duration::from_secs(5), stream.read(&mut buf))
             .await
@@ -2909,7 +2976,7 @@ mod tests {
     async fn an_answer_that_keeps_coming_is_no_stall() {
         use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
         let (near, mut far) = tokio::io::duplex(64);
-        let mut stream = GuardedStream::new(near, Duration::from_millis(200));
+        let mut stream = GuardedStream::new(near, Duration::from_millis(200), Arc::default());
         tokio::spawn(async move {
             for _ in 0..5 {
                 tokio::time::sleep(Duration::from_millis(80)).await;
@@ -2939,7 +3006,8 @@ mod tests {
     /// of the start of messages) and how often that word came before on any
     /// connection:
     /// the reply, or `None` to read the command and say nothing, as a hung
-    /// server or a dead path does.
+    /// server or a dead path does: from then on to every command on that
+    /// connection.
     type FakeAnswer = Arc<dyn Fn(&str, &str, usize) -> Option<String> + Send + Sync>;
 
     /// An IMAP server on loopback over TLS that greets, takes any LOGIN and
@@ -2981,7 +3049,11 @@ mod tests {
                     if write.write_all(b"* OK fake IMAP ready\r\n").await.is_err() {
                         return;
                     }
+                    let mut silent = false;
                     while let Ok(Some(line)) = lines.next_line().await {
+                        if silent {
+                            continue;
+                        }
                         let mut words = line.split_whitespace();
                         let tag = words.next().unwrap_or("*").to_string();
                         let mut word = words.next().unwrap_or("").to_ascii_uppercase();
@@ -3002,7 +3074,10 @@ mod tests {
                                 answer(&tag, &word, before)
                             }
                         };
-                        let Some(reply) = reply else { continue };
+                        let Some(reply) = reply else {
+                            silent = true;
+                            continue;
+                        };
                         if write.write_all(reply.as_bytes()).await.is_err() {
                             return;
                         }
@@ -3090,6 +3165,61 @@ mod tests {
         .expect("no hang")
         .expect("the third SELECT is answered");
         assert!(rows.is_empty() && total == 0);
+    }
+
+    /// A client that gives up on a read (Otomo after 15 s) drops the call in
+    /// the middle of its command, here on a connection that died. The next
+    /// call must not send its commands into that session and wait out the
+    /// stall time, a minute in service: it starts a fresh session at once.
+    #[tokio::test]
+    async fn a_call_dropped_mid_command_leaves_no_session_behind() {
+        let addr = fake_server(Arc::new(|tag, word, before| match word {
+            "SELECT" if before == 0 => None,
+            "SELECT" => Some(selected(tag)),
+            _ => Some(format!("{tag} OK done\r\n")),
+        }))
+        .await;
+        let account: AccountConfig = toml::from_str(&format!(
+            "name = \"Fake\"\nhost = \"127.0.0.1\"\nport = {}\nusername = \"u@h\"\n\
+             password = \"p\"\naccept_invalid_certs = true\n",
+            addr.port()
+        ))
+        .unwrap();
+        let mut client = ImapClient::new(account).stall_after(Duration::from_secs(30));
+        client.connect_bounded().await.expect("greeting and login");
+        assert!(
+            !client.waiting.load(Ordering::Relaxed),
+            "the login finished"
+        );
+
+        let gave_up = tokio::time::timeout(
+            Duration::from_millis(200),
+            client.list_emails("INBOX", 1, 0, false),
+        )
+        .await;
+        assert!(gave_up.is_err(), "the first SELECT goes unanswered");
+        assert!(
+            client.waiting.load(Ordering::Relaxed),
+            "dropped while waiting"
+        );
+        assert!(
+            !client.connection_state().connected,
+            "account_health does not call the left session connected"
+        );
+
+        let (rows, total, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            client.list_emails("INBOX", 1, 0, false),
+        )
+        .await
+        .expect("the next call must not wait behind the dropped one")
+        .expect("a fresh session answers");
+        assert!(rows.is_empty() && total == 0);
+        assert!(
+            !client.waiting.load(Ordering::Relaxed),
+            "a finished call leaves nothing waiting, so the session stays"
+        );
+        assert!(client.connection_state().connected);
     }
 
     /// The FETCH asks for exactly the start the rows are judged by.
