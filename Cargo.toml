@@ -1,6 +1,6 @@
 [package]
 name = "imap-mcp-rs"
-version = "3.2.4"
+version = "3.2.5"
 edition = "2024"
 # The floor is set by mail-parser 1.0, which requires 1.98 (this crate's own
 # code needs 1.91: Duration::from_mins, str::floor_char_boundary; File::lock
