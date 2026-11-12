@@ -3,6 +3,42 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.5
+
+### Fixed
+
+- **A cancelled read no longer holds its account.** A client that stops
+  waiting for a call cancels it with `notifications/cancelled`, and rmcp
+  then drops the answer but lets the call run on. A read stuck on a
+  connection that had died kept the account locked for the minute a silent
+  connection takes to count as dead, so the calls after it ran into the
+  client's timeout as well. Otomo, which waits 15 s, saw a search and the
+  list after it fail; in a rebuild with a connection that died silently the
+  account answered again only after a minute. Now a read stops at the
+  cancel and frees its account, and the next call replaces the session the
+  read left in the middle of a command (`account_health` no longer calls
+  that session connected). A call that writes runs to its end, so a move
+  cannot stop between the copy and the removal of the original.
+
+- **A connection that died silently is noticed after about 20 seconds of
+  quiet instead of 60.** TCP keepalive now probes after 10 s without
+  traffic, then every 5 s, and two unanswered probes drop the connection. A
+  call that comes later reconnects at once instead of waiting out the
+  minute a silent server is given. On Linux a command that the server has
+  not acknowledged after 10 s drops the connection too, so a path that
+  dies just before a command costs that command 10 s and a reconnect, not
+  the minute. With the packets of the connection dropped 25 s before a
+  search, 3.2.4 let it and the next call run into Otomo's 15 s timeout, and
+  the call after them waited another 20 s; now the search answers in 0.1 s,
+  and with the packets dropped 5 s before it in 10.6 s.
+
+The tool surface is unchanged: `tools/list` and the instructions are byte
+for byte those of 3.1.1, and `initialize` differs only in the version it
+reports.
+
+391 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
+end-to-end script.
+
 ## 3.2.4
 
 ### Changed
