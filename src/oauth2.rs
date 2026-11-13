@@ -347,7 +347,7 @@ pub async fn minimal_https_post(url: &str, body: &str) -> Result<(u16, String)> 
     let mut root_store = rustls::RootCertStore::empty();
     root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     // Provider pinned, not taken from the process default — see
-    // `ImapClient::establish_tls`.
+    // `ImapClient::tls_connector`.
     let tls_config = rustls::ClientConfig::builder_with_provider(Arc::new(
         rustls::crypto::aws_lc_rs::default_provider(),
     ))

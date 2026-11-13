@@ -12,6 +12,7 @@
 //! live in `util` and are unit-tested in isolation.
 
 use std::collections::HashSet;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -62,6 +63,13 @@ macro_rules! retry_read {
 }
 
 type ImapSession = Session<GuardedStream<TlsStream<TcpStream>>>;
+
+/// A connection before the login.
+type ImapConnection = async_imap::Client<GuardedStream<TlsStream<TcpStream>>>;
+
+/// A connection that has the server's greeting: the client, its `waiting`
+/// flag (see [`GuardedStream`]) and the address it went to.
+type Greeted = (ImapConnection, Arc<AtomicBool>, SocketAddr);
 
 /// How long the session waits without a single byte from the server, or
 /// without the server taking a single byte, before the connection counts as
@@ -260,6 +268,51 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 
 // The token refresh inside a connect gives up first, with its own error.
 const _: () = assert!(crate::oauth2::OAUTH2_TIMEOUT.as_secs() < CONNECT_TIMEOUT.as_secs());
+
+/// How long a connection attempt may go without the server's greeting before
+/// the next address of the host joins it (see [`ImapClient::first_greeting`]).
+/// RFC 8305 waits 250 ms between connection attempts. Here an attempt counts
+/// as connected only once the server has greeted, since a server can take
+/// the connection and the TLS handshake and then say nothing. On 13 November
+/// 2026 most connections to Outlook hung, over IPv4 and IPv6 alike: in the
+/// TCP handshake, in the TLS handshake or before the greeting. The others
+/// greeted within a tenth of a second, and which address hung changed from
+/// one connection to the next.
+const NEXT_ATTEMPT_AFTER: Duration = Duration::from_millis(250);
+
+/// The order in which a connect tries the addresses the host resolved to:
+/// the address of the last session first if the host still resolves to it,
+/// then the two families taking turns (RFC 8305, section 4), led by the
+/// family of the last session or else by the resolver's first. Outlook
+/// resolves to 16 IPv6 addresses ahead of four IPv4 ones, so a family that
+/// does not answer costs one attempt instead of all its addresses.
+fn attempt_order(
+    resolved: impl IntoIterator<Item = SocketAddr>,
+    last: Option<SocketAddr>,
+) -> Vec<SocketAddr> {
+    let mut rest: Vec<SocketAddr> = Vec::new();
+    for address in resolved {
+        if !rest.contains(&address) {
+            rest.push(address);
+        }
+    }
+    let mut order = Vec::with_capacity(rest.len());
+    if let Some(i) = last.and_then(|last| rest.iter().position(|a| *a == last)) {
+        order.push(rest.remove(i));
+    }
+    let lead_v6 = last
+        .or_else(|| rest.first().copied())
+        .is_some_and(|a| a.is_ipv6());
+    let (lead, other): (Vec<_>, Vec<_>) = rest.into_iter().partition(|a| a.is_ipv6() == lead_v6);
+    let (mut lead, mut other) = (lead.into_iter(), other.into_iter());
+    loop {
+        match (lead.next(), other.next()) {
+            (None, None) => break,
+            (a, b) => order.extend(a.into_iter().chain(b)),
+        }
+    }
+    order
+}
 
 /// Hard cap on the number of folders we'll process in a single `LIST` response.
 /// A malicious server could return millions of folders to drive the subsequent
@@ -610,6 +663,11 @@ pub struct ImapClient {
     /// Whether the session's stream was left waiting, a new one with every
     /// session (see [`GuardedStream`]).
     waiting: Arc<AtomicBool>,
+    /// The address of the last session that logged in. The next connect
+    /// tries it first (see [`attempt_order`]). A connect that fails forgets
+    /// it, so an address that greets and then breaks the login does not
+    /// lead again.
+    last_address: Option<SocketAddr>,
 }
 
 /// Read-only snapshot of an `ImapClient`'s health for the `account_health`
@@ -664,6 +722,7 @@ impl ImapClient {
             partial_rows: true,
             can_move: None,
             waiting: Arc::default(),
+            last_address: None,
         }
     }
 
@@ -861,21 +920,8 @@ impl ImapClient {
             self.session.is_none(),
             "connect() called while session is Some — caller forgot mark_dead/disconnect"
         );
-        let tls_stream = self.establish_tls().await?;
-        let waiting = Arc::new(AtomicBool::new(false));
-        let mut client = async_imap::Client::new(GuardedStream::new(
-            tls_stream,
-            self.stall,
-            Arc::clone(&waiting),
-        ));
-
-        // Read the server greeting before any commands.
-        // async-imap's Client::new() doesn't consume the greeting, which causes
-        // authenticate() to misinterpret it as a response to the AUTHENTICATE command.
-        let _greeting = client
-            .read_response()
-            .await
-            .map_err(|e| anyhow::anyhow!("Failed to read server greeting: {e:#}"))?;
+        let last = self.last_address.take();
+        let (client, waiting, address) = self.open(last).await?;
 
         let session = match self.config.auth_method {
             AuthMethod::Password => {
@@ -932,12 +978,14 @@ impl ImapClient {
 
         tracing::info!(
             host = %self.config.host,
+            %address,
             user = %self.config.username,
             "Connected to IMAP server"
         );
 
         self.session = Some(session);
         self.waiting = waiting;
+        self.last_address = Some(address);
         self.selected_folder = None;
         self.cached_folder_names = None;
         self.can_move = None;
@@ -2389,14 +2437,111 @@ impl ImapClient {
         self.find_folder_by_role(DRAFTS_FOLDER_NAMES).await
     }
 
-    async fn establish_tls(&self) -> Result<TlsStream<TcpStream>> {
-        let addr = format!("{}:{}", self.config.host, self.config.port);
+    /// TCP, TLS and the server's greeting, from the first address of the host
+    /// to get that far (see [`attempt_order`] and [`Self::first_greeting`]).
+    /// `last` is the address of the last session.
+    async fn open(&self, last: Option<SocketAddr>) -> Result<Greeted> {
         // The cause in the message ("Connection refused", "timed out"): it is
         // what tells a caller the failure is transient (`retryable`), and
-        // what `account_health` reports.
-        let tcp_stream = TcpStream::connect(&addr)
+        // what `account_health` reports. The wording is the one of a single
+        // `TcpStream::connect` to host and port.
+        let target = format!("{}:{}", self.config.host, self.config.port);
+        let resolved = tokio::net::lookup_host((self.config.host.as_str(), self.config.port))
             .await
-            .map_err(|e| anyhow::anyhow!("Failed to connect to {addr}: {e}"))?;
+            .map_err(|e| anyhow::anyhow!("Failed to connect to {target}: {e}"))?;
+        let addresses = attempt_order(resolved, last);
+        if addresses.is_empty() {
+            anyhow::bail!("Failed to connect to {target}: could not resolve to any address");
+        }
+        let name = rustls::pki_types::ServerName::try_from(self.config.host.clone())
+            .context("Invalid server hostname")?;
+        self.first_greeting(&addresses, &self.tls_connector()?, &name)
+            .await
+    }
+
+    /// The first of `addresses` to greet, with the connections of the others
+    /// closed: RFC 8305's racing of connection attempts, carried on to the
+    /// greeting. The first address starts, and the next one joins whenever
+    /// [`NEXT_ATTEMPT_AFTER`] passes without a greeting or an attempt fails.
+    /// A server that is slow to greet keeps its attempt and still wins if it
+    /// greets first. When every attempt fails, the error of the last one.
+    async fn first_greeting(
+        &self,
+        addresses: &[SocketAddr],
+        tls: &TlsConnector,
+        name: &rustls::pki_types::ServerName<'static>,
+    ) -> Result<Greeted> {
+        use futures_util::StreamExt as _;
+        let mut queue = addresses.iter().copied();
+        let mut running = futures_util::stream::FuturesUnordered::new();
+        loop {
+            if let Some(address) = queue.next() {
+                tracing::debug!(account = %self.config.name, %address, "Connection attempt");
+                running.push(async move { (address, self.greeting(address, tls, name).await) });
+            }
+            let more = queue.len() > 0;
+            tokio::select! {
+                Some((address, result)) = running.next() => match result {
+                    Ok((client, waiting)) => return Ok((client, waiting, address)),
+                    Err(e) => {
+                        tracing::debug!(
+                            account = %self.config.name,
+                            %address,
+                            error = %e,
+                            "Connection attempt failed"
+                        );
+                        if running.is_empty() && !more {
+                            return Err(e);
+                        }
+                    }
+                },
+                () = tokio::time::sleep(NEXT_ATTEMPT_AFTER), if more => {}
+                // Only without any address: otherwise one was just added, or
+                // attempts still run, since the error branch returns once
+                // none is left and no address is waiting.
+                else => anyhow::bail!("no address to connect to"),
+            }
+        }
+    }
+
+    /// One connection attempt: TCP to `address`, TLS for the host and the
+    /// server's greeting.
+    async fn greeting(
+        &self,
+        address: SocketAddr,
+        tls: &TlsConnector,
+        name: &rustls::pki_types::ServerName<'static>,
+    ) -> Result<(ImapConnection, Arc<AtomicBool>)> {
+        let tls_stream = self.establish_tls(address, tls, name).await?;
+        let waiting = Arc::new(AtomicBool::new(false));
+        let mut client = async_imap::Client::new(GuardedStream::new(
+            tls_stream,
+            self.stall,
+            Arc::clone(&waiting),
+        ));
+        // Read the server greeting before any commands.
+        // async-imap's Client::new() doesn't consume the greeting, which causes
+        // authenticate() to misinterpret it as a response to the AUTHENTICATE command.
+        client
+            .read_response()
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to read server greeting: {e:#}"))?;
+        Ok((client, waiting))
+    }
+
+    async fn establish_tls(
+        &self,
+        address: SocketAddr,
+        tls: &TlsConnector,
+        name: &rustls::pki_types::ServerName<'static>,
+    ) -> Result<TlsStream<TcpStream>> {
+        let tcp_stream = TcpStream::connect(address).await.map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to connect to {}:{}: {e}",
+                self.config.host,
+                self.config.port
+            )
+        })?;
 
         // TCP keepalive: first probe after 10 s idle, then every 5 s, and
         // two unanswered probes drop the connection, so a peer that died is
@@ -2426,6 +2571,16 @@ impl ImapClient {
             tracing::debug!(error = %e, "TCP_USER_TIMEOUT not available");
         }
 
+        let tls_stream = tls
+            .connect(name.clone(), tcp_stream)
+            .await
+            .map_err(|e| anyhow::anyhow!("TLS handshake failed: {e}"))?;
+
+        Ok(tls_stream)
+    }
+
+    /// The TLS client of this account, one for all attempts of a connect.
+    fn tls_connector(&self) -> Result<TlsConnector> {
         // The crypto provider is pinned here rather than left to the process
         // default: `ClientConfig::builder()` resolves that from the enabled
         // crate features and panics at runtime the day a second provider
@@ -2447,17 +2602,7 @@ impl ImapClient {
                 .with_root_certificates(root_store)
                 .with_no_client_auth()
         };
-
-        let connector = TlsConnector::from(Arc::new(tls_config));
-        let domain = rustls::pki_types::ServerName::try_from(self.config.host.clone())
-            .context("Invalid server hostname")?;
-
-        let tls_stream = connector
-            .connect(domain, tcp_stream)
-            .await
-            .map_err(|e| anyhow::anyhow!("TLS handshake failed: {e}"))?;
-
-        Ok(tls_stream)
+        Ok(TlsConnector::from(Arc::new(tls_config)))
     }
 }
 
@@ -3010,12 +3155,10 @@ mod tests {
     /// connection.
     type FakeAnswer = Arc<dyn Fn(&str, &str, usize) -> Option<String> + Send + Sync>;
 
-    /// An IMAP server on loopback over TLS that greets, takes any LOGIN and
-    /// LOGOUT, and answers everything else as `answer` says.
-    async fn fake_server(answer: FakeAnswer) -> std::net::SocketAddr {
+    /// The TLS side of the fake servers, with the certificate above.
+    fn fake_acceptor() -> tokio_rustls::TlsAcceptor {
         use base64::Engine as _;
         use base64::engine::general_purpose::STANDARD;
-        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
 
         let cert = rustls::pki_types::CertificateDer::from(STANDARD.decode(FAKE_CERT).unwrap());
         let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
@@ -3029,7 +3172,15 @@ mod tests {
         .with_no_client_auth()
         .with_single_cert(vec![cert], key)
         .unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        tokio_rustls::TlsAcceptor::from(Arc::new(config))
+    }
+
+    /// An IMAP server on loopback over TLS that greets, takes any LOGIN and
+    /// LOGOUT, and answers everything else as `answer` says.
+    async fn fake_server(answer: FakeAnswer) -> std::net::SocketAddr {
+        use tokio::io::{AsyncBufReadExt as _, AsyncWriteExt as _};
+
+        let acceptor = fake_acceptor();
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let seen = Arc::new(std::sync::Mutex::new(std::collections::HashMap::<
@@ -3220,6 +3371,165 @@ mod tests {
             "a finished call leaves nothing waiting, so the session stays"
         );
         assert!(client.connection_state().connected);
+    }
+
+    /// A server on loopback that takes the connection and the TLS handshake
+    /// and then says nothing, as most connections to Outlook did in November
+    /// 2026. The receiver hears of every connection the client closed.
+    async fn silent_server() -> (SocketAddr, tokio::sync::mpsc::UnboundedReceiver<()>) {
+        let acceptor = fake_acceptor();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (report, closes) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while let Ok((tcp, _)) = listener.accept().await {
+                let (acceptor, report) = (acceptor.clone(), report.clone());
+                tokio::spawn(async move {
+                    use tokio::io::AsyncReadExt as _;
+                    let Ok(mut tls) = acceptor.accept(tcp).await else {
+                        return;
+                    };
+                    let mut buf = [0u8; 64];
+                    while matches!(tls.read(&mut buf).await, Ok(n) if n > 0) {}
+                    let _ = report.send(());
+                });
+            }
+        });
+        (addr, closes)
+    }
+
+    /// An address on loopback that refuses connections: a port that was
+    /// free a moment ago.
+    fn refused_address() -> SocketAddr {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+    }
+
+    /// A fake server that answers every command with OK.
+    async fn agreeable_server() -> SocketAddr {
+        fake_server(Arc::new(|tag, _, _| Some(format!("{tag} OK done\r\n")))).await
+    }
+
+    /// The address that wins the race of a fake client over `addresses`,
+    /// within five seconds.
+    async fn race(addresses: &[SocketAddr]) -> Result<SocketAddr> {
+        let account: AccountConfig = toml::from_str(
+            "name = \"Fake\"\nhost = \"127.0.0.1\"\nport = 993\nusername = \"u@h\"\n\
+             password = \"p\"\naccept_invalid_certs = true\n",
+        )
+        .unwrap();
+        let client = ImapClient::new(account);
+        let name = rustls::pki_types::ServerName::try_from("127.0.0.1".to_string()).unwrap();
+        let tls = client.tls_connector().unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            client.first_greeting(addresses, &tls, &name),
+        )
+        .await
+        .expect("the race must end, not hang")
+        .map(|(_, _, address)| address)
+    }
+
+    /// Outlook in November 2026: the first address takes the connection and
+    /// the TLS handshake and never greets. The next address joins after
+    /// `NEXT_ATTEMPT_AFTER`, its greeting wins, and the silent connection is
+    /// closed instead of left open. 3.2.5 waited for the greeting until the
+    /// connect timed out after 15 s.
+    #[tokio::test]
+    async fn an_address_that_never_greets_is_passed_over() {
+        let (silent, mut closes) = silent_server().await;
+        let good = agreeable_server().await;
+        let started = std::time::Instant::now();
+        let winner = race(&[silent, good]).await.expect("the second greets");
+        assert_eq!(winner, good);
+        assert!(
+            started.elapsed() >= NEXT_ATTEMPT_AFTER,
+            "the first had its time"
+        );
+        tokio::time::timeout(Duration::from_secs(5), closes.recv())
+            .await
+            .expect("the attempt that lost is closed");
+    }
+
+    /// An address that refuses hands over at once instead of after
+    /// `NEXT_ATTEMPT_AFTER`: eight of them ahead of the good one take less
+    /// than the two seconds that waiting would cost.
+    #[tokio::test]
+    async fn refused_addresses_hand_over_at_once() {
+        let good = agreeable_server().await;
+        let mut addresses: Vec<SocketAddr> = (0..8).map(|_| refused_address()).collect();
+        addresses.push(good);
+        let started = std::time::Instant::now();
+        assert_eq!(race(&addresses).await.expect("the last greets"), good);
+        assert!(
+            started.elapsed() < NEXT_ATTEMPT_AFTER * 4,
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// When every address fails, the error is the one a single connection
+    /// gave before the race, with host and port, and retryable.
+    #[tokio::test]
+    async fn when_every_address_fails_the_error_is_the_connect_error() {
+        let err = race(&[refused_address(), refused_address()])
+            .await
+            .expect_err("nothing listens");
+        let msg = err.to_string();
+        assert!(
+            msg.starts_with("Failed to connect to 127.0.0.1:993: "),
+            "{msg}"
+        );
+        assert!(is_retryable_error(&msg), "{msg}");
+    }
+
+    /// Outlook resolves to 16 IPv6 addresses ahead of four IPv4 ones. The
+    /// families take turns, so an IPv4 address comes second. The address of
+    /// the last session leads while the host still resolves to it, and its
+    /// family leads the turns either way.
+    #[test]
+    fn the_families_take_turns_and_the_last_address_leads() {
+        let v6 = |n: u16| SocketAddr::from(([0x2603, 0x1026, 0xc0e, n, 0, 0, 0, 2], 993));
+        let v4 = |n: u8| SocketAddr::from(([52, 98, 240, n], 993));
+        let resolved = vec![v6(1), v6(2), v6(3), v4(1), v4(2), v6(1)];
+        assert_eq!(
+            attempt_order(resolved.clone(), None),
+            [v6(1), v4(1), v6(2), v4(2), v6(3)]
+        );
+        assert_eq!(
+            attempt_order(resolved.clone(), Some(v4(2))),
+            [v4(2), v4(1), v6(1), v6(2), v6(3)]
+        );
+        assert_eq!(
+            attempt_order(resolved.clone(), Some(v4(9))),
+            [v4(1), v6(1), v4(2), v6(2), v6(3)]
+        );
+        assert_eq!(
+            attempt_order(resolved, Some(v6(3))),
+            [v6(3), v6(1), v4(1), v6(2), v4(2)]
+        );
+        assert_eq!(
+            attempt_order(Vec::new(), Some(v4(1))),
+            Vec::<SocketAddr>::new()
+        );
+    }
+
+    /// The address of a session that logged in is kept for the next
+    /// connect, and a connect that fails forgets it.
+    #[tokio::test]
+    async fn a_failed_connect_forgets_the_last_address() {
+        let addr = agreeable_server().await;
+        let mut client = fake_client(addr).await;
+        assert_eq!(client.last_address, Some(addr));
+        client.mark_dead();
+        client.config.port = refused_address().port();
+        client
+            .connect_bounded()
+            .await
+            .expect_err("nothing listens there");
+        assert_eq!(client.last_address, None);
     }
 
     /// The FETCH asks for exactly the start the rows are judged by.
