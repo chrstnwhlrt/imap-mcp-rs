@@ -3,6 +3,37 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.6
+
+### Fixed
+
+- **An address that takes the connection and then stays silent no longer
+  takes its account down.** A connect used the first address of the host
+  that accepted the TCP connection and waited there for TLS and the
+  greeting until it timed out after 15 s. On 13 November 2026 most
+  connections to Outlook hung like that, over IPv4 and IPv6 alike: in the
+  TCP handshake, in the TLS handshake or before the greeting. The others
+  greeted within a tenth of a second, and which address hung changed from
+  one connection to the next. Every call on the Office account failed with
+  "IMAP connect timed out after 15s", and `imap-mcp-rs reauth` could not
+  verify its login. Now the attempts of a connect race up to the greeting,
+  as RFC 8305 races TCP connections: the next address joins after 250 ms
+  without a greeting or at once when an attempt fails, the first greeting
+  wins and the other connections are closed. The address families take
+  turns, so an IPv4 address comes second although Outlook lists 16 IPv6
+  addresses first, and the address of the last session leads. With a
+  silent server on `::1` ahead of GreenMail on 127.0.0.1, 3.2.5 answered
+  `list_folders` after 45 s with the timeout error and 3.2.6 after a second
+  with the folders. Against Outlook, ten connects without a login all got
+  their greeting, two of them while most addresses hung, after 6 and 8 s.
+
+The tool surface is unchanged: `tools/list` and the instructions are byte
+for byte those of 3.1.1, and `initialize` differs only in the version it
+reports.
+
+396 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
+end-to-end script.
+
 ## 3.2.5
 
 ### Fixed
