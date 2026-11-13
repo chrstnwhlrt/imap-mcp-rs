@@ -16,7 +16,6 @@ restart), STORE reported nothing changed and APPEND failed.
 """
 import argparse
 import json
-import subprocess
 import sys
 import types
 from pathlib import Path
@@ -50,7 +49,7 @@ def main():
     def kicked(tool, arguments):
         """`tool` on a session the server has just ended."""
         call("list_emails", {"folder": "INBOX", "limit": 1})  # a live session first
-        subprocess.run(["podman", "exec", welt.CONTAINER, "doveadm", "kick", login], capture_output=True, check=True)
+        welt.kick(login)
         return call(tool, arguments)
 
     checks = [

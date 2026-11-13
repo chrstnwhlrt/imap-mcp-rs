@@ -19,6 +19,8 @@ Misst, ob Gemma 4 E4B über den Sprachassistenten Otomo die Werkzeuge von imap-m
 
 Gebraucht werden ein Checkout von Otomo mit Release-Build (`otomo-probe`) und seiner `config.toml`, Ollama mit Gemma 4 E4B, Podman und ein gebautes imap-mcp-rs. Den Checkout nennt `OTOMO_DIR`, ohne die Variable liegt er als `otomo` neben diesem Repository. Gefragt wird als die Identität `OTOMO_IDENTITY` der Konfiguration, ohne die Variable `Christian`.
 
+Ohne Podman läuft die Welt mit `IMAP_WORLD_DOVECOT=native`. Dann startet `welt.py` den Dovecot aus PATH als Prozess des eigenen Nutzers, mit den Mail-Einstellungen des Images und nur auf 127.0.0.1:3994. Dovecot 2.3 und openssl kommen dafür etwa aus `nix shell nixpkgs#dovecot_2_3 nixpkgs#openssl`. Konfiguration, Zertifikat, Log und Post liegen im Ordner `run/dovecot`, den `welt.py stop` nach dem Beenden löscht. Ein Reset startet ihn auf leerem Postfach neu, die UIDs sind also dieselben wie mit frischem Container. Er läuft wie der Container in UTC und findet seinen Prozess über /proc, was Linux voraussetzt.
+
 ```
 python3 -I welt.py config
 python3 -I run.py TAG [--runs N] [--set cases|held|extra|nurlesen|km] [--config config-nur-lesen.toml] [--binary PFAD] [--texts texts/X.json] [--only REGEX]
@@ -29,4 +31,4 @@ python3 -I why.py TAG "REGEX"
 python3 -I kick.py [--binary PFAD]
 ```
 
-Gemma und Claude sehen dieselbe Oberfläche. Den Katalog misst man mit `config.toml` (ein Konto mit Schreibrechten), `--set nurlesen` mit `--config config-nur-lesen.toml` (zwei Konten, beide nur lesend). Ein Durchgang des Katalogs dauert mit Gemma rund acht Minuten. Gemessen wird nie parallel auf Ollama, das stört Gemmas Drafter. Auch zwei Läufe zugleich gegen die Welt gehen nicht, weil jeder Lauf sie zurücksetzt, `claude_check.py` ebenso.
+Gemma und Claude sehen dieselbe Oberfläche. Den Katalog misst man mit `config.toml` (ein Konto mit Schreibrechten), `--set nurlesen` mit `--config config-nur-lesen.toml` (zwei Konten, beide nur lesend). Ein Durchgang des Katalogs dauert mit Gemma rund drei Minuten. Gemessen wird nie parallel auf Ollama, das stört Gemmas Drafter. Auch zwei Läufe zugleich gegen die Welt gehen nicht, weil jeder Lauf sie zurücksetzt, `claude_check.py` ebenso.

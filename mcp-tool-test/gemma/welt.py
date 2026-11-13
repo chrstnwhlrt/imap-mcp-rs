@@ -3,10 +3,10 @@
 with a fictional mailbox, reset to the same content before every
 conversation, plus the server configuration that points imap-mcp-rs at it.
 
-    welt.py reset [--minimal]  a fresh container (127.0.0.1:3994, IMAPS), both mailboxes filled
+    welt.py reset [--minimal]  a fresh Dovecot (127.0.0.1:3994, IMAPS), both mailboxes filled
     welt.py state [--account NAME]  the current state as JSON on stdout
     welt.py config             write run/config.toml, run/config-zwei-konten.toml and run/config-nur-lesen.toml
-    welt.py stop               remove the container
+    welt.py stop               remove the Dovecot
 
 From Python, `welt.state()` returns the same as a dict: what a conversation
 left behind, read straight from Dovecot rather than through the server
@@ -14,7 +14,7 @@ under test. Its shape follows run/manifest.json, plus headers, attachments
 and the text of every message; messages from the world carry their `key`,
 anything the conversation wrote (drafts, replies) has `key: None`.
 
-`reset` replaces the container instead of emptying folders, so every round
+`reset` replaces the Dovecot instead of emptying folders, so every round
 starts from the same state down to the UIDs: they follow the arrival order
 within each folder and are the same after every reset. It writes
 run/manifest.json with every message's folder, UID, subject, flags and
@@ -36,16 +36,31 @@ German Outlook mailbox; non-ASCII names travel modified-UTF-7 encoded
 08:12" is moved before now when the reset runs earlier in the day, keeping
 the order of the day's messages.
 
+Where Podman is missing, IMAP_WORLD_DOVECOT=native runs the same Dovecot
+without a container: the dovecot of PATH (2.3.21.1 from
+nixpkgs#dovecot_2_3, openssl beside it for the certificate) as a process
+of the current user, with the mail settings of the image and nothing but
+IMAPS on 127.0.0.1:3994. Its configuration, certificate, log, mail and
+sockets lie in run/dovecot. A reset ends it and starts it on an empty mail
+directory, which gives the UIDs of a fresh container, and `stop` ends it
+and removes run/dovecot, so nothing stays behind. It runs in UTC like the
+container, since INTERNALDATE and the day SEARCH SINCE compares follow the
+server's time zone. It finds its process through /proc, so Linux only.
+
 Nothing here talks to a real mail server; the configuration names
 127.0.0.1:3994 only.
 """
 import argparse
 import datetime
 import email
+import grp
 import imaplib
 import json
 import os
+import pwd
 import re
+import shutil
+import signal
 import ssl
 import struct
 import subprocess
@@ -63,6 +78,9 @@ RUN = HERE / "run"
 CONTAINER = "imap-gemma-welt"
 IMAGE = "docker.io/dovecot/dovecot:2.3.21"
 HOST, PORT, PASSWORD = "127.0.0.1", 3994, "pass"
+# The Dovecot without a container (IMAP_WORLD_DOVECOT=native) keeps everything here: its configuration,
+# certificate, log, mail and the sockets of its processes.
+NATIVE = RUN / "dovecot"
 
 ME = ("Christian Wohlert", "christian@example.de")
 ME_WORK = ("Christian Wohlert", "cwohlert@firma.example")
@@ -501,6 +519,16 @@ def podman(*args, check=True, capture=True):
                           stdout=subprocess.PIPE if capture else None, stderr=subprocess.PIPE if capture else None)
 
 
+def engine():
+    """Where the world's Dovecot runs, from IMAP_WORLD_DOVECOT: "podman" (the
+    default) in a container of IMAGE, "native" as a process of this user,
+    the dovecot of PATH."""
+    value = os.environ.get("IMAP_WORLD_DOVECOT") or "podman"
+    if value not in ("podman", "native"):
+        sys.exit(f"IMAP_WORLD_DOVECOT={value}: podman or native")
+    return value
+
+
 def cmd_state(args):
     print(json.dumps(state([args.account] if args.account else None), ensure_ascii=False, indent=2))
 
@@ -510,12 +538,157 @@ def remove_container():
     /etc/dovecot and /srv/mail). Without `-v` every reset left two volumes
     behind, and after about 640 resets podman ran out of locks (num_locks
     2048): `podman run` failed with "allocating lock for new volume"."""
-    podman("rm", "-f", "-v", "-t", "0", CONTAINER, check=False)
+    try:
+        podman("rm", "-f", "-v", "-t", "0", CONTAINER, check=False)
+    except FileNotFoundError:
+        pass  # no Podman here, so no container either
+
+
+# The mail settings are those of the image's dovecot.conf. The rest lets a
+# Dovecot run as a normal user: its own directories, one user for every
+# process, no chroot, and IMAPS alone, on HOST only.
+NATIVE_CONFIG = """\
+# The Dovecot of the mail world without a container, written by welt.py reset.
+base_dir = {native}/run
+state_dir = {native}/state
+mail_temp_dir = {native}/state
+log_path = {native}/dovecot.log
+protocols = imap
+listen = {host}
+ssl = yes
+ssl_cert = <{native}/cert.pem
+ssl_key = <{native}/key.pem
+mail_home = {native}/mail/%Lu
+mail_location = sdbox:~/Mail
+mail_uid = {uid}
+mail_gid = {gid}
+first_valid_uid = {uid}
+last_valid_uid = {uid}
+default_internal_user = {user}
+default_internal_group = {group}
+default_login_user = {user}
+passdb {{
+  driver = static
+  args = password={password}
+}}
+namespace {{
+  inbox = yes
+  separator = /
+}}
+service imap-login {{
+  chroot =
+  inet_listener imap {{
+    port = 0
+  }}
+  inet_listener imaps {{
+    port = {port}
+  }}
+}}
+service anvil {{
+  chroot =
+}}
+"""
+
+
+def running(pid):
+    """Whether the process lives; a zombie counts as ended."""
+    try:
+        return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] != "Z"
+    except (OSError, IndexError):
+        return False
+
+
+def native_pid():
+    """The master process of the native Dovecot, if one runs: the PID of its
+    pid file, as long as that process is still the dovecot started on this
+    configuration."""
+    try:
+        pid = int((NATIVE / "run" / "master.pid").read_text().split()[0])
+        args = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (OSError, ValueError, IndexError):
+        return None
+    return pid if running(pid) and str(NATIVE / "dovecot.conf").encode() in args else None
+
+
+def native_stop():
+    """End the native Dovecot and wait until it is gone, since the next one
+    needs the port and the mail directory. Its master ends the other
+    processes before it exits."""
+    pid = native_pid()
+    if pid is None:
+        return
+    deadline = time.monotonic() + 10
+    try:
+        os.kill(pid, signal.SIGTERM)
+        while running(pid):
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                break
+            time.sleep(0.02)
+    except ProcessLookupError:
+        pass  # it ended in between
+
+
+def native_start():
+    """Start the dovecot of PATH on an empty mail directory, as a fresh
+    container would start."""
+    missing = [tool for tool in ("dovecot", "openssl") if shutil.which(tool) is None]
+    if missing:
+        sys.exit(f"IMAP_WORLD_DOVECOT=native needs {' and '.join(missing)} in PATH, "
+                 "as from nix shell nixpkgs#dovecot_2_3 nixpkgs#openssl")
+    # dovecot.conf takes the paths unquoted, and a socket path has at most
+    # 107 bytes; the longest socket of Dovecot 2.3 is token-login/imap-urlauth.
+    if (not re.fullmatch(r"[\w./+-]+", str(NATIVE))
+            or len(os.fsencode(NATIVE / "run" / "token-login" / "imap-urlauth")) > 107):
+        sys.exit(f"{NATIVE} does not fit dovecot.conf and its sockets: a shorter path without spaces is needed")
+    try:
+        user, group = pwd.getpwuid(os.getuid()).pw_name, grp.getgrgid(os.getgid()).gr_name
+    except KeyError:
+        sys.exit("dovecot runs as the current user, which needs a name in the passwd and group databases")
+    for part in ("mail", "run", "state"):
+        shutil.rmtree(NATIVE / part, ignore_errors=True)
+        (NATIVE / part).mkdir(parents=True)
+    if not (NATIVE / "key.pem").exists() or not (NATIVE / "cert.pem").exists():
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "3650",
+                        "-subj", f"/CN={CONTAINER}", "-keyout", str(NATIVE / "key.pem"),
+                        "-out", str(NATIVE / "cert.pem")], check=True, capture_output=True)
+    config = NATIVE / "dovecot.conf"
+    config.write_text(NATIVE_CONFIG.format(native=NATIVE, host=HOST, port=PORT, password=PASSWORD,
+                                           uid=os.getuid(), gid=os.getgid(), user=user, group=group))
+    log = NATIVE / "dovecot.log"
+    # UTC like the container: INTERNALDATE and the day SEARCH SINCE compares
+    # follow the server's time zone. What it says before its log runs goes to
+    # the log too: the master it leaves in the background keeps its output
+    # open, a pipe would never end.
+    with open(log, "wb") as out:
+        started = subprocess.run(["dovecot", "-c", str(config)], env={**os.environ, "TZ": "UTC"},
+                                 stdin=subprocess.DEVNULL, stdout=out, stderr=out)
+    if started.returncode:
+        sys.exit(f"dovecot did not start: {log.read_text().strip()[-600:]}")
+
+
+def world_down():
+    """End the Dovecot of the last reset, wherever it runs. A native one is
+    ended in either mode, since it would hold the port."""
+    native_stop()
+    if engine() == "podman":
+        remove_container()
+
+
+def kick(login):
+    """End every session of `login` at the server, as an idle timeout does."""
+    if engine() == "native":
+        command = ["doveadm", "-c", str(NATIVE / "dovecot.conf"), "kick", login]
+    else:
+        command = ["podman", "exec", CONTAINER, "doveadm", "kick", login]
+    subprocess.run(command, capture_output=True, check=True)
 
 
 def cmd_stop(_args):
-    remove_container()
-    print(f"{CONTAINER} entfernt")
+    native = NATIVE.exists()
+    world_down()
+    shutil.rmtree(NATIVE, ignore_errors=True)
+    print(f"Dovecot beendet, {NATIVE} entfernt" if native else f"{CONTAINER} entfernt")
 
 
 def cmd_reset(args):
@@ -523,9 +696,12 @@ def cmd_reset(args):
     now = datetime.datetime.now().astimezone()
     msgs = world(extras=not args.minimal)
     when_to_datetime(msgs, now)
-    # A fresh container: nothing of the previous round survives, UIDs included.
-    remove_container()
-    podman("run", "-d", "--name", CONTAINER, "-p", f"{HOST}:{PORT}:993", IMAGE)
+    # A fresh Dovecot: nothing of the previous round survives, UIDs included.
+    world_down()
+    if engine() == "native":
+        native_start()
+    else:
+        podman("run", "-d", "--name", CONTAINER, "-p", f"{HOST}:{PORT}:993", IMAGE)
     manifest = {"created": now.isoformat(), "server": f"{HOST}:{PORT}", "accounts": {}}
     for account, spec in ACCOUNTS.items():
         imap = connect(spec["login"])
