@@ -3,6 +3,43 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.7
+
+### Changed
+
+- **The examples in the served texts no longer come from the mail world
+  the texts are measured in.** The instructions showed a search with from
+  "Stadtwerke" and text "Rechnung" and named the tax adviser and mum as
+  people named by role. The `from` of `search_emails` offered "Stadtwerke"
+  and "mama", `move_email` the folder Rechnungen, and the recipients of
+  `draft_email` and `draft_forward` "Ben <ben@example.de>". All of them are
+  senders, folders and addresses of the Gemma kit's mail world, and Ben's
+  is the address that three of its draft questions check. A model could
+  copy the answer from the description instead of looking it up. Now the
+  examples are "Hausverwaltung" and "Miete", the landlord and grandma,
+  "Versicherung" and "oma", Verträge and "Lena <lena@example.org>", none of
+  which occurs in that world.
+
+Measured with Gemma 4 E4B on the 34 questions the old examples touched,
+three runs each. 31 of them came to 87 of 93 right with the old examples
+and with the new ones. The four questions to or about Ben among them came
+to 12 of 12 with the old examples and 11 of 12 with the new ones: once
+Gemma drafted to "Ben" without looking the address up and then asked for
+it. With the old examples it had looked the address up every time and never
+copied it from the description. The other three got six more runs each. The question about the Stadtwerke bill
+(9 against 6 of 9) and the read-only refusal to move an email to the trash
+(8 against 6) were nearly even in those six runs (6 against 6, 6 against
+5). The read-only refusal to forward an email to "Mama" went from 7 to 3
+of 9: Gemma said it had found the email but not that it could not forward
+it.
+
+The tool surface changes only in these examples. The instructions for one
+account with every permission and a signature have 988 characters instead
+of 986, and no configuration loses the sentence about retrying an error.
+
+396 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
+end-to-end script.
+
 ## 3.2.6
 
 ### Fixed
