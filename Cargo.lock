@@ -757,7 +757,7 @@ dependencies = [
 
 [[package]]
 name = "imap-mcp-rs"
-version = "3.2.6"
+version = "3.2.7"
 dependencies = [
  "ammonia",
  "anyhow",
