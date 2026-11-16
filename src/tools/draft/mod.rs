@@ -256,7 +256,7 @@ pub struct DraftForwardRequest {
     pub uid: u32,
     #[schemars(
         required,
-        description = "Email addresses, one per entry, such as \"ben@example.de\" or \"Ben <ben@example.de>\". Look an address up before asking the user: search_emails from: the name; for a person named by role, list_emails INBOX shows who wrote."
+        description = "Email addresses, one per entry, such as \"lena@example.org\" or \"Lena <lena@example.org>\". Look an address up before asking the user: search_emails from: the name; for a person named by role, list_emails INBOX shows who wrote."
     )]
     pub to: Option<Vec<String>>,
     #[schemars(description = "A note above the forwarded email, in the user's words.")]
@@ -287,7 +287,7 @@ pub struct DraftEmailRequest {
     pub account: Option<String>,
     #[schemars(
         required,
-        description = "Email addresses, one per entry, such as \"ben@example.de\" or \"Ben <ben@example.de>\". Look an address up before asking the user: search_emails from: the name; for a person named by role, list_emails INBOX shows who wrote."
+        description = "Email addresses, one per entry, such as \"lena@example.org\" or \"Lena <lena@example.org>\". Look an address up before asking the user: search_emails from: the name; for a person named by role, list_emails INBOX shows who wrote."
     )]
     pub to: Option<Vec<String>>,
     #[schemars(required, description = "Email subject line (plain text)")]

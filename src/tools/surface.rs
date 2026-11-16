@@ -9,8 +9,10 @@
 //! first 140 characters of a description whether a request needs the tool at
 //! all. Hence descriptions that begin with what the tool does for the user,
 //! instructions within the cut, and schemas without what changes nothing for
-//! the caller. The tool descriptions themselves sit on the tools and their
-//! request types; this module only fits them to the configuration:
+//! the caller. Examples in the texts do not come from the kit's mail world,
+//! so that no measured question finds its answer in a description. The tool
+//! descriptions themselves sit on the tools and their request types; this
+//! module only fits them to the configuration:
 //!
 //! - a tool no account may use is left out, and no served text points at it;
 //! - `account` is left out when there is only one account, and required
@@ -275,11 +277,11 @@ pub fn instructions(config: &ServerConfig) -> String {
     );
     sentences.push(
         "Search terms match as parts of words in any case, so one word finds most: from \
-         \"Stadtwerke\", text \"Rechnung\"."
+         \"Hausverwaltung\", text \"Miete\"."
             .into(),
     );
     sentences.push(
-        "Someone named by role or relation (the tax adviser, mum) stands by name in the newest \
+        "Someone named by role or relation (the landlord, grandma) stands by name in the newest \
          emails of INBOX."
             .into(),
     );
@@ -612,7 +614,7 @@ mod tests {
     }
 
     /// One account, every permission, a signature: the text measured with
-    /// Gemma (v3c), word for word.
+    /// Gemma (v3c, with examples from outside the mail world), word for word.
     #[test]
     fn the_measured_instructions_stay_as_measured() {
         let text = instructions(&config(&[account("Privat", SIGNATURE)]));
@@ -625,8 +627,8 @@ mod tests {
              list_emails, then pass its folder and uid (UIDs count per folder). The inbox is \
              INBOX; other folders come from list_folders: pass their name, say their \
              display_name where they have one. Search terms match as parts of words in any \
-             case, so one word finds most: from \"Stadtwerke\", text \"Rechnung\". Someone \
-             named by role or relation (the tax adviser, mum) stands by name in the newest \
+             case, so one word finds most: from \"Hausverwaltung\", text \"Miete\". Someone \
+             named by role or relation (the landlord, grandma) stands by name in the newest \
              emails of INBOX. delete_email moves to the trash; permanent only when the user \
              says for good. The server adds the user's signature to every draft: write only \
              the message, without a closing greeting or name. On an error with retryable true \
