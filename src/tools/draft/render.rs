@@ -569,7 +569,7 @@ fn format_date_outlook_in(iso: Option<&str>, locale: Locale, tz: &jiff::tz::Time
     let Ok(ts) = jiff::Timestamp::strptime("%Y-%m-%dT%H:%M:%S%:z", &norm) else {
         return iso.to_string();
     };
-    let z = ts.to_zoned(tz.clone());
+    let z = ts.to_zoned_datetime(tz.clone());
     let year = i32::from(z.year());
     let month = u32::try_from(z.month()).unwrap_or(1);
     let day = u32::try_from(z.day()).unwrap_or(1);

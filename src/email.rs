@@ -679,7 +679,7 @@ pub fn shown_in(utc: &str, zone: &jiff::tz::TimeZone) -> String {
     let Ok(instant) = utc.parse::<jiff::Timestamp>() else {
         return utc.to_string();
     };
-    let zoned = instant.to_zoned(zone.clone());
+    let zoned = instant.to_zoned_datetime(zone.clone());
     if zoned.offset().seconds() == 0 {
         instant.strftime("%Y-%m-%dT%H:%M:%SZ").to_string()
     } else {

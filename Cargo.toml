@@ -14,7 +14,7 @@ license = "MIT"
 repository = "https://github.com/chrstnwhlrt/imap-mcp-rs"
 
 [dependencies]
-rmcp = { version = "3.9.0", features = ["server", "macros", "transport-io"] }
+rmcp = { version = "3.10.0", features = ["server", "macros", "transport-io"] }
 # Every feature the code uses, spelled out: `time`, `net`, `sync` and `io-util`
 # were only enabled through other crates' feature requests before.
 tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "io-std", "io-util", "fs", "net", "sync", "time"] }
@@ -52,8 +52,8 @@ base64 = "0.23.1"
 # (formatting survives, scripts/event handlers/javascript: URLs do not);
 # jiff renders the Date header with the local UTC offset like desktop
 # clients do, instead of mail-builder's UTC fallback.
-ammonia = "4.2.4"
-jiff = "0.2.43"
+ammonia = "4.2.5"
+jiff = "1.0.0"
 
 # `geteuid` for the owner check of the attachment directory: std has no safe
 # way to ask for the process's user. Already in the tree through tokio and
