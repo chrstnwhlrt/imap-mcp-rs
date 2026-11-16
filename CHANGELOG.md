@@ -3,6 +3,41 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.8
+
+All dependencies and the toolchain at their newest releases, among them
+jiff 1.0.0, its first stable major version. Nothing a client sees changes:
+`initialize` and `tools/list` are byte for byte those of 3.2.7, compared
+for nine configs and three protocol versions.
+
+### Security
+
+- **ammonia 4.2.5 fixes a mutation XSS that combined MathML and SVG.**
+  ammonia cleans the HTML of the email that `draft_reply` and
+  `draft_forward` quote, and that HTML comes from the sender.
+
+### Changed
+
+- jiff 1.0.0 renames `Zoned` to `ZonedDateTime` and `to_zoned` to
+  `to_zoned_datetime`, which the code follows. Its other breaking changes
+  touch nothing this server uses.
+- rmcp 3.10.0 adds loading skills from a directory, which this server does
+  not use, and keeps tools whose schema maps property names to their
+  dependencies, which no tool here has.
+- Patch updates of mio (1.2.5), rustls-webpki (0.103.17), cc (1.11.2) and
+  bumpalo (3.20.4). The security fix in bumpalo concerns wasm targets only,
+  and no build of this server contains bumpalo.
+- The flake's rust-overlay input moved to its state of 16 November 2026 and
+  nixpkgs to that of 14 November; crane was already current. The toolchain
+  is Rust 1.100.0, the newest stable release. `rust-version` stays at 1.98
+  and the tests pass with that version.
+- cargo audit reports no vulnerability, only that pin-utils is unmaintained
+  (RUSTSEC-2026-0441), as since 3.1.1. No major version is outstanding
+  anywhere in the tree.
+
+396 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
+end-to-end script.
+
 ## 3.2.7
 
 ### Changed
