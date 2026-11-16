@@ -201,7 +201,7 @@ fn stamp_identity_headers<'a>(
         uuid::Uuid::new_v4().simple(),
         sanitize_header_value(message_id_domain)
     );
-    let date = jiff::Zoned::now()
+    let date = jiff::ZonedDateTime::now()
         .strftime("%a, %d %b %Y %H:%M:%S %z")
         .to_string();
     builder

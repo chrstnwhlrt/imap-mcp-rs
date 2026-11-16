@@ -957,7 +957,7 @@ fn parse_time_bound(
         }
         None => jiff::civil::DateTime::strptime("%Y-%m-%dT%H:%M:%S", &stem)
             .map_err(|_| err("unparseable date or time part"))?
-            .to_zoned(tz.clone())
+            .to_zoned_datetime(tz.clone())
             .map_err(|_| err("not a valid local time"))?
             .timestamp(),
     };
@@ -966,7 +966,7 @@ fn parse_time_bound(
     // SINCE/BEFORE compare the day of INTERNALDATE in the server's timezone,
     // so the exact instant can fall on a neighbouring calendar day there.
     // The precise cut happens client-side against the full timestamp.
-    let utc_day = timestamp.to_zoned(jiff::tz::TimeZone::UTC).date();
+    let utc_day = timestamp.to_zoned_datetime(jiff::tz::TimeZone::UTC).date();
     let widened = if widen_earlier {
         utc_day.yesterday().map_err(|_| err("date out of range"))?
     } else {
@@ -2909,7 +2909,7 @@ mod tests {
         // Compute independently: 2026-08-15T10:20:00Z.
         let expect = jiff::civil::date(2026, 8, 15)
             .at(10, 20, 0, 0)
-            .to_zoned(jiff::tz::TimeZone::UTC)
+            .to_zoned_datetime(jiff::tz::TimeZone::UTC)
             .unwrap()
             .timestamp()
             .as_second();
