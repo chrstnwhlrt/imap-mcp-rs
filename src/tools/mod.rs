@@ -380,7 +380,7 @@ impl ImapMcpServer {
     }
 
     #[tool(
-        description = "Move the user's emails to another folder, such as Rechnungen. target_folder is a folder name from list_folders. failed lists the uids that were not in the folder.",
+        description = "Move the user's emails to another folder, such as Verträge. target_folder is a folder name from list_folders. failed lists the uids that were not in the folder.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

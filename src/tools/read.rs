@@ -146,7 +146,7 @@ pub struct SearchEmailsRequest {
     )]
     pub text: Option<String>,
     #[schemars(
-        description = "Part of the sender's name or address, e.g. \"Stadtwerke\" or \"mama\"."
+        description = "Part of the sender's name or address, e.g. \"Versicherung\" or \"oma\"."
     )]
     pub from: Option<String>,
     #[schemars(description = "Words of the subject, case-insensitive.")]
