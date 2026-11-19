@@ -3,6 +3,55 @@
 Notable changes per release. Versions follow [semantic versioning](https://semver.org):
 the MCP tool surface and the config format are the public API.
 
+## 3.2.9
+
+The crates released since 3.2.8, among them rmcp 3.11.0. `initialize` and
+`tools/list` are byte for byte those of 3.2.8 for nine configs and three
+protocol versions. So are `server/discover` and the answers to 14 tool calls
+against GreenMail that read or only try a change.
+
+### Changed
+
+- **rmcp 3.11.0 refuses list requests for a capability the server does not
+  advertise.** This server advertises only tools, so `prompts/list`,
+  `resources/list`, `resources/templates/list` and `completion/complete` now
+  get the error -32601 (method not found) where they used to get an empty
+  list. Neither Claude Code nor Otomo sends any of them; Claude Code 2.1.328
+  asks for `server/discover` and `tools/list` only. rmcp's other change for
+  servers drops structured tool output that is not an object for older
+  protocol versions. No tool here returns structured output.
+- jiff 1.0.1 formats `%Z` of a `Timestamp` as `UTC` and rejects a timestamp
+  with a fraction of a second just before the earliest instant it can hold.
+  This server formats no `%Z` and parses no fractions of a second.
+- pin-project 1.2.0 and patch updates of bytes (1.12.2), pin-project-lite
+  (0.2.18), regex-automata (0.4.19), regex-syntax (0.8.12), smallvec
+  (1.16.6), uuid (1.29.3) and zeroize (1.9.2). rmcp brings in
+  unicode-normalization, unicode-general-category and tinyvec.
+- The flake's inputs moved to their state of 19 November 2026 for
+  rust-overlay, 18 November for crane and 16 November for nixpkgs. The
+  toolchain stays Rust 1.100.0, still the newest stable release.
+  `rust-version` stays at 1.98 and the tests pass with that version.
+- cargo audit reports no vulnerability. Since 17 November it reports chrono
+  as unmaintained (RUSTSEC-2026-0543) besides pin-utils (RUSTSEC-2026-0441).
+  chrono comes in through async-imap, rmcp and schemars, so this server
+  cannot drop it on its own. No major version is outstanding anywhere in the
+  tree.
+- The Gemma kit (`mcp-tool-test/gemma/run.py`) lets the mail server's tools
+  run without asking through a rule of the identity,
+  `permissions = { allow = ["mail_*"] }`, in place of `confirm = "never"` on
+  the server, a field Otomo has refused since 18 November 2026.
+
+Gemma 4 E4B measured both through Otomo in one window, three runs each.
+3.2.9 got 89 of 99 requests of the catalogue right against 92 of 99 for
+3.2.8 and 38 of 42 against 39 of 42 with two read-only accounts. Seven
+requests differ, two of them for the better. Gemma saw the same tool definitions and system prompts
+in both arms, so the differences are the spread of its sampling. Among them
+Gemma once deleted the Radhaus newsletter for good with `permanent: true`,
+the only such call in 77 deletes over all measurements so far.
+
+396 unit tests, 23 GreenMail integration tests and 78 checks in the MCP
+end-to-end script.
+
 ## 3.2.8
 
 All dependencies and the toolchain at their newest releases, among them

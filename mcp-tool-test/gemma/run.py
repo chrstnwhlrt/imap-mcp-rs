@@ -78,7 +78,12 @@ def sections(text):
 def assistant_config(path, proxy, server_args):
     """The assistant's own configuration for the run: IDENTITY alone, with the mail server as its only tool server,
     never asking before a call (an open question would carry over into the next request), and the proxy in front of
-    Ollama. Returns it with the address of Ollama. Never printed: it holds the assistant's secrets."""
+    Ollama. Returns it with the address of Ollama. Never printed: it holds the assistant's secrets.
+
+    Not asking is a rule of the identity that allows every tool of the server. Until Otomo's 80028d1 (18.11.2026)
+    it was `confirm = "never"` on the server, a field Otomo now refuses; a tool that no rule names and that does not
+    only read would be asked about. A rule of `[mcp]` that asks or denies one of the server's tools would still win,
+    so there may be none."""
     text = path.read_text()
     config = tomllib.loads(text)
     upstream = config.get("llm", {}).get("ollama", {}).get("base_url")
@@ -92,9 +97,10 @@ def assistant_config(path, proxy, server_args):
             if not any(re.match(rf'\s*name\s*=\s*"{IDENTITY}"', line) for line in lines):
                 continue
             lines = [re.sub(r"^(\s*servers\s*=\s*)\[[^\]]*\]", rf'\1["{SERVER}"]', line) for line in lines
-                     if not re.match(r"\s*ids\s*=", line)]
+                     if not re.match(r"\s*(ids|permissions)\s*=", line)]
+            lines.append(f'permissions = {{ allow = ["{SERVER}_*"] }}\n')
         kept.append((header, lines))
-    block = (f'[[mcp.servers]]\nname = "{SERVER}"\ntransport = "stdio"\nconfirm = "never"\n'
+    block = (f'[[mcp.servers]]\nname = "{SERVER}"\ntransport = "stdio"\n'
              f'command = {json.dumps(sys.executable)}\nargs = {json.dumps(server_args)}\n\n')
     at = next(i for i, (header, _) in enumerate(kept) if header == "[mcp]")
     kept.insert(at + 1, ("[[mcp.servers]]", [block]))
@@ -102,7 +108,13 @@ def assistant_config(path, proxy, server_args):
     checked = tomllib.loads(text)
     identities = checked.get("identities", [])
     assert [i["name"] for i in identities] == [IDENTITY] and identities[0]["servers"] == [SERVER], "identities"
+    assert identities[0]["permissions"] == {"allow": [f"{SERVER}_*"]}, "permissions"
     assert [s["name"] for s in checked["mcp"]["servers"]] == [SERVER], "servers"
+    # Otomo's patterns are names or prefixes with a trailing `*`.
+    rules = checked["mcp"].get("permissions", {})
+    reaching = [p for p in rules.get("ask", []) + rules.get("deny", [])
+                if p.startswith(f"{SERVER}_") or (p.endswith("*") and f"{SERVER}_".startswith(p[:-1]))]
+    assert not reaching, "[mcp] asks or denies tools of the mail server"
     return text, upstream
 
 
